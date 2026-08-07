@@ -3,8 +3,8 @@
 mode0: shape (1, N/ws, H=128, D=128); metric per_rank_comm=(N/ws)*(H/ws)*D*2*(ws-1)/time (matches TK).
 mode1: shape (1, N, H/ws, D=128), input (b, s_global, n_local, d); matches bindings mode1 semantics.
 
-Reports our throughput (FAST_ULYSSES_USE_TMA selects non-TMA/TMA) plus an NCCL reference.
-Run: PROF_MODE=0|1 FAST_ULYSSES_USE_TMA=0|1 torchrun --nproc_per_node=8 bench_uniform.py
+Reports our throughput plus an NCCL reference.
+Run: PROF_MODE=0|1 torchrun --nproc_per_node=8 benchmark/bench_uniform.py
 
 Times the DEFAULT copying entry point, so the copy-out is inside every number here. That is the
 like-for-like comparison: the NCCL oracle also lands its result in a tensor the caller owns.
@@ -65,19 +65,15 @@ def main() -> None:
     torch.cuda.set_device(lr)
     dev = torch.device("cuda", lr)
     pg = dist.group.WORLD
-    # FAST_ULYSSES_USE_TMA: unset -> auto (None), "0" -> non-TMA (False), else -> TMA (True).
-    _t = os.environ.get("FAST_ULYSSES_USE_TMA")
-    ut = None if _t is None else (_t != "0")
     group = UlyssesGroup(process_group=pg, initial_pool_bytes=12 << 30)
 
     mode = int(os.environ.get("PROF_MODE", "0"))
     H = int(os.environ.get("PROF_H", "128"))
     D = int(os.environ.get("PROF_D", "128"))
-    impl = "auto" if _t is None else ("TMA" if _t != "0" else "non-TMA")
     oracle = torch_a2a_mode0 if mode == 0 else torch_a2a_mode1
     if rank == 0:
         print(
-            f"=== mode{mode} | ws={ws} | H={H} D={D} | ours={impl} ===",
+            f"=== mode{mode} | ws={ws} | H={H} D={D} ===",
             flush=True,
         )
     n_list = [
@@ -89,8 +85,8 @@ def main() -> None:
             x = torch.randn(1, N // ws, H, D, dtype=torch.bfloat16, device=dev)
         else:
             x = torch.randn(1, N, H // ws, D, dtype=torch.bfloat16, device=dev)
-        # No explicit tune: the timed() warmup loop triggers the first-call lazy autotune, which caches
-        # the launch config so the timed iterations all hit the cache.
+        # The warmup inside timed() takes the first call's window allocation, so the timed
+        # iterations do not include a symmetric-heap allocation.
         remote = x.numel() * 2 * (ws - 1) / ws  # bytes leaving this rank over NVLink
         ours = timed(
             lambda: group.all_to_all_single_4d(x, mode=mode, tag=f"tk{mode}_{N}")
@@ -100,7 +96,7 @@ def main() -> None:
             og = remote / (ours[len(ours) // 2] * 1e3)
             ng = remote / (nccl[len(nccl) // 2] * 1e3)
             print(
-                f"N={N:7d} | ours({impl}) med={ours[len(ours) // 2]:8.1f}us {og:6.0f} GB/s "
+                f"N={N:7d} | ours med={ours[len(ours) // 2]:8.1f}us {og:6.0f} GB/s "
                 f"| NCCL med={nccl[len(nccl) // 2]:8.1f}us {ng:6.0f} GB/s",
                 flush=True,
             )

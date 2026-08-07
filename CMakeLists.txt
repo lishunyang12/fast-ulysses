@@ -10,6 +10,21 @@ set(CMAKE_CUDA_STANDARD 17)
 if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR "${CMAKE_CUDA_ARCHITECTURES}" STREQUAL "")
     set(CMAKE_CUDA_ARCHITECTURES "80;90;100;120")
 endif ()
+# Snapshot it HERE. find_package(Torch) below sets CMAKE_CUDA_ARCHITECTURES to OFF and drives the
+# arch selection from TORCH_CUDA_ARCH_LIST via its own -gencode flags instead, so anything read
+# after that point gets OFF rather than what was asked for.
+set(FAST_ULYSSES_ARCH_LIST "${CMAKE_CUDA_ARCHITECTURES}")
+# Torch consumes a dotted form (90 -> 9.0). setup.py already exports this; set it for a plain
+# cmake invocation too, otherwise -DCMAKE_CUDA_ARCHITECTURES is silently ignored.
+if (NOT DEFINED ENV{TORCH_CUDA_ARCH_LIST})
+    set(_arch_dotted "")
+    foreach (a IN LISTS FAST_ULYSSES_ARCH_LIST)
+        string(REGEX REPLACE "^(.+)(.)$" "\\1.\\2" _dotted "${a}")
+        list(APPEND _arch_dotted "${_dotted}")
+    endforeach ()
+    string(REPLACE ";" " " _arch_dotted "${_arch_dotted}")
+    set(ENV{TORCH_CUDA_ARCH_LIST} "${_arch_dotted}")
+endif ()
 
 # ccache: wrap CXX/CUDA compilers to cache objects and skip recompiling unchanged TUs (skipped if not installed)
 find_program(CCACHE_PROGRAM ccache)
@@ -25,6 +40,27 @@ execute_process(
         OUTPUT_VARIABLE TORCH_CMAKE_PREFIX_PATH OUTPUT_STRIP_TRAILING_WHITESPACE)
 set(CMAKE_PREFIX_PATH "${TORCH_CMAKE_PREFIX_PATH}" CACHE STRING "Torch prefix" FORCE)
 find_package(Torch REQUIRED)
+
+# ---- Does this libtorch have c10d::register_work? ----
+# It is what binds an async result's completion event to torch's work registry, which is how
+# the caller gets an AsyncCollectiveTensor (wait_tensor finds the event) instead of a handle
+# nothing forces them to wait on. Probe the LIBRARY, not the header: a declaration says
+# nothing about what libtorch_cpu exports, and the substring below is the mangled
+# c10d::register_work(const at::Tensor&, const c10::intrusive_ptr<c10d::Work>&).
+# Unquoted ${CMAKE_NM}: if it is unset, the command fails and RESULT_VARIABLE says so rather
+# than CMake erroring on an empty COMMAND. Missing it is not fatal -- csrc/work.cpp then
+# orders the result eagerly and comm.py hands back a CompletedHandle instead.
+find_library(TORCH_CPU_LIBRARY torch_cpu PATHS "${TORCH_INSTALL_PREFIX}/lib" NO_DEFAULT_PATH REQUIRED)
+execute_process(COMMAND ${CMAKE_NM} -D --defined-only "${TORCH_CPU_LIBRARY}"
+        OUTPUT_VARIABLE TORCH_CPU_SYMBOLS RESULT_VARIABLE NM_STATUS ERROR_QUIET)
+set(HAVE_C10D_REGISTER_WORK OFF)
+if (NM_STATUS EQUAL 0)
+    string(FIND "${TORCH_CPU_SYMBOLS}" "_ZN4c10d13register_workERKN2at6Tensor" REGISTER_WORK_AT)
+    if (NOT REGISTER_WORK_AT EQUAL -1)
+        set(HAVE_C10D_REGISTER_WORK ON)
+    endif ()
+endif ()
+message(STATUS "c10d::register_work available: ${HAVE_C10D_REGISTER_WORK}")
 
 # setup.py resolves NVSHMEM and passes both paths, because the install we most want to use
 # -- the nvidia-nvshmem-cu13 wheel that torch already depends on -- ships headers and
@@ -45,7 +81,16 @@ file(GLOB SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/fast_ulysses/csrc/*.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/fast_ulysses/csrc/*.cu")
 add_library(_C SHARED ${SOURCES})
 set_target_properties(_C PROPERTIES PREFIX "" SUFFIX "${EXT_SUFFIX}"
-        CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+        CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES "${FAST_ULYSSES_ARCH_LIST}")
+# What build_info() reports. The arch list is worth carrying in the binary: a .so built without
+# this GPU's arch fails in a way that does not mention arch.
+#
+# Comma-separated, because a CMake list expands with semicolons and target_compile_definitions
+# would read those as separate definitions.
+string(REPLACE ";" "," _arch_csv "${FAST_ULYSSES_ARCH_LIST}")
+target_compile_definitions(_C PRIVATE
+        FAST_ULYSSES_CUDA_ARCH_LIST="${_arch_csv}"
+        FAST_ULYSSES_NVSHMEM_HOME="${NVSHMEM_HOME}")
 # CUDA 13 moved the CCCL headers (cuda/std/*) into include/cccl, where nvshmem.h no longer
 # finds them -- and nvshmem.h is included by bindings.cpp, so the HOST compiler needs the
 # path too, not just nvcc. Adding it here removes what INSTALL.md used to ask users to pass
@@ -66,14 +111,20 @@ find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/li
 # nvshmemi_init_thread out, the symbol that clashes with torch's libtorch_nvshmem.so (see the
 # DEVIATION notes in ulysses_group.cu).
 target_link_libraries(_C PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} Python::Module
-        "${NVSHMEM_HOST_LIB}" cuda)  # cuda: CUDA driver, for cuTensorMapEncodeTiled (TMA)
+        "${NVSHMEM_HOST_LIB}")
 # The wheel layout is not on any default search path, so bake it in rather than making every
 # caller set LD_LIBRARY_PATH.
 get_filename_component(NVSHMEM_LIB_DIR "${NVSHMEM_HOST_LIB}" DIRECTORY)
 set_target_properties(_C PROPERTIES BUILD_WITH_INSTALL_RPATH ON
         INSTALL_RPATH "${NVSHMEM_LIB_DIR}")
+if (HAVE_C10D_REGISTER_WORK)
+    target_compile_definitions(_C PRIVATE FAST_ULYSSES_HAS_WORK_REGISTRY=1)
+else ()
+    message(WARNING "c10d::register_work not found in ${TORCH_CPU_LIBRARY}: the async calls will "
+            "return a CompletedHandle instead of an AsyncCollectiveTensor, with the caller's stream "
+            "made to wait at launch -- correct, but no overlap.")
+    target_compile_definitions(_C PRIVATE FAST_ULYSSES_HAS_WORK_REGISTRY=0)
+endif ()
 # -t0: nvcc compiles the per-arch device passes in parallel (one thread per arch)
 target_compile_options(_C PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:-O3 -t0 --expt-relaxed-constexpr
-        -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__
-        -U__CUDA_NO_BFLOAT16_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__>)
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3 -t0 --expt-relaxed-constexpr>)

@@ -1,25 +1,22 @@
 """torchrun worker: what happens if two live groups OVERLAP instead of partitioning?
 
 a2a_subgroup.py covers the shape production uses -- tp2 x sp4 gives {0,2,4,6} and {1,3,5,7},
-which PARTITION the job. That works. But nothing in the API stops a caller building groups that
-share ranks, and reading NVSHMEM 3.7's src/host/team/team_internal.cpp suggests it cannot work:
+which PARTITION the job. Nothing in the API stops a caller building groups that share ranks
+instead.
 
-  * each PE here calls `nvshmem_team_split_strided` ONCE with its OWN triplet, which is not how
-    NVSHMEM uses it internally (`nvshmemi_team_split_2d` loops the call with every PE in every
-    call, non-members included);
-  * `nvshmemi_team_split_strided` brackets its body with PARENT-team collectives
-    (nvshmemi_barrier before; quiet + team_sync + check_collective_error after) while the body's
-    AND-reduce, which picks the team index, runs over the CHILD triplet alone.
+ANSWERED, and the answer is a HANG in the constructor. The team split brackets its body in
+PARENT-team collectives while the reduce that picks the team index runs over the child triplet
+alone, so a rank in two groups enters the parent collective twice and a rank in one enters it
+once. Members block, non-members walk past. Nothing detects this: a rank-local check cannot see
+a divergence that is already present in the first construction, and an all-gather cannot help
+because only members reach the constructor at all. csrc/ulysses_group.cu carries the constraint.
 
-So a rank that belongs to two groups enters the parent collective twice while a rank that
-belongs to one enters it once. That is a divergence, and divergence in a collective is a hang,
-not an error -- the worst failure mode, because the user gets nothing to read.
+So this file is NOT registered in tests/test_multigpu.py and must not be -- running it hangs the
+job until the harness timeout. It is kept as the reproducer for the day someone adds the
+job-level layout check that would make the case detectable.
 
-This worker does not assert a particular outcome. It records WHICH one, so the constructor can
-be made to reject the case if it is a hang. A hang is caught by the harness timeout: if this
-prints "building overlapping groups" and then nothing, that is the answer.
-
-Run:  torchrun --nproc_per_node=8 tests/distributed/a2a_overlapping_groups.py
+Run by hand, expecting a timeout:
+    torchrun --nproc_per_node=8 tests/distributed/a2a_overlapping_groups.py
 """
 
 from __future__ import annotations

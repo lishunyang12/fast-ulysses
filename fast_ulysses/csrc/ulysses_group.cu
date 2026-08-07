@@ -27,8 +27,7 @@ __global__ void ulysses_barrier_kernel(uint64_t* local, BarPeers peers, int ws, 
     // The epoch is advanced ON THE DEVICE, not passed in from the host. That is what makes a captured
     // call replayable: a host-computed epoch is a constant baked into the graph, so every replay
     // announces the same value, the peer flags already hold it from the previous replay, and the wait
-    // is satisfied by stale state -- a handshake that silently does nothing. (In the NCCL reference
-    // build of this operator that corrupted 260k elements on the FIRST replay.)
+    // is satisfied by stale state -- a handshake that silently does nothing.
     //
     // atomicAdd rather than a plain read-modify-write: barrier state is per tag and a tag's calls are
     // ordered, so two of these are never resident on one counter in correct use; the atomic keeps a
@@ -61,14 +60,27 @@ const UlyssesGroup::BarrierState& UlyssesGroup::barrier_state_(const std::string
     const auto& buf = pool_->acquire(static_cast<int64_t>(world_size_), at::kLong, "__ulysses_sync__" + tag);
     st.my_flags     = buf.sym_base;
     st.peer_flags   = buf.peer_ptrs;
-    // Epoch counter: this rank's own device memory, never addressed by a peer.
-    ULYSSES_CUDA_CHECK(cudaMalloc(&st.epoch, sizeof(uint64_t)));
+    // Epoch counter: never addressed by a peer, but taken from the pool rather than cudaMalloc'd.
+    // cudaMalloc is not stream-ordered and blocks the host until the device drains, which with a
+    // spin barrier in flight is the same deadlock the pool's one-slab design exists to remove.
+    const auto& ep = pool_->acquire(1, at::kLong, "__ulysses_epoch__" + tag);
+    st.epoch       = reinterpret_cast<uint64_t*>(ep.sym_base);
     ULYSSES_CUDA_CHECK(cudaMemsetAsync(st.epoch, 0, sizeof(uint64_t), stream));  // first kernel publishes 1
     ULYSSES_CUDA_CHECK(cudaMemsetAsync(st.my_flags, 0, world_size_ * sizeof(uint64_t), stream));
     // One slow sync: ensure all ranks finish clearing before anyone writes a flag (otherwise the
     // clear could overwrite an already-written epoch).
     nvshmemx_barrier_on_stream(team_, stream);
     return barriers_.emplace(tag, std::move(st)).first->second;
+}
+
+int64_t UlyssesGroup::barrier_epoch(const std::string& tag)
+{
+    auto it = barriers_.find(tag);
+    if (it == barriers_.end())
+        return 0;
+    uint64_t value = 0;
+    ULYSSES_CUDA_CHECK(cudaMemcpy(&value, it->second.epoch, sizeof(value), cudaMemcpyDeviceToHost));
+    return static_cast<int64_t>(value);
 }
 
 void UlyssesGroup::fast_barrier(cudaStream_t stream, const std::string& tag)
@@ -79,12 +91,13 @@ void UlyssesGroup::fast_barrier(cudaStream_t stream, const std::string& tag)
     BarPeers            peers;
     for (int i = 0; i < world_size_; ++i)
         peers.p[i] = st.peer_flags[i];
-    // NOTE (measured on 4xH200, CUDA 13.3): a cuStreamWriteValue64/WaitValue64 variant of
-    // this barrier -- attractive on paper because the CE a2a path would then never need an
-    // SM slot -- was tried and REVERTED: stream memops interfered with concurrent GEMMs
-    // (overlap hidden% dropped from +34% to -28% with WRITE_VALUE_DEFAULT and -15% with
-    // NO_MEMORY_BARRIER). The 1-block spin kernel only needs an SM slot at a kernel
-    // boundary and empirically wins under compute pressure.
+    // A spin kernel, not stream memops (cuStreamWriteValue64/WaitValue64), even though memops
+    // look better on paper -- the transfer path would then need no SM at all. Two reasons they
+    // are not used. They measure worse under concurrent compute, turning the overlap this
+    // operator exists for into a regression (docs/BENCHMARK.md), and the waiting form needs a
+    // remote-write-flush device attribute that much of the target hardware lacks, while this
+    // kernel's inline PTX is available from sm_70 up. It needs an SM slot only at a kernel
+    // boundary, so it gets one even while compute is resident.
     ulysses_barrier_kernel<<<1, 32, 0, stream>>>(
         reinterpret_cast<uint64_t*>(st.my_flags), peers, world_size_, my_rank_, st.epoch);
     ULYSSES_CUDA_CHECK(cudaGetLastError());  // catch a barrier-kernel launch failure
@@ -140,8 +153,7 @@ UlyssesGroup::UlyssesGroup(std::vector<int64_t> peer_global_pes,
     device_id_(static_cast<int>(device_id))
 {
     TORCH_CHECK(g_world_inited, "init_world must be called before constructing UlyssesGroup");
-    TORCH_CHECK(
-        world_size_ >= 1 && world_size_ <= 8, "world_size must be in [1, 8] (single-node NVLink), got ", world_size_);
+    TORCH_CHECK(world_size_ >= 1 && world_size_ <= 8, "world_size must be in [1, 8] (one node), got ", world_size_);
     ULYSSES_CUDA_CHECK(cudaSetDevice(device_id_));
     peer_global_pes_.reserve(world_size_);
     for (auto pe : peer_global_pes)
@@ -153,18 +165,27 @@ UlyssesGroup::UlyssesGroup(std::vector<int64_t> peer_global_pes,
     //
     // Each PE passes its OWN triplet below, which is not the shape the API is built for: NVSHMEM's
     // own nvshmem_team_split_2d gets its two axis teams by looping split_strided with EVERY PE in
-    // EVERY call, non-members included. What the one-call-per-PE form here rests on was READ out of
-    // NVSHMEM 3.7.2's team_internal.cpp and has NOT been run: nvshmemi_team_split_strided wraps its
-    // body in PARENT-team collectives -- a barrier before, quiet + team_sync + an error allreduce --
-    // while the body, the AND-reduce that picks the team index, runs over the CHILD triplet alone.
+    // EVERY call, non-members included. The one-call-per-PE form used here works because the split
+    // wraps its body in PARENT-team collectives -- a barrier, then quiet, team sync and an error
+    // allreduce -- while the body that picks the team index reduces over the CHILD triplet alone.
+    //
     // Hence the contract comm.py states: the live groups must PARTITION the job, every PE in
     // exactly one and all of them constructing together, so those parent-team collectives still
-    // pair up one for one. Measured: two groups sharing PEs ({0,1,2,3} and {2,3,4,5} at 8 ranks)
-    // HANG inside the constructor -- members block, non-members walk on. NOT ENFORCED: a local
-    // check cannot see it, because the divergence is already present in the FIRST construction,
-    // where the PEs outside that group never enter the split at all. Catching it needs an
-    // all-gather of the PE sets at construction time, confirming they partition the world. Two disjoint teams may come back with the SAME team index -- the psync that
-    // index names is each PE's own, so teams sharing no PE never meet in it.
+    // pair up one for one. Groups that overlap instead hang right here -- members block on the
+    // parent collectives, non-members walk past them.
+    //
+    // NOT ENFORCED, and two attempts at enforcing it failed in instructive ways. A local check
+    // of the PE sets already built cannot see it: the divergence is present in the FIRST
+    // construction, before any second group exists. An all-gather of the PE sets cannot either,
+    // because it is itself collective over the world and only GROUP MEMBERS reach the
+    // constructor -- the ranks that join no group never arrive, so the gather hangs in place of
+    // the split. Both were written, measured, and removed rather than left looking like
+    // protection.
+    //
+    // The check has to be something every rank calls, which means it cannot live in a
+    // constructor only members call. A module-level entry the caller invokes on all ranks with
+    // the intended layout would work; it is not built. Two disjoint teams may come back with the SAME team index -- the
+    // psync that index names is each PE's own, so teams sharing no PE never meet in it.
     const int gpes          = nvshmem_n_pes();
     bool      is_full_world = (world_size_ == gpes);
     for (int i = 0; i < world_size_ && is_full_world; ++i)
@@ -216,9 +237,7 @@ UlyssesGroup::UlyssesGroup(std::vector<int64_t> peer_global_pes,
 const CEResources& UlyssesGroup::ce_resources()
 {
     if (!ce_ready_) {
-        ce_.streams.resize(world_size_);
-        for (int i = 0; i < world_size_; ++i)
-            ULYSSES_CUDA_CHECK(cudaStreamCreateWithFlags(&ce_.streams[i], cudaStreamNonBlocking));
+        ULYSSES_CUDA_CHECK(cudaStreamCreateWithFlags(&ce_.xfer, cudaStreamNonBlocking));
         ce_ready_ = true;
     }
     return ce_;
@@ -231,17 +250,12 @@ void UlyssesGroup::destroy()
     if (ce_ready_) {
         // Unchecked teardown calls, matching the rest of destroy(): the caller already
         // guarantees quiescence (comm.py drains the comm stream + dist.barrier first).
-        for (auto s : ce_.streams) {
-            cudaStreamSynchronize(s);
-            cudaStreamDestroy(s);
-        }
+        cudaStreamSynchronize(ce_.xfer);
+        cudaStreamDestroy(ce_.xfer);
         ce_       = {};
         ce_ready_ = false;
     }
-    // Epoch counters only (unchecked, like the stream teardown above); the flags they go with are
-    // pool segments and go away with pool_->destroy().
-    for (auto& [tag, st] : barriers_)
-        cudaFree(st.epoch);
+    // Both the flags and the epoch counters are pool windows, so pool_->destroy() reclaims them.
     barriers_.clear();
     if (pool_)
         pool_->destroy();

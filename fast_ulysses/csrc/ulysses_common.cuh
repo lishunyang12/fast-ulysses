@@ -14,14 +14,12 @@ namespace ulysses {
         TORCH_CHECK(err_ == cudaSuccess, "CUDA error (" #expr "): ", cudaGetErrorString(err_));                        \
     } while (0)
 
-// System-scope release publish / acquire load, used by fast_barrier on every arch. These were
-// in tma_ptx.cuh, which was TMA-only otherwise and is gone with the TMA path.
+// System-scope release publish / acquire load, used by fast_barrier on every arch.
 
 // The publish is a MAX, not a store, so a flag can never move backwards. Barrier state is per
 // tag and a tag's calls are ordered, so with the contract kept this cannot arise and the MAX is
 // NOT load-bearing; what it buys is that a caller who breaks the same-tag contract cannot pin a
-// peer's flag BELOW the epoch that peer is waiting for. Carried over from the NCCL reference
-// build of this operator, which publishes the same way.
+// peer's flag BELOW the epoch that peer is waiting for.
 __device__ __forceinline__ void red_release_sys_max_u64(uint64_t* addr, uint64_t v)
 {
     asm volatile("red.release.sys.global.max.u64 [%0], %1;" ::"l"(addr), "l"(v) : "memory");

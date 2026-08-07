@@ -50,8 +50,7 @@ def main() -> None:
     group = UlyssesGroup(process_group=pg, initial_pool_bytes=1 << 30)
 
     b = 2
-    # d=512 exceeds the TMA tensormap boxDim cap (256): auto must fall back to non-TMA and still
-    # be bit-exact (explicit True/False stay restricted to d in {64,128} below).
+    # d=512 is in the sweep so the largest head dim stays bit-exact.
     for dtype in (torch.float16, torch.bfloat16):
         for d in (64, 128, 256, 512):
             for mode in (0, 1):
@@ -72,16 +71,6 @@ def main() -> None:
                         flush=True,
                     )
                 dist.barrier()
-
-    # d=512 used to be rejected because TMA's tensormap has a boxDim cap. The copy engines have
-    # no such limit, so it is now an ordinary shape and is checked like any other.
-    x = torch.randn(b, 16, 4 * ws, 512, dtype=torch.bfloat16, device=dev)
-    ref = torch_a2a(x, 0, ws, pg)
-    if not torch.equal(group.all_to_all_single_4d(x, mode=0, tag="d512"), ref):
-        raise AssertionError(f"MISMATCH rank={rank} ws={ws} d=512 mode=0")
-    if rank == 0:
-        print(f"OK[d512] ws={ws}", flush=True)
-    dist.barrier()
 
     # Distinct-tag non-aliasing (replaces the old a2a_frame): two concurrently-live results of the SAME
     # shape must use distinct tags and not clobber each other. Run both a2a, THEN check both -- if out_q

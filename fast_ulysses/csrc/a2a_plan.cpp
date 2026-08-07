@@ -1,7 +1,7 @@
 #include "a2a_plan.h"
 
 #include <algorithm>
-#include <numeric>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -12,6 +12,32 @@ namespace {
 [[noreturn]] void fail(const std::string& message)
 {
     throw std::invalid_argument("fast_ulysses: " + message);
+}
+
+// Both operands are already known non-negative (A2ADims::validate rejects negatives).
+//
+// Only the caller's OWN shard is cross-checked against the tensor it handed in -- a peer's entry
+// in seq_splits/head_splits is bounded by nothing. A product that wraps yields a negative
+// window_numel, which then passes SymmetricHeapPool::acquire's capacity check (it compares
+// against a positive reserve) and is then carved out of the pool as an enormous unsigned size.
+int64_t checked_mul(int64_t a, int64_t b, const std::string& what)
+{
+    if (a != 0 && b > std::numeric_limits<int64_t>::max() / a) {
+        fail(what + " overflows int64 (" + std::to_string(a) + " * " + std::to_string(b) + ")");
+    }
+    return a * b;
+}
+
+int64_t checked_sum(const std::vector<int64_t>& values, const std::string& what)
+{
+    int64_t total = 0;
+    for (int64_t v : values) {
+        if (v > std::numeric_limits<int64_t>::max() - total) {
+            fail(what + " overflows int64");
+        }
+        total += v;
+    }
+    return total;
 }
 
 std::vector<int64_t> exclusive_prefix_sum(const std::vector<int64_t>& values)
@@ -28,14 +54,13 @@ std::vector<int64_t> exclusive_prefix_sum(const std::vector<int64_t>& values)
 // Emit `depth` batch repetitions of `op`, `src_stride` / `dst_stride` bytes apart, as one 3D copy
 // when that is both expressible and not slower, and as `depth` 2D copies otherwise.
 //
-// Only MULTI-ROW copies are fused. Folding b single-row copies (each a flat memcpy) into a 3D
-// copy of b slices puts them on the strided path and measured 0.67 -> 2.24 ms at b=2 on a PCIe
-// box. Pitched copies are the opposite case: already strided, so fusing costs nothing on the
-// device and removes (b-1) launches per peer, the only thing that grows with b (host submit
-// 59.9 -> 31.9 us at b=4). Both figures were measured in custom_nccl_op, the NCCL-symmetric-
-// window sibling of this operator, and have NOT been re-run here. Keeping the restriction also
-// means the rows == 1 case (s_local == 1) still issues b separate 2D copies, exactly what this
-// transport issued before the plan existed.
+// Only MULTI-ROW copies are fused, and the restriction is the point. A single-row copy is a flat
+// memcpy; folding b of them into one 3D copy of b slices moves them onto the strided path, which
+// is markedly slower. A pitched copy is already strided, so fusing costs it nothing on the device
+// and removes (b-1) launches per peer -- the only per-call cost that grows with b. So the rule
+// buys host submit time exactly where it is free, and declines it where it is not.
+//
+// Consequence worth knowing: at rows == 1 (s_local == 1) this still issues b separate 2D copies.
 //
 // cudaMemcpy3DParms also does not take a slice stride: it derives one as pitch * ysize. So a
 // stride is only expressible when it divides the pitch exactly and leaves room for the rows.
@@ -64,12 +89,12 @@ void push_batched(std::vector<CopyOp>& out, CopyOp op, int64_t depth, int64_t sr
 
 int64_t A2ADims::seq_total() const
 {
-    return std::accumulate(seq_splits.begin(), seq_splits.end(), int64_t{0});
+    return checked_sum(seq_splits, "seq_splits total");
 }
 
 int64_t A2ADims::head_total() const
 {
-    return std::accumulate(head_splits.begin(), head_splits.end(), int64_t{0});
+    return checked_sum(head_splits, "head_splits total");
 }
 
 std::vector<int64_t> A2ADims::seq_offsets() const
@@ -137,9 +162,11 @@ A2APlan build_plan(const A2ADims& dims, int mode, int64_t elem_size)
     // Window size: the largest receive over all ranks. Every rank's output is dense from the
     // window base, so this is just the max of the per-rank output sizes. See A2APlan.
     for (int p = 0; p < dims.world_size; ++p) {
-        const int64_t peer_numel = (mode == kScatterHead) ? dims.b * seq_total * dims.head_splits[p] * dims.d :
-                                                            dims.b * dims.seq_splits[p] * head_total * dims.d;
-        plan.window_numel        = std::max(plan.window_numel, peer_numel);
+        const int64_t rows       = (mode == kScatterHead) ? seq_total : dims.seq_splits[p];
+        const int64_t heads      = (mode == kScatterHead) ? dims.head_splits[p] : head_total;
+        const int64_t peer_numel = checked_mul(
+            checked_mul(checked_mul(dims.b, rows, "window size"), heads, "window size"), dims.d, "window size");
+        plan.window_numel = std::max(plan.window_numel, peer_numel);
     }
 
     for (int p = 0; p < dims.world_size; ++p) {
@@ -164,10 +191,9 @@ A2APlan build_plan(const A2ADims& dims, int mode, int64_t elem_size)
         else {
             // The inverse: send peer p the sequence rows it owns, carrying only this rank's head
             // columns, into p's window at this rank's head offset -- a STRIDED write across the
-            // link, which custom_nccl_op measured ~9% below a contiguous one (352.8 vs 389.7
-            // GB/s, 4xH200; not re-measured here). Landing the bytes contiguously in a
-            // per-sender segment instead is not available to this operator at all: the window IS
-            // the returned tensor, so there is no local pass to interleave them afterwards.
+            // link, which runs somewhat below a contiguous one. Landing the bytes contiguously in
+            // a per-sender segment instead is not available to this operator at all: the window
+            // IS the returned tensor, so there is no local pass to interleave them afterwards.
             const int64_t row = n_me * d_bytes;
             const int64_t s_p = dims.seq_splits[p];
             if (row == 0 || s_p == 0) {

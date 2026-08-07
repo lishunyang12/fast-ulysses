@@ -3,7 +3,7 @@
 Each worker under tests/distributed/ is a standalone torchrun script and can also be run directly:
     torchrun --nproc_per_node=8 tests/distributed/a2a_correctness.py
 Needs >=2 GPUs (skipped otherwise). By default each worker runs at min(ngpu, 8) processes plus, when
->=3 GPUs are present, an odd world size (different kernel template instantiations).
+>=3 GPUs are present, an odd world size (exercises the non-power-of-two peer sweep).
 FAST_ULYSSES_TEST_NPROC overrides the process count list with a single value.
 """
 
@@ -33,7 +33,7 @@ def _nprocs() -> list[int]:
     ngpu = torch.cuda.device_count()
     out = {min(max(ngpu, 2), 8)}
     if ngpu >= 3:
-        out.add(3)  # odd world size: exercises the odd-WS launch_ws template instantiations
+        out.add(3)  # odd world size: exercises launch_a2a_ce's non-power-of-two peer sweep
     return sorted(out)
 
 
@@ -52,6 +52,10 @@ def _nprocs() -> list[int]:
         "a2a_cudagraph.py",
         "a2a_ce_flag_ordering.py",
         "a2a_overlapping_barriers.py",
+        # The one adversarial worker whose control does NOT need a rebuild: it arms the fault
+        # itself, so it re-proves it can fail on every run rather than in a comment.
+        "a2a_ce_fault_injection.py",
+        "a2a_alias_guard.py",
     ],
 )
 def test_multigpu_worker(worker, nproc):
@@ -61,14 +65,19 @@ def test_multigpu_worker(worker, nproc):
     _run_worker(worker, nproc)
 
 
-def test_multigpu_subgroup():
-    """tp=2 x ulysses-sp: two stride-2 subgroups of the same job, live together."""
+@pytest.mark.parametrize("worker", ["a2a_subgroup.py", "a2a_subgroup_divergent.py"])
+def test_multigpu_subgroup(worker):
+    """tp=2 x ulysses-sp: two stride-2 subgroups of the same job, live together.
+
+    Identical shapes in both groups (a2a_subgroup) and, after reserve() has taken the collective
+    allocation off the call path, deliberately divergent ones (a2a_subgroup_divergent).
+    """
     env = os.environ.get("FAST_ULYSSES_TEST_NPROC")
     nproc = int(env) if env else min(torch.cuda.device_count(), 8)
     nproc -= nproc % 2  # tp=2 needs an even world
     if nproc < 4:
         pytest.skip(f"needs >=4 GPUs for tp=2 x sp>=2, found {torch.cuda.device_count()}")
-    _run_worker("a2a_subgroup.py", nproc)
+    _run_worker(worker, nproc)
 
 
 def _run_worker(worker: str, nproc: int) -> None:

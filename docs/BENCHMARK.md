@@ -93,6 +93,20 @@ into one `cudaMemcpy3DAsync` per peer instead of `b`.
 Only multi-row copies are fused: folding a single-row flat memcpy into a 3D copy puts it on the
 strided path and is slower.
 
+## Alternatives tried and not adopted
+
+Kept here rather than in comments, so the code says what it does and this says why the
+alternatives were dropped. Same machine and conditions as above unless noted.
+
+| alternative | result |
+|---|---|
+| One stream per peer, and everything on one stream | See the table above; both are slower than remote-serialised with the own share on the caller's stream. |
+| Sequential peer order instead of XOR-shift | XOR-shift pairs ranks without coordination; measured in the sibling NCCL implementation at ~14%, not re-run here. |
+| `cudaMemcpy3DBatchAsync` | 0.82 ms, and 1.35 ms with `cudaMemcpyFlagPreferOverlapWithCompute`, against the plain `cudaMemcpy3DAsync` used instead. Also rejects the legacy default stream with "invalid argument". |
+| Fusing single-row copies into 3D | 0.67 → 2.24 ms at `b=2`. Fusing is applied only to multi-row copies for this reason. |
+| Contiguous per-sender segments instead of strided writes (mode 1) | Strided runs ~9% below contiguous (352.8 vs 389.7 GB/s in the sibling implementation). Not available here regardless: the window IS the returned tensor, so there is no local pass to interleave afterwards. |
+| `cuStreamWriteValue64` / `cuStreamWaitValue64` barrier instead of the spin kernel | Concurrent-GEMM overlap fell from +34% to −28% (`WRITE_VALUE_DEFAULT`) and −15% (`NO_MEMORY_BARRIER`). The waiting form also needs `CU_DEVICE_ATTRIBUTE_CAN_FLUSH_REMOTE_WRITES`, which is 0 on much of the target hardware, while the spin kernel's inline PTX is available from sm_70 up. |
+
 ## What is not measured here
 
 - **End-to-end model impact.** These are microbenchmarks — warm L2, no neighbours competing for
