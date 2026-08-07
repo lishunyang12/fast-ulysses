@@ -34,7 +34,10 @@ if (CCACHE_PROGRAM)
     message(STATUS "ccache enabled: ${CCACHE_PROGRAM}")
 endif ()
 
-find_package(Python COMPONENTS Interpreter Development REQUIRED)
+# Development.Module, not Development: the target below links Python::Module, which needs only the
+# headers. Plain Development also demands libpython, which a manylinux CPython does not ship at all,
+# so asking for it fails everywhere the release wheels are actually built.
+find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 execute_process(
         COMMAND ${Python_EXECUTABLE} -c "import torch; print(torch.utils.cmake_prefix_path)"
         OUTPUT_VARIABLE TORCH_CMAKE_PREFIX_PATH OUTPUT_STRIP_TRAILING_WHITESPACE)
@@ -77,6 +80,22 @@ if (NOT DEFINED EXT_SUFFIX)
     set(EXT_SUFFIX ".so")
 endif ()
 
+# One version literal, in fast_ulysses/__init__.py. Parse it here so a bare `cmake -S . -B build`
+# bakes the same string the Python side reports; setup.py overrides it with the full version
+# including any local tag.
+if (NOT DEFINED FAST_ULYSSES_VERSION)
+    file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/fast_ulysses/__init__.py" _version_line
+            REGEX "^__version__[ \t]*=")
+    string(REGEX REPLACE ".*\"([^\"]+)\".*" "\\1" FAST_ULYSSES_VERSION "${_version_line}")
+endif ()
+# Re-run configure when the literal is bumped, so the baked macro cannot go stale.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/fast_ulysses/__init__.py")
+
+# Wheel builds bake only $ORIGIN-relative RPATH entries; developer builds also keep the absolute
+# directory this build found NVSHMEM in.
+option(FAST_ULYSSES_RELOCATABLE "Emit an $ORIGIN-only RPATH (wheel builds)" OFF)
+
 file(GLOB SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/fast_ulysses/csrc/*.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/fast_ulysses/csrc/*.cu")
 add_library(_C SHARED ${SOURCES})
@@ -89,6 +108,7 @@ set_target_properties(_C PROPERTIES PREFIX "" SUFFIX "${EXT_SUFFIX}"
 # would read those as separate definitions.
 string(REPLACE ";" "," _arch_csv "${FAST_ULYSSES_ARCH_LIST}")
 target_compile_definitions(_C PRIVATE
+        FAST_ULYSSES_VERSION="${FAST_ULYSSES_VERSION}"
         FAST_ULYSSES_CUDA_ARCH_LIST="${_arch_csv}"
         FAST_ULYSSES_NVSHMEM_HOME="${NVSHMEM_HOME}")
 # CUDA 13 moved the CCCL headers (cuda/std/*) into include/cccl, where nvshmem.h no longer
@@ -113,10 +133,24 @@ find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/li
 target_link_libraries(_C PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} Python::Module
         "${NVSHMEM_HOST_LIB}")
 # The wheel layout is not on any default search path, so bake it in rather than making every
-# caller set LD_LIBRARY_PATH.
-get_filename_component(NVSHMEM_LIB_DIR "${NVSHMEM_HOST_LIB}" DIRECTORY)
+# caller set LD_LIBRARY_PATH. Relative to $ORIGIN (= <site-packages>/fast_ulysses) so the wheel
+# stays relocatable; four nvidia directories because the cudart wheel layout differs across torch
+# minors. These stay DT_RUNPATH -- no --disable-new-dtags -- so LD_LIBRARY_PATH can still override
+# the bundled NVSHMEM with a site build.
+set(FAST_ULYSSES_RPATH
+        "$ORIGIN/../nvidia/nvshmem/lib"
+        "$ORIGIN/../nvidia/cu13/lib"
+        "$ORIGIN/../nvidia/cu12/lib"
+        "$ORIGIN/../nvidia/cuda_runtime/lib"
+        "$ORIGIN/../torch/lib")
+if (NOT FAST_ULYSSES_RELOCATABLE)
+    # Developer build: nothing of that layout exists above $ORIGIN, so fall back to where this
+    # build found NVSHMEM -- last, so an installed copy still wins.
+    get_filename_component(NVSHMEM_LIB_DIR "${NVSHMEM_HOST_LIB}" DIRECTORY)
+    list(APPEND FAST_ULYSSES_RPATH "${NVSHMEM_LIB_DIR}")
+endif ()
 set_target_properties(_C PROPERTIES BUILD_WITH_INSTALL_RPATH ON
-        INSTALL_RPATH "${NVSHMEM_LIB_DIR}")
+        INSTALL_RPATH "${FAST_ULYSSES_RPATH}")
 if (HAVE_C10D_REGISTER_WORK)
     target_compile_definitions(_C PRIVATE FAST_ULYSSES_HAS_WORK_REGISTRY=1)
 else ()

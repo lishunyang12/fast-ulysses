@@ -13,25 +13,19 @@ namespace ulysses {
 static bool g_world_inited = false;
 static int  g_live_groups  = 0;
 
-// ---- Custom NVLink flag barrier ----
-// Flag layout: each rank holds uint64 flags[ws] PER TAG. On arrival, rank r publishes epoch into
-// every peer p's flags[r] (P2P, release/sys MAX), then spins until its own flags[0..ws-1] all >= epoch
-// (acquire/sys). Monotonically increasing epoch means no reset and no ABA. Strict lockstep within a
-// tag (SPMD collective) keeps epoch identical across ranks throughout.
+// Flag barrier. Each rank holds uint64 flags[ws] PER TAG. On arrival, rank r publishes epoch into
+// every peer p's flags[r] (release/sys MAX), then spins until its own flags[0..ws-1] are all >=
+// epoch (acquire/sys). A monotonically increasing epoch means no reset and no ABA.
 struct BarPeers {
     uint64_t p[8];
 };
 
 __global__ void ulysses_barrier_kernel(uint64_t* local, BarPeers peers, int ws, int rank, uint64_t* epoch_counter)
 {
-    // The epoch is advanced ON THE DEVICE, not passed in from the host. That is what makes a captured
-    // call replayable: a host-computed epoch is a constant baked into the graph, so every replay
-    // announces the same value, the peer flags already hold it from the previous replay, and the wait
-    // is satisfied by stale state -- a handshake that silently does nothing.
-    //
-    // atomicAdd rather than a plain read-modify-write: barrier state is per tag and a tag's calls are
-    // ordered, so two of these are never resident on one counter in correct use; the atomic keeps a
-    // caller who breaks that contract from losing an epoch outright instead of failing.
+    // The epoch is advanced ON THE DEVICE, which is what makes a captured call replayable: a
+    // host-computed epoch is a constant baked into the graph, so every replay announces a value the
+    // peer flags already hold and the wait is satisfied by stale state. atomicAdd, so that a caller
+    // who breaks the same-tag ordering contract cannot lose an epoch outright.
     __shared__ uint64_t epoch;
     if (threadIdx.x == 0)
         epoch = atomicAdd(reinterpret_cast<unsigned long long*>(epoch_counter), 1ULL) + 1;
@@ -60,15 +54,14 @@ const UlyssesGroup::BarrierState& UlyssesGroup::barrier_state_(const std::string
     const auto& buf = pool_->acquire(static_cast<int64_t>(world_size_), at::kLong, "__ulysses_sync__" + tag);
     st.my_flags     = buf.sym_base;
     st.peer_flags   = buf.peer_ptrs;
-    // Epoch counter: never addressed by a peer, but taken from the pool rather than cudaMalloc'd.
-    // cudaMalloc is not stream-ordered and blocks the host until the device drains, which with a
-    // spin barrier in flight is the same deadlock the pool's one-slab design exists to remove.
+    // Epoch counter: never addressed by a peer, but taken from the pool rather than cudaMalloc'd,
+    // which is not stream-ordered and blocks the host until the device drains -- with a spin
+    // barrier in flight, the deadlock the pool's one-slab design exists to remove.
     const auto& ep = pool_->acquire(1, at::kLong, "__ulysses_epoch__" + tag);
     st.epoch       = reinterpret_cast<uint64_t*>(ep.sym_base);
     ULYSSES_CUDA_CHECK(cudaMemsetAsync(st.epoch, 0, sizeof(uint64_t), stream));  // first kernel publishes 1
     ULYSSES_CUDA_CHECK(cudaMemsetAsync(st.my_flags, 0, world_size_ * sizeof(uint64_t), stream));
-    // One slow sync: ensure all ranks finish clearing before anyone writes a flag (otherwise the
-    // clear could overwrite an already-written epoch).
+    // All ranks must finish clearing before anyone writes a flag, or a clear overwrites an epoch.
     nvshmemx_barrier_on_stream(team_, stream);
     return barriers_.emplace(tag, std::move(st)).first->second;
 }
@@ -91,13 +84,9 @@ void UlyssesGroup::fast_barrier(cudaStream_t stream, const std::string& tag)
     BarPeers            peers;
     for (int i = 0; i < world_size_; ++i)
         peers.p[i] = st.peer_flags[i];
-    // A spin kernel, not stream memops (cuStreamWriteValue64/WaitValue64), even though memops
-    // look better on paper -- the transfer path would then need no SM at all. Two reasons they
-    // are not used. They measure worse under concurrent compute, turning the overlap this
-    // operator exists for into a regression (docs/BENCHMARK.md), and the waiting form needs a
-    // remote-write-flush device attribute that much of the target hardware lacks, while this
-    // kernel's inline PTX is available from sm_70 up. It needs an SM slot only at a kernel
-    // boundary, so it gets one even while compute is resident.
+    // A spin kernel, not stream memops (cuStreamWriteValue64/WaitValue64): the waiting memop needs
+    // a remote-write-flush device attribute that is not always present, while this kernel's inline
+    // PTX only requires sm_70. It needs an SM slot only at a kernel boundary.
     ulysses_barrier_kernel<<<1, 32, 0, stream>>>(
         reinterpret_cast<uint64_t*>(st.my_flags), peers, world_size_, my_rank_, st.epoch);
     ULYSSES_CUDA_CHECK(cudaGetLastError());  // catch a barrier-kernel launch failure
@@ -125,20 +114,17 @@ void UlyssesGroup::init_world(std::vector<int64_t> uid_ints, int64_t global_rank
     TORCH_CHECK(static_cast<int64_t>(uid_ints.size()) >= uniqueid_nints(), "uid_ints too short");
     nvshmemx_uniqueid_t uid;
     std::memcpy(&uid, uid_ints.data(), sizeof(uid));
-    // Use INITIALIZER, not memset(0): it stamps the version field of attr/args/uid_args.
-    // nvshmemx_set_attr_uniqueid_args does not write version, and hostlib_init_attr dispatches the V2
-    // path based on attr.args.version, so the version must be stamped first (inline nvshmemx_init_attr
-    // auto-stamps when version is invalid; here we explicitly substitute that step).
+    // Use INITIALIZER, not memset(0): it stamps the version field, which
+    // nvshmemx_set_attr_uniqueid_args does not write and hostlib_init_attr dispatches on. Inline
+    // nvshmemx_init_attr would have stamped it for us.
     nvshmemx_init_attr_t attr = NVSHMEMX_INIT_ATTR_INITIALIZER;
     TORCH_CHECK(
         nvshmemx_set_attr_uniqueid_args(static_cast<int>(global_rank), static_cast<int>(global_nranks), &uid, &attr)
             == 0,
         "nvshmemx_set_attr_uniqueid_args failed");
-    // DEVIATION: use the host-lib direct entry nvshmemx_hostlib_init_attr instead of
-    // inline nvshmemx_init_attr. The inline version calls nvshmemi_init_thread, a symbol that lives only
-    // in static libnvshmem_device.a; linking it clashes with the NVSHMEM version node of torch's bundled
-    // libtorch_nvshmem.so (undefined symbol nvshmem_selected_device_transport). hostlib_init_attr is the
-    // equivalent entry exported directly by the host shared library (NVSHMEM's own python UID path uses it).
+    // The host-lib direct entry, not inline nvshmemx_init_attr, which calls nvshmemi_init_thread:
+    // that lives only in static libnvshmem_device.a, and linking it clashes with the version node
+    // of torch's bundled libtorch_nvshmem.so.
     TORCH_CHECK(nvshmemx_hostlib_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr) == 0,
                 "nvshmemx_hostlib_init_attr failed");
     g_world_inited = true;
@@ -159,33 +145,18 @@ UlyssesGroup::UlyssesGroup(std::vector<int64_t> peer_global_pes,
     for (auto pe : peer_global_pes)
         peer_global_pes_.push_back(static_cast<int>(pe));
 
-    // team: the whole world -> TEAM_WORLD; else the strided slice of it that this PE set describes.
-    // The stride comes from the PE list, so the 2-D parallel layout works: tp=2 x ulysses-sp=4 on 8
-    // GPUs gives the sp groups {0,2,4,6} and {1,3,5,7}, stride 2, and both are live at once.
+    // team: the whole world -> TEAM_WORLD; else the strided slice of it this PE set describes. The
+    // stride comes from the PE list, so a 2-D layout works: tp=2 x ulysses-sp=4 on 8 GPUs gives sp
+    // groups {0,2,4,6} and {1,3,5,7}, both live at once.
     //
-    // Each PE passes its OWN triplet below, which is not the shape the API is built for: NVSHMEM's
-    // own nvshmem_team_split_2d gets its two axis teams by looping split_strided with EVERY PE in
-    // EVERY call, non-members included. The one-call-per-PE form used here works because the split
-    // wraps its body in PARENT-team collectives -- a barrier, then quiet, team sync and an error
-    // allreduce -- while the body that picks the team index reduces over the CHILD triplet alone.
-    //
-    // Hence the contract comm.py states: the live groups must PARTITION the job, every PE in
-    // exactly one and all of them constructing together, so those parent-team collectives still
-    // pair up one for one. Groups that overlap instead hang right here -- members block on the
-    // parent collectives, non-members walk past them.
-    //
-    // NOT ENFORCED, and two attempts at enforcing it failed in instructive ways. A local check
-    // of the PE sets already built cannot see it: the divergence is present in the FIRST
-    // construction, before any second group exists. An all-gather of the PE sets cannot either,
-    // because it is itself collective over the world and only GROUP MEMBERS reach the
-    // constructor -- the ranks that join no group never arrive, so the gather hangs in place of
-    // the split. Both were written, measured, and removed rather than left looking like
-    // protection.
-    //
-    // The check has to be something every rank calls, which means it cannot live in a
-    // constructor only members call. A module-level entry the caller invokes on all ranks with
-    // the intended layout would work; it is not built. Two disjoint teams may come back with the SAME team index -- the
-    // psync that index names is each PE's own, so teams sharing no PE never meet in it.
+    // Each PE passes only its OWN triplet, which is not the shape the API is built for
+    // (nvshmem_team_split_2d loops split_strided with EVERY PE in every call). It works because the
+    // split wraps its body in PARENT-team collectives while the body that picks the team index
+    // reduces over the CHILD triplet alone. Hence the contract comm.py states: the live groups must
+    // PARTITION the job and construct together, so those parent-team collectives still pair up.
+    // Overlapping groups hang right here -- members block on the parent collectives, non-members
+    // walk past them. NOT ENFORCED: such a check has to run on every rank, and only group members
+    // reach this constructor.
     const int gpes          = nvshmem_n_pes();
     bool      is_full_world = (world_size_ == gpes);
     for (int i = 0; i < world_size_ && is_full_world; ++i)
@@ -202,7 +173,7 @@ UlyssesGroup::UlyssesGroup(std::vector<int64_t> peer_global_pes,
         for (int pe : peer_global_pes_)
             pes += std::to_string(pe) + " ";
         // A PE set that is not an arithmetic progression is not a strided team and has no other
-        // representation here -- refuse it by name instead of splitting some other PE set.
+        // representation here -- refuse it instead of splitting some other PE set.
         TORCH_CHECK(stride >= 1, "process-group ranks must be increasing; got [", pes, "]");
         for (int i = 1; i < world_size_; ++i)
             TORCH_CHECK(peer_global_pes_[i] == start + i * stride,
@@ -248,8 +219,7 @@ void UlyssesGroup::destroy()
     if (destroyed_)
         return;
     if (ce_ready_) {
-        // Unchecked teardown calls, matching the rest of destroy(): the caller already
-        // guarantees quiescence (comm.py drains the comm stream + dist.barrier first).
+        // Unchecked, like the rest of destroy(): the caller already guarantees quiescence.
         cudaStreamSynchronize(ce_.xfer);
         cudaStreamDestroy(ce_.xfer);
         ce_       = {};
@@ -263,8 +233,8 @@ void UlyssesGroup::destroy()
         nvshmem_team_destroy(team_);
     destroyed_ = true;
     if (--g_live_groups == 0 && g_world_inited) {
-        // DEVIATION: nvshmem_finalize() is inline and calls nvshmemi_finalize() (again only in static
-        // device.a). Use nvshmemx_hostlib_finalize() exported by the host shared library instead.
+        // nvshmem_finalize() is inline and calls nvshmemi_finalize(), again only in the static
+        // device library; this is the host shared library's equivalent.
         nvshmemx_hostlib_finalize();
         g_world_inited = false;
     }
@@ -272,10 +242,9 @@ void UlyssesGroup::destroy()
 
 UlyssesGroup::~UlyssesGroup()
 {
-    // No collective teardown from the destructor: destroy() calls nvshmem_free / team_destroy /
-    // hostlib_finalize, all collective, while GC / interpreter-exit timing differs across ranks --
-    // a rank destructing alone would hang the group. Leak and warn instead; explicit destroy()
-    // (the Python wrapper guards it with dist.barrier) is the supported path.
+    // No collective teardown from the destructor: destroy() is collective throughout, while GC and
+    // interpreter-exit timing differ across ranks, so a rank destructing alone would hang the
+    // group. Leak and warn instead.
     if (!destroyed_)
         std::cerr << "[fast_ulysses] UlyssesGroup dropped without destroy(); leaking symmetric-heap "
                      "resources (call group.destroy() on all ranks)"

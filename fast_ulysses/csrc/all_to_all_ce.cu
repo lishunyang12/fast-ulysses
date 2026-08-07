@@ -1,20 +1,7 @@
-// CE (copy-engine) transfer path for the 4D all-to-all: pitched cudaMemcpy2D/3DAsync straight
-// into peers' symmetric-heap addresses. The remote copies are serialised onto one stream and
-// this rank's own share goes on the caller's stream.
-//
-// The data movement uses DMA engines and zero SMs, so -- unlike an SM-resident collective, which
-// cannot get a block slot while e.g. cuBLAS GEMMs hold every SM -- it runs concurrently with
-// compute rather than behind it.
-//
-// This file computes no offsets: the (peer, offset, pitch, rows) addressing is built by
-// build_plan in a2a_plan.cpp, which is host-only and tested without a GPU (tests/test_plan.py).
-// A plan op may carry the whole batch (CopyOp::depth), in which case it issues as one
-// cudaMemcpy3DAsync instead of b cudaMemcpy2DAsync calls; at b == 1 the plan never fuses, so
-// the calls are exactly the ones this path has always issued.
-//
-// cudaMemcpy3DBatchAsync -- the driver's pitched batch entry point, as opposed to the plain
-// cudaMemcpy3DAsync used here -- was tried and is not used: it is slower, and it rejects the
-// legacy default stream. docs/BENCHMARK.md has the figures.
+// CE (copy-engine) transfer path for the 4D all-to-all: pitched cudaMemcpy2D/3DAsync straight into
+// peers' symmetric-heap addresses. The movement uses DMA engines and zero SMs, so it runs
+// concurrently with compute rather than waiting for a block slot as an SM-resident collective does.
+// It computes no offsets -- the addressing comes from build_plan in a2a_plan.cpp.
 #include "a2a_plan.h"
 #include "ulysses_group.cuh"
 
@@ -33,9 +20,8 @@ void CUDART_CB delay_payload(void* arg)
     std::this_thread::sleep_for(std::chrono::microseconds(reinterpret_cast<int64_t>(arg)));
 }
 
-// One CopyOp -> one CUDA call. depth > 1 is the batch dimension folded in by the plan;
-// cudaMemcpy3DParms takes no slice stride and derives one as pitch * ysize, which is why
-// push_batched only fuses when the strides divide the pitches (a2a_plan.cpp).
+// One CopyOp -> one CUDA call. The slice counts below are derived, not passed, because
+// cudaMemcpy3DParms takes no slice stride (see push_batched).
 void issue_copy(void* dst, const void* src, const CopyOp& op, cudaStream_t stream)
 {
     if (op.depth <= 1) {
@@ -68,15 +54,11 @@ void issue_copy(void* dst, const void* src, const CopyOp& op, cudaStream_t strea
 
 // Arm (delay_us > 0) or disarm (0) the "signal before payload" fault. TESTS ONLY.
 //
-// This operator depends on copy-engine writes being visible at the destination by the time the
-// barrier kernel's release store announcing them arrives. That is undocumented, so the test for
-// it is worth exactly as much as its negative control -- and the control otherwise means editing
-// this file and rebuilding, which is something a person has to remember to do.
-//
-// Armed, launch_a2a_ce holds the payload on the transfer stream and does not join it back onto
-// the caller's stream, so the closing barrier publishes while the bytes are still in flight and
-// readers must see stale data. A test that arms it, requires a tear, disarms it and requires
-// none therefore carries its own control on every run. See a2a_ce_fault_injection.py.
+// The operator depends on copy-engine writes being visible at the destination by the time the
+// barrier kernel's release store announcing them arrives, which is undocumented, so the test for it
+// is only worth as much as its negative control. Armed, launch_a2a_ce holds the payload back and
+// skips the join onto the caller's stream, so the closing barrier publishes while the bytes are in
+// flight. See a2a_ce_fault_injection.py.
 void set_ce_fault(int64_t delay_us)
 {
     g_fault_delay_us = delay_us;
@@ -91,24 +73,15 @@ void launch_a2a_ce(const void*                  src,
 {
     const int      ws        = static_cast<int>(peer_ptrs.size());
     const uint8_t* src_bytes = static_cast<const uint8_t*>(src);
-    // FRESH events every call -- do not hoist them into CEResources. Re-recording a shared
-    // event that still has in-flight stream waits (deep enqueue-ahead: many deferred
-    // barrier=False groups queued behind the device) lets a pending wait resolve against a
-    // LATER record whose completion depends on this very stream progressing -- a circular
-    // wait that deadlocks the group.
-    // Create/destroy is a few us per call and depth-safe: the waits capture the dependency
-    // at call time, and destroy defers until the event retires.
-    // ONE STREAM for the remote copies, and this rank's OWN share on the CALLER's stream.
+    // Fresh events every call -- do not hoist them into CEResources. A shared event re-recorded
+    // while earlier waits are still pending lets one of those waits resolve against a later record,
+    // which makes the wait depend on the very stream it is blocking: a circular wait. Creating them
+    // here is depth-safe, since a wait captures the dependency at call time and destroy defers.
     //
-    // The remote copies all leave through the same egress, so giving each peer its own stream
-    // only makes every copy slower; serialising them removes that contention for free.
-    //
-    // This rank's own share crosses no link, so it CAN run alongside the remote ones -- and
-    // getting that overlap needs no stream of its own, just the caller's. Hence the separate
-    // emit below.
-    //
-    // Peers are visited in XOR-shift order, which pairs ranks up without any cross-rank
-    // coordination. docs/BENCHMARK.md has the figures for all three effects.
+    // ONE STREAM for the remote copies, since they all leave through the same egress and separate
+    // streams would only make them contend. This rank's OWN share crosses no link, so it can run
+    // alongside them on the caller's stream -- hence the separate emit below. Peers are visited in
+    // XOR-shift order, which pairs ranks up without coordination.
     cudaEvent_t ready;
     ULYSSES_CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
     ULYSSES_CUDA_CHECK(cudaEventRecord(ready, stream));
@@ -146,9 +119,8 @@ void launch_a2a_ce(const void*                  src,
     cudaEvent_t done;
     ULYSSES_CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
     ULYSSES_CUDA_CHECK(cudaEventRecord(done, xfer));
-    // Skipping this join is the fault: the caller's stream reaches the closing barrier, and
-    // publishes, without waiting for the remote copies. Everything else about the call is
-    // unchanged, so what the test observes is the ordering and nothing else.
+    // Skipping this join is the fault: the caller's stream then reaches the closing barrier, and
+    // publishes, without waiting for the remote copies. Nothing else about the call changes.
     if (g_fault_delay_us == 0) {
         ULYSSES_CUDA_CHECK(cudaStreamWaitEvent(stream, done, 0));
     }

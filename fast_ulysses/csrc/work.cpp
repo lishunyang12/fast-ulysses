@@ -16,10 +16,9 @@ namespace ulysses {
 
 namespace {
 
-// A Work whose completion is a CUDA event rather than a communicator handle. wait() enqueues
-// a dependency on the CALLER's current stream -- whichever stream that is when the wait
-// happens -- and returns immediately: the host is not part of the handshake, which is the
-// whole point of the async path.
+// A Work whose completion is a CUDA event rather than a communicator handle. wait() enqueues a
+// dependency on whatever stream is current when the wait happens and returns immediately -- the
+// host is not part of the handshake.
 class StreamEventWork: public c10d::Work {
 public:
     explicit StreamEventWork(cudaEvent_t event): event_(event) {}
@@ -72,10 +71,8 @@ bool register_stream_completion(const at::Tensor& tensor, cudaStream_t comm_stre
     c10d::register_work(tensor, c10::make_intrusive<StreamEventWork>(event));
     return true;
 #else
-    // Nothing can reach this event through torch, so order it against the caller here.
-    // Destroying it immediately is safe: cudaStreamWaitEvent captures the event's recorded
-    // state at the call, and cudaEventDestroy releases an in-flight event's resources only
-    // once the device is done with it.
+    // Nothing can reach this event through torch, so order it against the caller here. Destroying it
+    // immediately is safe: the wait captured the event's recorded state, and destroy defers.
     ULYSSES_CUDA_CHECK(cudaStreamWaitEvent(at::cuda::getCurrentCUDAStream(), event, 0));
     ULYSSES_CUDA_CHECK(cudaEventDestroy(event));
     return false;

@@ -1,14 +1,8 @@
 #pragma once
-// Addressing for the 4D all-to-all, expressed as pitched copies. Pure host arithmetic with no
-// CUDA and no NVSHMEM in it, so the layout contract can be tested on its own (see
-// tests/test_plan.py, which replays the plan over numpy buffers and compares against torch's
-// all_to_all_single + permute). The transport in all_to_all_ce.cu only turns these ops into
-// cudaMemcpy calls; it computes no offsets of its own.
-//
-// UNEVEN splits are the general case: even splits are just seq_splits = [s/P]*P and
-// head_splits = [n/P]*P, so there is a single code path to get right. The operator entry point
-// (make_dims in bindings.cpp) takes the splits from the caller and falls back to the even ones
-// when it is given none.
+// Addressing for the 4D all-to-all, expressed as pitched copies. Pure host arithmetic with no CUDA
+// and no NVSHMEM in it, so the layout contract can be tested on its own (tests/test_plan.py replays
+// a plan over numpy buffers). UNEVEN splits are the general case -- even splits are just
+// seq_splits = [s/P]*P and head_splits = [n/P]*P -- so there is a single code path to get right.
 #include <cstdint>
 #include <vector>
 
@@ -38,18 +32,10 @@ struct A2ADims {
     void validate() const;
 };
 
-// One pitched copy. Offsets are byte offsets from the base of their buffer -- this rank's input
-// tensor and the destination peer's symmetric window -- so the same struct describes a
-// cudaMemcpy2D/3DAsync and a host-side replay in a test.
-//
-// `depth` folds the batch dimension in. Every batch element repeats the same rows x width copy
-// at a fixed stride, so b of them can go as ONE cudaMemcpy3DAsync instead of b
-// cudaMemcpy2DAsync calls -- same bytes on the device, b-1 fewer launches on the host.
-//
-// Not every batched op can be expressed this way: cudaMemcpy3DParms derives its slice stride as
-// pitch * ysize rather than taking it directly, so the stride has to be a whole multiple of the
-// pitch with room for the rows. `push_batched` checks and falls back to separate 2D copies when
-// it is not. See a2a_plan.cpp.
+// One pitched copy, offsets in bytes from the base of their buffer (this rank's input tensor, the
+// destination peer's symmetric window), so the same struct describes a cudaMemcpy2D/3DAsync and a
+// host-side replay in a test. `depth` folds the batch dimension in: b repetitions of the same
+// rows x width copy at a fixed stride go as ONE cudaMemcpy3DAsync, when expressible (push_batched).
 struct CopyOp {
     int     peer       = 0;
     int64_t src_offset = 0;
@@ -65,22 +51,16 @@ struct CopyOp {
 
 struct A2APlan {
     std::vector<int64_t> output_shape;  // shape THIS rank receives, dense from the window base
-    // Elements the symmetric window must hold: the LARGEST rank's output, not this rank's.
-    // Under uneven splits each rank receives a different amount, but nvshmem_align is a
-    // collective that has to be called with the same size everywhere or the peer offsets stop
-    // lining up -- so every rank allocates the max. It can compute it without communicating:
-    // the splits describe the whole group and are rank-uniform under SPMD.
+    // Elements the symmetric window must hold: the LARGEST rank's output, not this rank's. The peer
+    // offsets only line up while every rank allocates the same size, and each rank can compute the
+    // max without communicating, because the splits describe the whole group.
     int64_t             window_numel = 0;
     std::vector<CopyOp> ops;  // what THIS rank sends; ops[i].peer says where
 };
 
-// The window holds the output layout, and this rank's own share travels through it like every
-// other peer's: `ops` covers all world_size destinations. That is what
-// all_to_all_single_4d_borrowed needs -- its result IS the window -- and it means the copying
-// entry point's copy-out is one flat copy of the whole result rather than a second addressing
-// scheme. One plan serves both forms; custom_nccl_op instead builds a different plan per form
-// so that self can go straight from input to output, which saves one HBM pass. Not done here,
-// not measured here.
+// One plan serves both entry points: `ops` covers all world_size destinations, so this rank's own
+// share travels through the window like every peer's -- which is what the borrowed form needs, its
+// result BEING the window, and what makes the copying form's copy-out one flat copy.
 A2APlan build_plan(const A2ADims& dims, int mode, int64_t elem_size);
 
 }  // namespace ulysses

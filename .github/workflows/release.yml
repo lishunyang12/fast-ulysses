@@ -1,0 +1,249 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+# mapfile, shopt, [[ ]] and ${VAR#prefix} are bash, and a container job does not reliably
+# resolve `run` to bash. Without this the step dies on a parse error, exit 2 and no output.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  guard:
+    # Nothing downstream can catch a tag that disagrees with the version literal: every artifact
+    # takes its version from fast_ulysses/__init__.py, so they all agree with each other and none
+    # of them agrees with the tag. The release would be named v0.1.1 and would publish 0.1.0 --
+    # permanently, since PyPI never lets a version be replaced. So check it before anything runs.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match __version__
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          lit=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' fast_ulysses/__init__.py)
+          if [[ "${tag}" != "${lit}" ]]; then
+            echo "FATAL: tag is ${GITHUB_REF_NAME} (version ${tag}) but" \
+                 "fast_ulysses/__init__.py says ${lit}. Bump the literal, or retag." >&2
+            exit 1
+          fi
+          echo "tag ${GITHUB_REF_NAME} matches __version__ ${lit}"
+
+  sdist:
+    needs: guard
+    runs-on: ubuntu-latest
+    # In the builder image rather than on a bare runner because the install test below
+    # compiles the extension; anywhere else it would only prove the tarball unpacks.
+    container: pytorch/manylinux2_28-builder:cuda13.0
+    env:
+      PYBIN: /opt/python/cp312-cp312/bin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        # --no-isolation: setup.py imports torch to derive the runtime pins, so torch has to
+        # be the one already installed here rather than whatever an isolated env would fetch.
+        run: |
+          $PYBIN/pip install "setuptools>=77" build twine torch==2.13.0
+          $PYBIN/python -m build --sdist --no-isolation
+          $PYBIN/twine check dist/*.tar.gz
+
+      - name: Install the sdist and import it
+        # An sdist that does not build is worse than no sdist: pip falls back to it exactly
+        # when a user's (python, torch, CUDA) misses the wheel matrix, which is the situation
+        # it exists for. One architecture only -- this is a build test, not an artifact.
+        env:
+          FAST_ULYSSES_CUDA_ARCH: "90"
+        run: |
+          $PYBIN/python -m venv --system-site-packages /tmp/sdist-venv
+          /tmp/sdist-venv/bin/pip install dist/*.tar.gz --no-build-isolation
+          cd /tmp && /tmp/sdist-venv/bin/python -c "import fast_ulysses; print(fast_ulysses.__version__)"
+
+      - name: The isolated path must fail with the instruction, not a traceback
+        # This is what `pip install fast-ulysses` does for anyone the wheel matrix misses, and
+        # the step above cannot see it: it passes --no-build-isolation into a venv that already
+        # has torch. The build genuinely cannot work under isolation, so the contract is that
+        # it says so.
+        run: |
+          $PYBIN/python -m venv /tmp/iso-venv
+          if /tmp/iso-venv/bin/pip install dist/*.tar.gz > /tmp/iso.log 2>&1; then
+            echo "FATAL: the isolated build succeeded, which means it linked a torch the user did not choose" >&2
+            exit 1
+          fi
+          grep -q "cannot be built under pip's build isolation" /tmp/iso.log || {
+            echo "FATAL: isolated build failed without the instruction:" >&2
+            tail -30 /tmp/iso.log >&2
+            exit 1
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  wheels:
+    needs: guard
+    runs-on: ubuntu-latest
+    strategy:
+      # One row failing must not cancel the other seven: which rows survive is the useful
+      # output when a torch release changes something.
+      fail-fast: false
+      matrix:
+        # (torch, index, image, cuda major, local version tag). The image's CUDA major has to
+        # match the torch build's, or the wheel links the wrong libcudart and is dead on
+        # arrival. torch 2.9 is absent on purpose: it pins nvidia-nvshmem-cu12 3.3.20, below
+        # the minimum setup.py accepts. CUDA 12.6 is absent for the same kind of reason: it
+        # predates Blackwell and cannot compile sm_100/sm_120.
+        include:
+          - {torch: "2.10.0", index: "https://download.pytorch.org/whl/cu128", image: "cuda12.8", cuda_major: "12", tag: "torch210cu128"}
+          - {torch: "2.10.0", index: "https://download.pytorch.org/whl/cu130", image: "cuda13.0", cuda_major: "13", tag: "torch210cu130"}
+          - {torch: "2.11.0", index: "https://download.pytorch.org/whl/cu128", image: "cuda12.8", cuda_major: "12", tag: "torch211cu128"}
+          - {torch: "2.11.0", index: "https://download.pytorch.org/whl/cu130", image: "cuda13.0", cuda_major: "13", tag: "torch211cu130"}
+          - {torch: "2.12.1", index: "https://download.pytorch.org/whl/cu129", image: "cuda12.8", cuda_major: "12", tag: "torch212cu129"}
+          - {torch: "2.12.1", index: "https://download.pytorch.org/whl/cu130", image: "cuda13.0", cuda_major: "13", tag: "torch212cu130"}
+          - {torch: "2.13.0", index: "https://download.pytorch.org/whl/cu129", image: "cuda12.8", cuda_major: "12", tag: "torch213cu129"}
+          - {torch: "2.13.0", index: "pypi", image: "cuda13.0", cuda_major: "13", tag: "torch213cu130", pypi_set: true}
+    steps:
+      # Must be the first step: the builder images are 8-10 GB compressed and a stock runner
+      # has ~14 GB free, so the pull fails with "no space left on device" without it.
+      - uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+
+      - uses: actions/checkout@v4
+
+      - name: Build the tagged wheels
+        run: |
+          docker run --rm -v "$PWD:/io" -w /io \
+            -e TORCH_VERSION=${{ matrix.torch }} \
+            -e TORCH_INDEX=${{ matrix.index }} \
+            -e CUDA_MAJOR=${{ matrix.cuda_major }} \
+            -e LOCAL_VERSION=${{ matrix.tag }} \
+            -e OUTDIR=/io/wheelhouse \
+            pytorch/manylinux2_28-builder:${{ matrix.image }} bash scripts/build_wheels.sh
+
+      - name: Build the untagged PyPI wheels
+        if: matrix.pypi_set
+        # The same row a second time with no local version, because PyPI rejects local
+        # versions outright -- so the set it gets cannot be the tagged one. This row is the
+        # one whose torch is what a plain `pip install torch` resolves to, which is what makes
+        # it the right one to publish unqualified.
+        run: |
+          docker run --rm -v "$PWD:/io" -w /io \
+            -e TORCH_VERSION=${{ matrix.torch }} \
+            -e TORCH_INDEX=${{ matrix.index }} \
+            -e CUDA_MAJOR=${{ matrix.cuda_major }} \
+            -e LOCAL_VERSION= \
+            -e OUTDIR=/io/wheelhouse-pypi \
+            pytorch/manylinux2_28-builder:${{ matrix.image }} bash scripts/build_wheels.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.tag }}
+          path: wheelhouse/*.whl
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.pypi_set
+        with:
+          name: wheels-pypi
+          path: wheelhouse-pypi/*.whl
+
+  verify:
+    needs: [sdist, wheels]
+    runs-on: ubuntu-latest
+    # For readelf/objdump/cuobjdump. check_wheel.py runs again on the collected set because
+    # the per-row check ran on a wheel that had not yet made the round trip through the
+    # artifact store, and because the count assertion below needs everything in one place.
+    container: pytorch/manylinux2_28-builder:cuda13.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: collected
+
+      - name: Re-check every wheel
+        # No --cuda-major: each wheel's own _build_meta says which CUDA it was built against,
+        # and check_wheel.py cross-checks that against the libcudart the .so actually needs.
+        run: |
+          shopt -s globstar nullglob
+          /opt/python/cp312-cp312/bin/python scripts/check_wheel.py collected/**/*.whl
+
+      - name: Assert the expected artifact count
+        # A row that fails does not fail this workflow (fail-fast is off), so without a count
+        # a release can go out silently missing a whole matrix row.
+        run: |
+          shopt -s globstar nullglob
+          wheels=(collected/**/*.whl)
+          sdists=(collected/**/*.tar.gz)
+          # 8 rows x 4 pythons tagged, plus the 4 untagged wheels from the PyPI row.
+          expected=$(( 8 * 4 + 4 ))
+          if [[ ${#wheels[@]} -ne ${expected} || ${#sdists[@]} -ne 1 ]]; then
+            printf '%s\n' "${wheels[@]}" "${sdists[@]}"
+            echo "FATAL: got ${#wheels[@]} wheels and ${#sdists[@]} sdists," \
+                 "expected ${expected} and 1" >&2
+            exit 1
+          fi
+
+  github-release:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: collected
+
+      - name: Collect and checksum
+        # GitHub Release filenames keep the "+", so the tagged wheels stay distinguishable
+        # here in a way they cannot be on PyPI.
+        run: |
+          mkdir -p release
+          find collected \( -name '*.whl' -o -name '*.tar.gz' \) -exec cp {} release/ \;
+          cd release && sha256sum ./*.whl ./*.tar.gz > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+
+  pypi:
+    needs: [verify, github-release]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # Trusted publishing: the OIDC token stands in for an API token. It needs a PENDING
+      # PUBLISHER configured on PyPI (project name + this repo + this workflow file +
+      # environment) before the first upload, or the very first release fails at the last step.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-pypi
+          path: dist
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+      - name: Refuse local versions
+        # Warehouse answers 400 for any PEP 440 local version. Catching it here names the
+        # actual problem; catching it from the upload gives an HTTP status and no context.
+        run: |
+          tagged=$(find dist -name '*+*')
+          if [[ -n "${tagged}" ]]; then
+            echo "FATAL: PyPI rejects local versions, these carry one:" >&2
+            echo "${tagged}" >&2
+            exit 1
+          fi
+          ls -1 dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

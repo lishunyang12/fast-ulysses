@@ -148,9 +148,11 @@ def main() -> int:
         print("# ours-unpad / ours-pad is the number this benchmark exists for: if it is 1.00")
         print("#          the collective does not care whether the padding is there.")
         print()
-        hdr = (f"{'shape':<12} {'pad':>4} {'MB':>7} | {'base-pad':>9} {'base-unpad':>11} "
-               f"{'b-unp/pad':>10} | {'ours-pad':>9} {'ours-unpad':>11} {'o-unp/pad':>10} | "
-               f"{'ours/base':>10} {'submit us':>9}")
+        hdr = (
+            f"{'shape':<12} {'pad':>4} {'MB':>7} | {'base-pad':>9} {'base-unpad':>11} "
+            f"{'b-unp/pad':>10} | {'ours-pad':>9} {'ours-unpad':>11} {'o-unp/pad':>10} | "
+            f"{'ours/base':>10} {'submit us':>9}"
+        )
         print(hdr)
         print("-" * len(hdr))
 
@@ -163,8 +165,9 @@ def main() -> int:
         s_pad_me, n_pad = padded_shard(s_real, ws)
         xp = torch.randn((b, s_pad_me, n_global, d), dtype=dtype, device=dev)
         t_bp = median_ms(lambda: baseline_padded(xp, pg, ws), args.iters, args.warmup)
-        t_op = median_ms(lambda: group.all_to_all_single_4d(xp, mode=0, tag="pad"),
-                         args.iters, args.warmup)
+        t_op = median_ms(
+            lambda: group.all_to_all_single_4d(xp, mode=0, tag="pad"), args.iters, args.warmup
+        )
         mb = xp.numel() * xp.element_size() / 1e6
         xp = None
         torch.cuda.empty_cache()
@@ -172,23 +175,33 @@ def main() -> int:
         seq_splits = unpadded_splits(s_real, ws)
         head_splits = [n_me] * ws
         x = torch.randn((b, seq_splits[rank], n_global, d), dtype=dtype, device=dev)
-        t_bu = median_ms(lambda: baseline_unpadded(x, pg, ws, rank, seq_splits),
-                         args.iters, args.warmup)
+        t_bu = median_ms(
+            lambda: baseline_unpadded(x, pg, ws, rank, seq_splits), args.iters, args.warmup
+        )
         t_ou = median_ms(
-            lambda: group.all_to_all_single_4d(x, mode=0, tag="unpad",
-                                               seq_splits=seq_splits, head_splits=head_splits),
-            args.iters, args.warmup)
+            lambda: group.all_to_all_single_4d(
+                x, mode=0, tag="unpad", seq_splits=seq_splits, head_splits=head_splits
+            ),
+            args.iters,
+            args.warmup,
+        )
         sub_us = median_submit_us(
-            lambda: group.all_to_all_single_4d(x, mode=0, tag="unpad",
-                                               seq_splits=seq_splits, head_splits=head_splits),
-            args.iters, args.warmup)
+            lambda: group.all_to_all_single_4d(
+                x, mode=0, tag="unpad", seq_splits=seq_splits, head_splits=head_splits
+            ),
+            args.iters,
+            args.warmup,
+        )
         x = None
         torch.cuda.empty_cache()
 
         if rank == 0:
-            print(f"{label:<12} {n_pad:>4} {mb:>7.0f} | {t_bp:>9.3f} {t_bu:>11.3f} "
-                  f"{t_bu / t_bp:>9.2f}x | {t_op:>9.3f} {t_ou:>11.3f} {t_ou / t_op:>9.2f}x | "
-                  f"{t_bp / t_op:>9.2f}x {sub_us:>9.1f}", flush=True)
+            print(
+                f"{label:<12} {n_pad:>4} {mb:>7.0f} | {t_bp:>9.3f} {t_bu:>11.3f} "
+                f"{t_bu / t_bp:>9.2f}x | {t_op:>9.3f} {t_ou:>11.3f} {t_ou / t_op:>9.2f}x | "
+                f"{t_bp / t_op:>9.2f}x {sub_us:>9.1f}",
+                flush=True,
+            )
 
     group.destroy()
     dist.barrier()

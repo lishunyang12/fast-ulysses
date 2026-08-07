@@ -1,0 +1,121 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  schedule:
+    # Weekly. The matrix-smoke job below builds every release row against whatever torch
+    # currently resolves, so a point release that breaks a row is found on a Monday instead of
+    # halfway through a tag push.
+    - cron: "23 5 * * 1"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# mapfile, shopt, [[ ]] and ${VAR#prefix} are bash, and a container job does not reliably
+# resolve `run` to bash. Without this the step dies on a parse error, exit 2 and no output.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # .pre-commit-config.yaml is the single lint entry point. It already pins ruff and the
+      # exact clang-format release csrc/ is formatted with, so running either tool directly
+      # here would eventually disagree with what contributors get locally.
+      - uses: pre-commit/action@v3.0.1
+
+  build-and-test:
+    runs-on: ubuntu-latest
+    container: pytorch/manylinux2_28-builder:cuda13.0
+    env:
+      PYBIN: /opt/python/cp312-cp312/bin
+      # Two architectures, not four: this job answers "does it still build and does the plan
+      # still hold", and the full arch list is a release concern.
+      FAST_ULYSSES_CUDA_ARCH: "90;100"
+      FAST_ULYSSES_RELOCATABLE: "1"
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+    steps:
+      # No free-disk-space here: a job-level `container:` is pulled before the first step runs,
+      # so the cleanup would happen too late to matter. The jobs that must have the space
+      # (matrix-smoke, and release.yml) start the builder with an explicit `docker run`.
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-cuda13.0-cp312-${{ github.sha }}
+          restore-keys: ccache-cuda13.0-cp312-
+
+      - name: Install build deps and torch
+        run: $PYBIN/pip install "setuptools>=77" wheel "auditwheel>=6" pytest numpy torch==2.13.0
+
+      - name: Build wheel
+        run: $PYBIN/pip wheel . --no-build-isolation --no-deps -w raw/
+
+      - name: Repair wheel
+        run: |
+          mapfile -t excludes < <($PYBIN/python scripts/check_wheel.py --print-excludes)
+          $PYBIN/python -m auditwheel repair "${excludes[@]}" \
+            --plat manylinux_2_28_x86_64 -w dist/ raw/*.whl
+
+      - name: Check wheel
+        run: $PYBIN/python scripts/check_wheel.py --cuda-major 13 --arch 90,100 dist/*.whl
+
+      - name: Install the wheel and run the CPU suite
+        # From /tmp, not the workspace: ${{ github.workspace }}/fast_ulysses is an importable
+        # package directory without a built _C, and test_plan.py skips itself on a failed
+        # import -- so from the workspace this would pass by skipping everything.
+        #
+        # tests/test_multigpu.py is not runnable on any GitHub-hosted runner (no GPU). It is
+        # gated manually by scripts/preflight_gpu.sh before a tag is pushed.
+        run: |
+          $PYBIN/pip install dist/*.whl
+          cd /tmp && $PYBIN/pytest "$GITHUB_WORKSPACE/tests/test_plan.py" -q
+
+  matrix-smoke:
+    # Weekly only. Same rows as release.yml's wheels matrix -- keep the two lists in sync --
+    # but one python and no upload: this exercises the build-and-assert path, not the artifacts.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {torch: "2.10.0", index: "https://download.pytorch.org/whl/cu128", image: "cuda12.8", cuda_major: "12"}
+          - {torch: "2.10.0", index: "https://download.pytorch.org/whl/cu130", image: "cuda13.0", cuda_major: "13"}
+          - {torch: "2.11.0", index: "https://download.pytorch.org/whl/cu128", image: "cuda12.8", cuda_major: "12"}
+          - {torch: "2.11.0", index: "https://download.pytorch.org/whl/cu130", image: "cuda13.0", cuda_major: "13"}
+          - {torch: "2.12.1", index: "https://download.pytorch.org/whl/cu129", image: "cuda12.8", cuda_major: "12"}
+          - {torch: "2.12.1", index: "https://download.pytorch.org/whl/cu130", image: "cuda13.0", cuda_major: "13"}
+          - {torch: "2.13.0", index: "https://download.pytorch.org/whl/cu129", image: "cuda12.8", cuda_major: "12"}
+          - {torch: "2.13.0", index: "pypi", image: "cuda13.0", cuda_major: "13"}
+    steps:
+      # Must be the first step: the builder images are 8-10 GB compressed and a stock runner
+      # has ~14 GB free, so the pull fails with "no space left on device" without it.
+      - uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+
+      - uses: actions/checkout@v4
+
+      - name: Build and check the row
+        run: |
+          docker run --rm -v "$PWD:/io" -w /io \
+            -e TORCH_VERSION=${{ matrix.torch }} \
+            -e TORCH_INDEX=${{ matrix.index }} \
+            -e CUDA_MAJOR=${{ matrix.cuda_major }} \
+            -e PYTHONS=cp312 \
+            -e LOCAL_VERSION=weekly \
+            pytorch/manylinux2_28-builder:${{ matrix.image }} bash scripts/build_wheels.sh

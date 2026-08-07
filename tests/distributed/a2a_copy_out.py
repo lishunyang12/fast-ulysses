@@ -100,9 +100,9 @@ def main() -> None:
             "out has shape",
         ),
         "non-contiguous": (
-            torch.empty(
-                (b, n_global // ws, s_local * ws, d), dtype=dtype, device=dev
-            ).transpose(1, 2),
+            torch.empty((b, n_global // ws, s_local * ws, d), dtype=dtype, device=dev).transpose(
+                1, 2
+            ),
             "contiguous CUDA tensor",
         ),
         "on the cpu": (torch.empty(out_shape, dtype=dtype), "contiguous CUDA tensor"),

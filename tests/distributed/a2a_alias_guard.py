@@ -62,7 +62,9 @@ def main() -> None:
         "whole borrowed result": lambda: group.all_to_all_single_4d_borrowed(y, mode=1, tag=TAG),
         # Slicing the outermost axis of a contiguous tensor stays contiguous, so .contiguous()
         # inside prepare() is a no-op and this really does reach the transport as window memory.
-        "sliced borrowed result": lambda: group.all_to_all_single_4d_borrowed(y[1:2], mode=1, tag=TAG),
+        "sliced borrowed result": lambda: group.all_to_all_single_4d_borrowed(
+            y[1:2], mode=1, tag=TAG
+        ),
         # The output side, which had no check at all: copy-out would read and write the same bytes.
         "borrowed result as out": lambda: group.all_to_all_single_4d(x, mode=0, tag=TAG, out=y),
     }
@@ -74,7 +76,10 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001 -- the type is torch's, the message is the contract
             if "overlaps tag" not in str(exc):
                 fails += 1
-                print(f"FAIL rank={rank} [{name}]: raised, but not the aliasing check: {exc}", flush=True)
+                print(
+                    f"FAIL rank={rank} [{name}]: raised, but not the aliasing check: {exc}",
+                    flush=True,
+                )
             continue
         fails += 1
         print(f"FAIL rank={rank} [{name}]: accepted a call that aliases the window", flush=True)
@@ -88,7 +93,10 @@ def main() -> None:
     nfail = torch.tensor([fails], device=dev)
     dist.all_reduce(nfail)
     if rank == 0:
-        print("ALIAS_GUARD " + ("PASS" if nfail.item() == 0 else f"FAILED {int(nfail.item())}"), flush=True)
+        print(
+            "ALIAS_GUARD " + ("PASS" if nfail.item() == 0 else f"FAILED {int(nfail.item())}"),
+            flush=True,
+        )
     group.destroy()
     dist.destroy_process_group()
     if nfail.item():

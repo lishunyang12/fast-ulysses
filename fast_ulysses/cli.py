@@ -1,16 +1,10 @@
-"""``fast-ulysses doctor``: can this machine run the operator, and over what links?
+"""``fast-ulysses doctor``: can this machine run the operator?
 
-This exists because the answer is not obvious on the hardware range the operator targets --
-sm80 through sm120, NVLink and PCIe alike. The transport writes peer windows with plain
-``cudaMemcpy*Async`` into addresses from ``nvshmem_ptr``, so the one thing that decides whether a
-group can be formed is whether every pair is P2P-mappable. On an NVSwitch box that is always
-true and never interesting; on a two-socket PCIe box it depends on the root complex layout, on
-IOMMU and ACS settings, and on the driver.
-
-What this reports is what can be established WITHOUT a process group: the build, the devices,
-and the pairwise P2P matrix. The authoritative check is ``nvshmem_ptr`` returning non-null for
-every peer, which needs NVSHMEM up -- UlyssesGroup's constructor does it and names the failing
-pair. A green matrix here is a necessary condition for that, not a substitute.
+What decides whether a group can be formed is whether every pair of devices is P2P-mappable, since
+the transport writes peer windows with plain ``cudaMemcpy*Async``. This reports what can be
+established WITHOUT a process group -- the build, the devices, the pairwise P2P matrix -- so a green
+matrix is a necessary condition, not a substitute for the authoritative ``nvshmem_ptr`` check
+UlyssesGroup's constructor makes.
 """
 
 from __future__ import annotations
@@ -32,11 +26,19 @@ def _load():
 def _doctor() -> int:
     pkg, err = _load()
     if err is not None:
-        print(f"extension: FAILED TO LOAD\n  {type(err).__name__}: {err}")
+        # Already rendered: fast_ulysses/__init__ routes a load failure through _diagnose.explain
+        # before re-raising, and importing _diagnose here would re-run the __init__ that failed.
+        print(f"extension: FAILED TO LOAD\n{type(err).__name__}: {err}")
         return 1
     print(f"extension: {pkg._C.__file__}")
     for key, value in sorted(pkg._C.build_info().items()):
         print(f"  {key}: {value}")
+    from fast_ulysses._diagnose import build_meta
+
+    meta = build_meta()
+    print("build metadata:" if meta else "build metadata: none (_build_meta.py not generated)")
+    for key, value in sorted(meta.items()):
+        print(f"  {key.lower()}: {value}")
 
     import torch
 
@@ -53,8 +55,7 @@ def _doctor() -> int:
         mark = "" if arch in built else "  <-- NOT IN THIS BUILD"
         print(f"  [{i}] {p.name}  sm_{arch}  {p.total_memory >> 30} GiB{mark}")
 
-    # cudaDeviceCanAccessPeer for every ordered pair. Asymmetry is possible and worth seeing, so
-    # print the full matrix rather than the upper triangle.
+    # Every ORDERED pair: asymmetry is possible, so print the full matrix, not the upper triangle.
     print("p2p (cudaDeviceCanAccessPeer), row=from col=to:")
     print("     " + " ".join(f"{j:>3}" for j in range(n)))
     unreachable = []
@@ -75,6 +76,23 @@ def _doctor() -> int:
         )
     else:
         print(f"\nall {n} devices are mutually P2P-mappable")
+
+    from fast_ulysses.fallback import numa_nodes
+
+    nodes = numa_nodes(range(n))
+    if len(set(nodes.values())) > 1:
+        by_node: dict[int, list[int]] = {}
+        for dev, node in sorted(nodes.items()):
+            by_node.setdefault(node, []).append(dev)
+        layout = ", ".join(f"node {k}: {v}" for k, v in sorted(by_node.items()))
+        print(
+            f"\nNUMA: these devices span more than one CPU socket ({layout}).\n"
+            "A group confined to one node keeps the full advantage. A group spanning nodes stays\n"
+            "CORRECT but is slower than torch.distributed, which routes around the socket boundary\n"
+            "over a NIC or through host memory while this transport always writes peer memory\n"
+            "directly. See docs/BENCHMARK.md, 'Two-socket PCIe'."
+        )
+
     return 1 if unreachable else 0
 
 

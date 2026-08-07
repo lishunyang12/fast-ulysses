@@ -14,12 +14,9 @@ namespace {
     throw std::invalid_argument("fast_ulysses: " + message);
 }
 
-// Both operands are already known non-negative (A2ADims::validate rejects negatives).
-//
-// Only the caller's OWN shard is cross-checked against the tensor it handed in -- a peer's entry
-// in seq_splits/head_splits is bounded by nothing. A product that wraps yields a negative
-// window_numel, which then passes SymmetricHeapPool::acquire's capacity check (it compares
-// against a positive reserve) and is then carved out of the pool as an enormous unsigned size.
+// A peer's entry in seq_splits/head_splits is bounded by nothing, and a product that wraps yields a
+// negative window_numel, which passes acquire's capacity check and is then carved out of the pool
+// as an enormous unsigned size.
 int64_t checked_mul(int64_t a, int64_t b, const std::string& what)
 {
     if (a != 0 && b > std::numeric_limits<int64_t>::max() / a) {
@@ -52,18 +49,12 @@ std::vector<int64_t> exclusive_prefix_sum(const std::vector<int64_t>& values)
 }
 
 // Emit `depth` batch repetitions of `op`, `src_stride` / `dst_stride` bytes apart, as one 3D copy
-// when that is both expressible and not slower, and as `depth` 2D copies otherwise.
+// when that is both expressible and worth it, and as `depth` 2D copies otherwise.
 //
-// Only MULTI-ROW copies are fused, and the restriction is the point. A single-row copy is a flat
-// memcpy; folding b of them into one 3D copy of b slices moves them onto the strided path, which
-// is markedly slower. A pitched copy is already strided, so fusing costs it nothing on the device
-// and removes (b-1) launches per peer -- the only per-call cost that grows with b. So the rule
-// buys host submit time exactly where it is free, and declines it where it is not.
-//
-// Consequence worth knowing: at rows == 1 (s_local == 1) this still issues b separate 2D copies.
-//
-// cudaMemcpy3DParms also does not take a slice stride: it derives one as pitch * ysize. So a
-// stride is only expressible when it divides the pitch exactly and leaves room for the rows.
+// Only MULTI-ROW copies are fused: a single-row copy is a flat memcpy, and folding b of them into
+// one 3D copy would move them onto the strided path, while a pitched copy is already strided and
+// fusing removes (b-1) launches. cudaMemcpy3DParms also takes no slice stride -- it derives one as
+// pitch * ysize -- so a stride is expressible only when it divides the pitch and fits the rows.
 void push_batched(std::vector<CopyOp>& out, CopyOp op, int64_t depth, int64_t src_stride, int64_t dst_stride)
 {
     const bool worth_fusing = depth > 1 && op.rows > 1;
@@ -159,8 +150,7 @@ A2APlan build_plan(const A2ADims& dims, int mode, int64_t elem_size)
     plan.output_shape = (mode == kScatterHead) ? std::vector<int64_t>{dims.b, seq_total, n_me, dims.d} :
                                                  std::vector<int64_t>{dims.b, s_me, head_total, dims.d};
 
-    // Window size: the largest receive over all ranks. Every rank's output is dense from the
-    // window base, so this is just the max of the per-rank output sizes. See A2APlan.
+    // Window size: the largest receive over all ranks (see A2APlan::window_numel).
     for (int p = 0; p < dims.world_size; ++p) {
         const int64_t rows       = (mode == kScatterHead) ? seq_total : dims.seq_splits[p];
         const int64_t heads      = (mode == kScatterHead) ? dims.head_splits[p] : head_total;
@@ -171,9 +161,9 @@ A2APlan build_plan(const A2ADims& dims, int mode, int64_t elem_size)
 
     for (int p = 0; p < dims.world_size; ++p) {
         if (mode == kScatterHead) {
-            // Send peer p the head columns it owns, for every local sequence position; they land
-            // in the slice of p's window that this rank's sequence shard occupies. The window
-            // rows are contiguous, so this reads strided and writes contiguous.
+            // Send peer p the head columns it owns, for every local sequence position; they land in
+            // the slice of p's window that this rank's sequence shard occupies. The window rows are
+            // contiguous, so this reads strided and writes contiguous.
             const int64_t row = dims.head_splits[p] * d_bytes;
             if (row == 0 || s_me == 0) {
                 continue;
@@ -190,10 +180,9 @@ A2APlan build_plan(const A2ADims& dims, int mode, int64_t elem_size)
         }
         else {
             // The inverse: send peer p the sequence rows it owns, carrying only this rank's head
-            // columns, into p's window at this rank's head offset -- a STRIDED write across the
-            // link, which runs somewhat below a contiguous one. Landing the bytes contiguously in
-            // a per-sender segment instead is not available to this operator at all: the window
-            // IS the returned tensor, so there is no local pass to interleave them afterwards.
+            // columns, into p's window at this rank's head offset -- a strided write. Landing them
+            // contiguously in a per-sender segment is not available here: the window IS the
+            // returned tensor, so there is no local pass to interleave them afterwards.
             const int64_t row = n_me * d_bytes;
             const int64_t s_p = dims.seq_splits[p];
             if (row == 0 || s_p == 0) {
