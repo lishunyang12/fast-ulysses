@@ -59,7 +59,7 @@ itself collective).
 - Sync and async calls **both count** in the rank-uniform call sequence (both advance the same
   per-group barrier epoch; sync calls run on the caller's stream, async on the comm stream).
 
-## `all_to_all_single_4d_async(x, *, mode=0, tag="", use_tma=None) -> AsyncA2AHandle`
+## `all_to_all_single_4d_async(x, *, mode=0, tag="", use_tma=None, barrier=True) -> AsyncA2AHandle`
 
 Async variant: the collective is submitted to the group's dedicated high-priority comm stream and
 the call returns immediately; kernels submitted to the caller's stream afterwards overlap with the
@@ -70,6 +70,13 @@ does not block) and returns the output view. Collective constraints are identica
 monotonic counter, so barrier kernels must execute in submission order. `wait()` every outstanding
 async handle of the group **before** issuing the next sync collective on the main stream — the data
 dependency forces the comm-stream barriers to complete first.
+
+**Grouped handshake (`barrier=False`)**: several async calls can share ONE completion handshake —
+pass `barrier=False` on all but the last call of the group (e.g. q, k, v of one attention layer).
+Only the barrier-carrying handle's `wait()` guarantees that peers' writes have landed in the local
+output buffers; a `barrier=False` handle's `wait()` orders this rank's own work only. All ranks
+must use the identical barrier pattern (epoch lockstep). This removes N-1 barrier kernels and,
+more importantly, N-1 cross-rank skew couplings per group.
 
 **Overlap in practice (measured on 8×H200)**: the direct-write scatter is an SM-resident large
 grid; cooperative-launch GEMMs (e.g. cuBLAS nvjet) release no SM slots while running, so the a2a
@@ -98,11 +105,14 @@ Notes:
 - Same rank-uniform call-sequence constraint as every other collective (sync and async advance the
   same barrier epoch).
 
-## `all_to_all_single_4d_ce_async(x, *, mode=0, tag="") -> AsyncA2AHandle`
+## `all_to_all_single_4d_ce_async(x, *, mode=0, tag="", barrier=True) -> AsyncA2AHandle`
 
 Async CE variant (same comm-stream launch and ordering constraint as
 `all_to_all_single_4d_async`). Because the transfer rides the DMA engines, the in-flight window
-overlaps concurrent GEMMs/attention instead of time-slicing with them.
+overlaps concurrent GEMMs/attention instead of time-slicing with them. `barrier=False` grouping
+works exactly as on the kernel path. (The sync `all_to_all_single_4d_ce` deliberately has no
+`barrier` parameter: a deferred sync result would be an unreadable view with nothing left to
+publish it.)
 
 ## `destroy() -> None`
 

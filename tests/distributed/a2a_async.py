@@ -5,6 +5,9 @@
 Checks that (1) async results bitwise-match the sync op, (2) compute submitted between launch and
 wait() (the overlap window) does not corrupt the result, (3) sync and async calls interleave safely
 on the shared comm stream, and (4) in-flight q/k/v async calls with distinct tags stay independent.
+Grouped-handshake coverage: (5) a barrier=False/False/True q/k/v group publishes all three
+results on both the base and CE paths, and (6) a deep pile of undrained barrier=False CE calls
+published by one final barrier=True call (regression for the per-call CE join events).
 """
 
 from __future__ import annotations
@@ -74,6 +77,46 @@ def main():
     back = h1.wait()
     torch.cuda.synchronize()
     check("mode1 async roundtrip == input", torch.equal(back, x))
+
+    # 4) barrier=False grouping on the base path: q/k defer their handshake, v carries it;
+    #    all three results must be published after the barrier-carrying handle's wait().
+    hq = group.all_to_all_single_4d_async(q, mode=0, tag="gq", barrier=False)
+    hk = group.all_to_all_single_4d_async(k, mode=0, tag="gk", barrier=False)
+    hv = group.all_to_all_single_4d_async(v, mode=0, tag="gv", barrier=True)
+    oq, ok_, ov = hq.wait(), hk.wait(), hv.wait()
+    torch.cuda.synchronize()
+    check(
+        "barrier=False group (q/k deferred, v publishes)",
+        torch.equal(oq, rq) and torch.equal(ok_, rk) and torch.equal(ov, rv),
+    )
+
+    # 5) CE grouping: q/k defer, v publishes -- same contract as the base path, and the CE
+    #    fan-out's join events must chain correctly across the deferred calls.
+    cq = group.all_to_all_single_4d_ce(q, mode=0, tag="cq").clone()
+    ck = group.all_to_all_single_4d_ce(k, mode=0, tag="ck").clone()
+    cv = group.all_to_all_single_4d_ce(v, mode=0, tag="cv").clone()
+    hq = group.all_to_all_single_4d_ce_async(q, mode=0, tag="caq", barrier=False)
+    hk = group.all_to_all_single_4d_ce_async(k, mode=0, tag="cak", barrier=False)
+    hv = group.all_to_all_single_4d_ce_async(v, mode=0, tag="cav", barrier=True)
+    oq, ok_, ov = hq.wait(), hk.wait(), hv.wait()
+    torch.cuda.synchronize()
+    check(
+        "CE barrier=False group (q/k deferred, v publishes)",
+        torch.equal(oq, cq) and torch.equal(ok_, ck) and torch.equal(ov, cv),
+    )
+
+    # 6) CE deferred deep pile: many undrained barrier=False CE calls before one publishing
+    #    call. Regression for the per-call join events -- the old shared CEResources events
+    #    deadlocked within a handful of undrained groups when the host ran far ahead of the
+    #    device (a pending wait could resolve against a later re-record).
+    w = torch.randn(1, 8, ws, 32, device=dev, dtype=torch.bfloat16)
+    wref = group.all_to_all_single_4d_ce(w, mode=0, tag="pileref").clone()
+    for _ in range(20):
+        group.all_to_all_single_4d_ce_async(w, mode=0, tag="pile", barrier=False)
+    hw = group.all_to_all_single_4d_ce_async(w, mode=0, tag="pile2", barrier=True)
+    got_w = hw.wait()
+    torch.cuda.synchronize()
+    check("CE deferred deep pile (20 undrained groups)", torch.equal(got_w, wref))
 
     _ = a  # keep the dummy compute live
 

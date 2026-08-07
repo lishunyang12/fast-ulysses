@@ -108,7 +108,7 @@ void UlyssesGroup::init_world(std::vector<int64_t> uid_ints, int64_t global_rank
         nvshmemx_set_attr_uniqueid_args(static_cast<int>(global_rank), static_cast<int>(global_nranks), &uid, &attr)
             == 0,
         "nvshmemx_set_attr_uniqueid_args failed");
-    // DEVIATION (see task-5-report): use the host-lib direct entry nvshmemx_hostlib_init_attr instead of
+    // DEVIATION: use the host-lib direct entry nvshmemx_hostlib_init_attr instead of
     // inline nvshmemx_init_attr. The inline version calls nvshmemi_init_thread, a symbol that lives only
     // in static libnvshmem_device.a; linking it clashes with the NVSHMEM version node of torch's bundled
     // libtorch_nvshmem.so (undefined symbol nvshmem_selected_device_transport). hostlib_init_attr is the
@@ -240,12 +240,8 @@ const CEResources& UlyssesGroup::ce_resources()
 {
     if (!ce_ready_) {
         ce_.streams.resize(world_size_);
-        ce_.done.resize(world_size_);
-        for (int i = 0; i < world_size_; ++i) {
+        for (int i = 0; i < world_size_; ++i)
             ULYSSES_CUDA_CHECK(cudaStreamCreateWithFlags(&ce_.streams[i], cudaStreamNonBlocking));
-            ULYSSES_CUDA_CHECK(cudaEventCreateWithFlags(&ce_.done[i], cudaEventDisableTiming));
-        }
-        ULYSSES_CUDA_CHECK(cudaEventCreateWithFlags(&ce_.ready, cudaEventDisableTiming));
         ce_ready_ = true;
     }
     return ce_;
@@ -272,9 +268,6 @@ void UlyssesGroup::destroy()
             cudaStreamSynchronize(s);
             cudaStreamDestroy(s);
         }
-        for (auto e : ce_.done)
-            cudaEventDestroy(e);
-        cudaEventDestroy(ce_.ready);
         ce_       = {};
         ce_ready_ = false;
     }
