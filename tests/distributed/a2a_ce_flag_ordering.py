@@ -23,14 +23,16 @@ to write the flag with a ``cudaMemcpyAsync`` on the transfer stream instead of f
 If the ordering does not hold, a reader that is ALREADY WAITING when the flag lands sees the
 previous call's payload in part of the buffer. The worker maximises exactly that:
 
-  * BORROWED results -- this extension always returns the symmetric-heap view, and the check reads
-    it directly. Never ``.clone()`` it here: a device-to-device copy between the barrier and the
-    first read is time the writes could use to drain, which would hide the very thing being
-    tested.
+  * BORROWED results -- ``all_to_all_single_4d_borrowed``, whose result is the symmetric-heap view
+    itself, and the check reads it directly. Never ``.clone()`` it here: a device-to-device copy
+    between the barrier and the first read is time the writes could use to drain, which would hide
+    the very thing being tested. That is also why the default ``all_to_all_single_4d`` is wrong for
+    this worker -- its copy-out is exactly that copy, sitting exactly there.
   * A LARGE payload, so the copy engine is still busy when the flag is issued.
-  * SKEW IN THE TRANSFER. rank 0 is held back by a ballast GEMM chain, so its CE copies start
-    late, while every other rank is already spinning in the CLOSING barrier and reads the instant
-    rank 0's flag arrives.
+  * SKEW IN THE TRANSFER, via UNEVEN SHARDS. In mode 0 a rank sends `s_me * head_total * d`, so
+    giving rank 0 most of the sequence makes its copies several times longer than everyone
+    else's. They reach the CLOSING barrier while it is still copying and read the instant its
+    flag arrives.
   * A distinct constant per iteration, so a stale byte is unmistakable rather than plausible. It
     CYCLES in 1..128 rather than being the iteration number, because bfloat16 has 8 significant
     bits: ``float(i)`` is exact only up to 256 and above that adjacent iterations collide on one
@@ -38,37 +40,37 @@ previous call's payload in part of the buffer. The worker maximises exactly that
     used ``float(i)`` over 300 iterations and is blind from 257 on; it failed at iteration 2, so
     it never showed.)
 
-WHY THE PRE-CALL BALLAST IS NOT BLIND HERE, AND WHEN IT WILL BECOME SO. The reference's first
-version of this test skewed the ranks the same way and was blind: it passed even with the closing
-barrier deleted, because its call OPENS with a barrier that re-aligns everyone before any data
-moves. It had to skew the TRANSFER instead, with uneven shards -- which this extension cannot do
-from Python: ``A2APlan`` carries per-rank splits, but ``check_uniform_args`` builds even ones only
-and no entry point exposes them. Rebuild this worker on uneven shards once they are reachable.
-Meanwhile a pre-call ballast does reach the transfer here, because ``all_to_all_single_4d`` has NO
-opening barrier: it is copies, then ``fast_barrier``. That is the same missing barrier
-tests/distributed/a2a_window_race.py probes -- so if an opening barrier is ever added, THIS WORKER
-GOES BLIND. Re-run the negative control after any barrier change.
+WHY THE SKEW IS ON THE TRANSFER AND NOT BEFORE THE CALL. An earlier version of this worker held
+rank 0 back with a ballast GEMM chain BEFORE the call, and said so in a docstring that also named
+its own expiry condition: that it would go blind if an opening barrier were ever added. One was
+(bindings.cpp, writers-wait-for-readers), and this file was not updated with it -- so for several
+commits this worker passed while testing nothing, and bindings.cpp and docs/API.md went on citing
+it as the evidence for an undocumented assumption. An audit caught it.
 
-READING A FAILURE: the missing opening barrier means a tear here has TWO possible causes, and the
-constants the log prints tell them apart. A flag-ordering violation reads the residue that was in
-the window BEFORE this call's writes became visible -- the PREVIOUS iteration's constant, the
-``[i-1, i]`` mixture the reference measured with its closing barrier deleted. A window race (a
-peer's NEXT call overwriting us while we read) reads the FOLLOWING iteration's constant. Only the
-first is this worker's subject; the second is a2a_window_race.py's and would be a finding against
-that gap, not against the copy-engine ordering.
+The mechanism is simple once seen: the call now OPENS with a handshake, which re-aligns every rank
+before any data moves, so an arrival skew is absorbed and equal shards then copy for equal times.
+The reference hit exactly this and recorded it (custom_nccl_op/tests/distributed/
+run_ce_flag_ordering.py) -- its first version "passed even with the closing barrier deleted --
+proof that it was testing nothing". Only a skew the opening barrier CANNOT absorb works, and that
+means making the transfers themselves unequal.
 
 Deviation from the reference worker: it breaks out of the loop on the first tear. Here the loop
 runs to the end, because a rank that leaves early stops issuing collectives and its peers hang in
 ``fast_barrier`` -- a 600 s timeout instead of a reported failure.
 
-NEGATIVE CONTROL: delete ``group->fast_barrier(stream, tag)`` in fast_ulysses/csrc/bindings.cpp
-and rebuild; the reference implementation's equivalent control failed at iteration 2 with 62.9M
-stale elements reading [i-1, i]. Without a rebuild, the same control is one line here: replace the
-``group.all_to_all_single_4d(x, mode=0, tag="ord")`` call below with
-``group.all_to_all_single_4d_async(x, mode=0, tag="ord", barrier=False).wait()`` -- a
-``barrier=False`` handle's wait orders this rank's own work only, so the reads become
-unsynchronised and must report stale constants within a few iterations. If the worker still
-passes with either control applied, it is testing nothing and a pass means nothing.
+NEGATIVE CONTROL: delete the CLOSING ``group->fast_barrier(stream, tag)`` in
+fast_ulysses/csrc/bindings.cpp -- the one under ``if (barrier)``, NOT the opening one -- and
+rebuild. The reference's equivalent control failed at iteration 2 with 62.9M stale elements
+reading [i-1, i]. THIS CONTROL MUST BE RE-RUN whenever the barriers change; the previous version
+of this worker was left passing a control it could no longer fail.
+
+The one-line variant that used to be offered here (``barrier=False``) is no longer a control:
+``barrier=False`` defers only the closing handshake, and the opening one still runs, so the ranks
+stay aligned. Deleting the closing barrier in C++ and rebuilding is the only valid control now.
+
+This worker uses the BORROWED form deliberately: the copying entry point would put a
+device-to-device pass between the barrier and the first read, which is time the peers'
+writes could use to drain -- it would hide the very thing being tested.
 """
 
 from __future__ import annotations
@@ -95,15 +97,22 @@ def main() -> None:
 
     # ~200 MB per rank at ws=4 (~400 MB at ws=8): the copy engines are still draining when the
     # barrier kernel publishes the flag.
-    b, s_local, d = 1, 8192, 384
-    x = torch.empty((b, s_local, 8 * ws, d), dtype=torch.bfloat16, device=dev)
+    # Rank 0 takes most of the sequence, so its transfer runs several times longer than the
+    # others' and they wait for it at the closing barrier. In mode 0 a rank sends
+    # s_me * head_total * d, so this is the axis that makes the transfers unequal.
+    b, s_total, d = 1, 8192 * ws, 384
+    base = s_total // (2 * ws)
+    seq_splits = [base] * ws
+    seq_splits[0] = s_total - base * (ws - 1)
+    head_splits = [8] * ws
+    kw = {"seq_splits": seq_splits, "head_splits": head_splits}
+    x = torch.empty((b, seq_splits[rank], 8 * ws, d), dtype=torch.bfloat16, device=dev)
     mb = x.numel() * x.element_size() / 1e6
-    ballast = torch.randn((4096, 4096), dtype=torch.bfloat16, device=dev)
 
     # Warm the tag: the first use allocates and collectively registers the symmetric buffer, which
     # serialises the ranks and would hide the skew this worker depends on.
     x.fill_(0.0)
-    group.all_to_all_single_4d(x, mode=0, tag="ord")
+    group.all_to_all_single_4d_borrowed(x, mode=0, tag="ord", **kw)
     torch.cuda.synchronize()
     dist.barrier()
 
@@ -112,12 +121,11 @@ def main() -> None:
         v = float(1 + i % 128)  # bf16-exact and distinct from every neighbouring call; see above
         x.fill_(v)
 
-        # rank 0's copies start late; everyone else is already spinning in the closing barrier.
-        if rank == 0:
-            for _ in range(8):
-                ballast = ballast @ ballast * 1e-4
+        # No arrival skew: the opening barrier would absorb it. The skew is in the shards --
+        # rank 0's transfer is several times longer, so the others reach the closing barrier
+        # while it is still copying.
 
-        y = group.all_to_all_single_4d(x, mode=0, tag="ord")
+        y = group.all_to_all_single_4d_borrowed(x, mode=0, tag="ord", **kw)
         # Enqueued directly behind the barrier on this stream, reading the window itself. The host
         # sync inside .item() happens after this comparison has already read it, so it cannot mask
         # a stale read.

@@ -58,7 +58,7 @@ const UlyssesGroup::BarrierState& UlyssesGroup::barrier_state_(const std::string
 
     BarrierState st;
     // The tag goes in the pool name, so each tag's handshake gets its own flags -- see BarrierState.
-    const auto& buf = pool_->acquire({static_cast<int64_t>(world_size_)}, at::kLong, "__ulysses_sync__" + tag);
+    const auto& buf = pool_->acquire(static_cast<int64_t>(world_size_), at::kLong, "__ulysses_sync__" + tag);
     st.my_flags     = buf.sym_base;
     st.peer_flags   = buf.peer_ptrs;
     // Epoch counter: this rank's own device memory, never addressed by a peer.
@@ -159,8 +159,11 @@ UlyssesGroup::UlyssesGroup(std::vector<int64_t> peer_global_pes,
     // while the body, the AND-reduce that picks the team index, runs over the CHILD triplet alone.
     // Hence the contract comm.py states: the live groups must PARTITION the job, every PE in
     // exactly one and all of them constructing together, so those parent-team collectives still
-    // pair up one for one. A rank that builds no group, or a second one by itself, hangs the job
-    // inside the split. Two disjoint teams may come back with the SAME team index -- the psync that
+    // pair up one for one. Measured: two groups sharing PEs ({0,1,2,3} and {2,3,4,5} at 8 ranks)
+    // HANG inside the constructor -- members block, non-members walk on. NOT ENFORCED: a local
+    // check cannot see it, because the divergence is already present in the FIRST construction,
+    // where the PEs outside that group never enter the split at all. Catching it needs an
+    // all-gather of the PE sets at construction time, confirming they partition the world. Two disjoint teams may come back with the SAME team index -- the psync that
     // index names is each PE's own, so teams sharing no PE never meet in it.
     const int gpes          = nvshmem_n_pes();
     bool      is_full_world = (world_size_ == gpes);

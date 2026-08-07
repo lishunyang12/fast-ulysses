@@ -2,19 +2,26 @@
 
     torchrun --nproc_per_node=8 tests/distributed/a2a_window_race.py
 
-Every result is a view of the tag's single symmetric-heap buffer, so the caller reads exactly the
-memory the peers write. The closing barrier of call N (bindings.cpp: CE copies, then
-``fast_barrier``) proves every peer's call-N writes have LANDED. It proves nothing about every
-peer having FINISHED READING its own window for call N -- so a fast peer's call N+1 transfer can
-start writing into our window while our call-N read is still in flight.
+This worker calls ``all_to_all_single_4d_borrowed``, and only that form makes it mean anything: a
+borrowed result is a view of the tag's single symmetric-heap buffer, so the caller reads exactly
+the memory the peers write. The default ``all_to_all_single_4d`` copies the window into the
+caller's own tensor before returning, and a peer overwriting the window afterwards could not be
+seen from that copy -- the race would still exist and this worker would report nothing.
 
-WHAT THIS EXTENSION HAS TODAY: only that closing barrier. The reference implementation
-(custom_nccl_op) also OPENS every call with a barrier, before it writes anything -- writers wait
-for readers -- and that barrier sits at the START of the next call rather than at the end of this
-one precisely because a borrowed result is read by the caller, at a time the operator never sees.
-fast_ulysses has no opening barrier, so this worker is a live PROBE of that gap, not a regression
-test of a working feature. If it reports a torn window, the finding is that
-``all_to_all_single_4d`` needs a second ``fast_barrier`` before ``launch_a2a_ce``.
+The closing barrier of call N (bindings.cpp: CE copies, then ``fast_barrier``) proves every peer's
+call-N writes have LANDED. It proves nothing about every peer having FINISHED READING its own
+window for call N -- so a fast peer's call N+1 transfer can start writing into our window while
+our call-N read is still in flight.
+
+WHAT THIS EXTENSION HAS TODAY: both barriers. It used to have only the closing one, and this
+worker was written as a live PROBE of that gap -- it FAILED, which is how the opening barrier came
+to be added (bindings.cpp, before launch_a2a_ce). It is now a regression test for a working
+feature. The opening one sits at the START of the next call rather than at the end of this one
+precisely because a borrowed result is read by the caller, at a time the operator never sees.
+
+NEGATIVE CONTROL: delete the OPENING ``group->fast_barrier(stream, tag)`` -- the unconditional one
+before ``launch_a2a_ce``, not the closing one under ``if (barrier)`` -- and rebuild. This worker
+failed on exactly that before the barrier existed.
 
 The adversarial timing is the whole worker; the assertion is trivial:
   * rank 0 is the SLOW READER. The ballast sits between the call and the read, exactly where a
@@ -35,6 +42,9 @@ and rebuild. With no handshake at all, iteration 1 or 2 must report a large numb
 holding a neighbouring call's constant (the log prints the distinct values it saw). If it still
 passes with that line gone, the timing above has stopped being adversarial on this machine and
 the worker is worthless as written -- fix the worker before trusting a pass.
+
+This worker uses the BORROWED form deliberately: only a result that IS the window can be
+torn by a peer's next call. A copied result is already out of the window by then.
 """
 
 from __future__ import annotations
@@ -69,14 +79,14 @@ def main() -> None:
     # Warm the tag: the first use allocates and collectively registers the symmetric buffer, which
     # serialises the ranks and would hide the skew this worker depends on.
     x.fill_(0.0)
-    group.all_to_all_single_4d(x, mode=1, tag="race")
+    group.all_to_all_single_4d_borrowed(x, mode=1, tag="race")
     torch.cuda.synchronize()
     dist.barrier()
 
     iters, torn, first_bad = 40, 0, 0
     for i in range(1, iters + 1):
         x.fill_(float(i))
-        y = group.all_to_all_single_4d(x, mode=1, tag="race")
+        y = group.all_to_all_single_4d_borrowed(x, mode=1, tag="race")
 
         # Rank 0 keeps holding the borrowed window while its peers race into call i+1, whose
         # copies target this very buffer. Alternating keeps the ranks oscillating rather than

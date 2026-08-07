@@ -14,23 +14,20 @@ SymmetricHeapPool::SymmetricHeapPool(int64_t reserved_bytes, int world_size, std
 }
 
 const SymmetricHeapPool::Buffer&
-SymmetricHeapPool::acquire(const std::vector<int64_t>& shape, c10::ScalarType dtype, const std::string& tag)
+SymmetricHeapPool::acquire(int64_t numel, c10::ScalarType dtype, const std::string& tag)
 {
     TORCH_CHECK(!destroyed_, "SymmetricHeapPool::acquire called after destroy()");
-    Key  key{tag, shape, dtype};
+    Key  key{tag, numel, dtype};
     auto it = registry_.find(key);
     if (it != registry_.end())
         return it->second;  // reuse
 
-    int64_t numel = 1;
-    for (auto s : shape)
-        numel *= s;
-    const int64_t elem   = c10::elementSize(dtype);
-    int64_t       nbytes = numel * elem;
-    nbytes               = (nbytes + 15) / 16 * 16;  // uint4 alignment
+    int64_t nbytes = numel * c10::elementSize(dtype);
+    nbytes         = (nbytes + 15) / 16 * 16;  // uint4 alignment
 
-    // Uniform: every rank computes an identical nbytes (out_shape is rank-independent), so the
-    // collective (uniform-size) nvshmem_align below needs no max-reduce.
+    // Uniform: `numel` is the caller's rank-uniform capacity (for the a2a, the largest rank's
+    // output -- see A2APlan::window_numel), so the collective (uniform-size) nvshmem_align below
+    // needs no max-reduce.
     const int64_t alloc_bytes = nbytes;
     TORCH_CHECK(used_ + alloc_bytes <= reserved_,
                 "SymmetricHeapPool OOM: need ",
@@ -59,10 +56,6 @@ SymmetricHeapPool::acquire(const std::vector<int64_t>& shape, c10::ScalarType dt
                     i,
                     " (non-P2P-reachable; phase-1 requires single-node NVLink).");
 
-    auto opts = at::TensorOptions().dtype(dtype).device(at::kCUDA, at::cuda::current_device());
-    buf.view  = at::from_blob(
-        p, shape, [](void*) {}, opts);  // no-op deleter
-
     auto res = registry_.emplace(std::move(key), std::move(buf));
     return res.first->second;
 }
@@ -71,7 +64,7 @@ void SymmetricHeapPool::destroy()
 {
     if (destroyed_)
         return;
-    registry_.clear();  // drop from_blob views (does not free underlying memory)
+    registry_.clear();
     for (void* p : segments_)
         nvshmem_free(p);
     segments_.clear();

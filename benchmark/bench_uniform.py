@@ -5,6 +5,11 @@ mode1: shape (1, N, H/ws, D=128), input (b, s_global, n_local, d); matches bindi
 
 Reports our throughput (FAST_ULYSSES_USE_TMA selects non-TMA/TMA) plus an NCCL reference.
 Run: PROF_MODE=0|1 FAST_ULYSSES_USE_TMA=0|1 torchrun --nproc_per_node=8 bench_uniform.py
+
+Times the DEFAULT copying entry point, so the copy-out is inside every number here. That is the
+like-for-like comparison: the NCCL oracle also lands its result in a tensor the caller owns.
+``all_to_all_single_4d_borrowed`` is faster by the copy-out; benchmark/bench_stages.py is where
+that stage is broken out.
 """
 
 from __future__ import annotations

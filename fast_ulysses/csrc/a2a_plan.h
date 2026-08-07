@@ -7,8 +7,8 @@
 //
 // UNEVEN splits are the general case: even splits are just seq_splits = [s/P]*P and
 // head_splits = [n/P]*P, so there is a single code path to get right. The operator entry point
-// (check_uniform_args in bindings.cpp) builds even splits only; the uneven arithmetic is what
-// the host tests exercise.
+// (make_dims in bindings.cpp) takes the splits from the caller and falls back to the even ones
+// when it is given none.
 #include <cstdint>
 #include <vector>
 
@@ -64,13 +64,23 @@ struct CopyOp {
 };
 
 struct A2APlan {
-    std::vector<int64_t> output_shape;  // shape of the symmetric window this rank receives into
-    std::vector<CopyOp>  ops;           // what THIS rank sends; ops[i].peer says where
+    std::vector<int64_t> output_shape;  // shape THIS rank receives, dense from the window base
+    // Elements the symmetric window must hold: the LARGEST rank's output, not this rank's.
+    // Under uneven splits each rank receives a different amount, but nvshmem_align is a
+    // collective that has to be called with the same size everywhere or the peer offsets stop
+    // lining up -- so every rank allocates the max. It can compute it without communicating:
+    // the splits describe the whole group and are rank-uniform under SPMD.
+    int64_t             window_numel = 0;
+    std::vector<CopyOp> ops;  // what THIS rank sends; ops[i].peer says where
 };
 
-// The result IS the symmetric window (all_to_all_single_4d returns the window view), so the
-// window already holds the output layout and this rank's own share travels through it like
-// every other peer's: `ops` covers all world_size destinations and there is no copy-out.
+// The window holds the output layout, and this rank's own share travels through it like every
+// other peer's: `ops` covers all world_size destinations. That is what
+// all_to_all_single_4d_borrowed needs -- its result IS the window -- and it means the copying
+// entry point's copy-out is one flat copy of the whole result rather than a second addressing
+// scheme. One plan serves both forms; custom_nccl_op instead builds a different plan per form
+// so that self can go straight from input to output, which saves one HBM pass. Not done here,
+// not measured here.
 A2APlan build_plan(const A2ADims& dims, int mode, int64_t elem_size);
 
 }  // namespace ulysses

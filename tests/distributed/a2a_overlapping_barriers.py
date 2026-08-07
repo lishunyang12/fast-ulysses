@@ -20,14 +20,21 @@ fast_ulysses now keeps the barrier state per tag as well -- flags and epoch coun
 interleave, because a tag's calls are ordered by the contract; across tags nothing is shared. This
 worker is what keeps that true.
 
-BE AWARE OF A DOC/CODE DIVERGENCE while reading a result. comm.py's
-``all_to_all_single_4d_async`` docstring and docs/API.md still say "barrier kernels must execute in
-submission order (one per-group epoch), so wait() every outstanding async handle before the next
-sync collective" -- written when the epoch WAS per group. The C++ has moved on; the prose has not.
-So a pass here means the Python-side restriction is stale and can be dropped; torn results mean
-the restriction is real and the per-tag split is incomplete; a HANG (600 s timeout) means a rank
-fell behind an epoch it can never satisfy. Do not relax the documented contract on anything
-weaker than a run of this worker.
+BORROWED RESULTS ON BOTH SIDES, deliberately. A swallowed handshake shows up as a read of the
+window before the peers' writes for that call have landed, and the borrowed forms put that read
+where the check is -- directly on the window. The copying forms would put it in the copy-out
+instead: still a read at the wrong time, but one whose result the check only sees second-hand,
+through a copy that has itself given the writes more time to drain. The controls below also need
+``barrier=False``, which only the borrowed form has.
+
+THIS WORKER IS THE EVIDENCE FOR THE DOCUMENTED CONTRACT. comm.py's
+``all_to_all_single_4d_async`` docstring and docs/API.md used to say "barrier kernels must execute
+in submission order (one per-group epoch), so wait() every outstanding async handle before the
+next sync collective" -- written when the epoch WAS per group. They now state the contract the
+code implements: ordered within a tag, unordered across tags. Reading a result: a pass is what
+that contract rests on; torn results mean it is wrong and the per-tag split is incomplete; a HANG
+(600 s timeout) means a rank fell behind an epoch it can never satisfy. Do not relax the
+documented contract on anything weaker than a run of this worker.
 
 Deviation from the reference case: it breaks out of the loop on the first tear. Here the loop runs
 to the end, because a rank that leaves early stops issuing collectives and its peers hang in
@@ -39,9 +46,9 @@ site in fast_ulysses/csrc/bindings.cpp (e.g. ``group->fast_barrier(stream, "")``
 Both tags then share one flag array and one epoch counter, which is the configuration the
 reference measured: torn results with an atomic counter, and an outright HANG with a plain
 read-modify-write. Cheaper control, no rebuild: replace the sync
-``group.all_to_all_single_4d(k, ...)`` call below with
-``group.all_to_all_single_4d_async(k, mode=0, tag="ob_k", barrier=False).wait()`` -- that handle's
-wait orders this rank's own work only, so k is read with no handshake at all and ``k_out`` must
+``group.all_to_all_single_4d_borrowed(k, ...)`` call below with
+``group.all_to_all_single_4d_borrowed_async(k, mode=0, tag="ob_k", barrier=False).wait()`` -- that
+handle's wait orders this rank's own work only, so k is read with no handshake at all and ``k_out`` must
 report a neighbouring iteration's constant. If neither control produces a failure, the loop is
 blind and a pass means nothing.
 """
@@ -75,8 +82,8 @@ def main() -> None:
     # init runs an on-stream nvshmem barrier. Doing that here, serially on one stream, keeps the
     # loop below from also being a test of two tags registering concurrently on two streams.
     warm = torch.zeros((b, s_local, n_global, d), dtype=torch.bfloat16, device=dev)
-    group.all_to_all_single_4d(warm, mode=0, tag="ob_q")
-    group.all_to_all_single_4d(warm, mode=0, tag="ob_k")
+    group.all_to_all_single_4d_borrowed(warm, mode=0, tag="ob_q")
+    group.all_to_all_single_4d_borrowed(warm, mode=0, tag="ob_k")
     torch.cuda.synchronize()
     dist.barrier()
 
@@ -96,10 +103,10 @@ def main() -> None:
         q = torch.full((b, s_local, n_global, d), v, dtype=torch.bfloat16, device=dev)
         k = torch.full((b, s_local, n_global, d), -v, dtype=torch.bfloat16, device=dev)
 
-        handle = group.all_to_all_single_4d_async(q, mode=0, tag="ob_q")
+        handle = group.all_to_all_single_4d_borrowed_async(q, mode=0, tag="ob_q")
         # No wait here: that is the whole point. This runs on the caller's stream while the call
         # above is still going on the comm stream.
-        k_out = group.all_to_all_single_4d(k, mode=0, tag="ob_k")
+        k_out = group.all_to_all_single_4d_borrowed(k, mode=0, tag="ob_k")
         q_out = handle.wait()
 
         if not (q_out == v).all():

@@ -43,6 +43,8 @@ def _nprocs() -> list[int]:
     [
         "a2a_correctness.py",
         "a2a_async.py",
+        "a2a_uneven.py",
+        "a2a_copy_out.py",
         # Adversarial workers. Each builds one specific unsafe timing and is worth only as much as
         # that timing: each module docstring names the NEGATIVE CONTROL (the line to delete to make
         # it fail) and what its failure looks like. Re-run those controls after any barrier change.

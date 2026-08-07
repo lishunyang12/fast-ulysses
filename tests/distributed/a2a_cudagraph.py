@@ -21,6 +21,13 @@ computes ``want`` is a collective and re-aligns everyone, so it is issued BEFORE
 Capture failing is REPORTED, not failed: graph capture is not a documented feature of this
 extension. A green run with ``captured=False`` on the last line checked NOTHING -- read the line.
 
+BORROWED, because the graph needs a static output tensor and the borrowed form has one for free:
+the pool hands back the same window for a given (tag, capacity, dtype) on every call, so the view
+taken during the warm-up call is the address every replay writes. The default
+``all_to_all_single_4d`` allocates its output inside the call, which under capture comes from the
+graph's private pool and is not the tensor the warm-up call returned -- a different worker, not
+this one.
+
 NEGATIVE CONTROL, one line, aimed at exactly the bug above: in ``ulysses_barrier_kernel``
 (fast_ulysses/csrc/ulysses_group.cu) replace
 
@@ -79,7 +86,7 @@ def main() -> None:
     # capture would fail for an unrelated reason. The returned view is the graph's static output:
     # the pool hands back the same buffer for this (tag, shape, dtype) on every call.
     static_in.copy_(torch.randn_like(static_in))
-    static_out = group.all_to_all_single_4d(static_in, mode=0, tag="cg")
+    static_out = group.all_to_all_single_4d_borrowed(static_in, mode=0, tag="cg")
     torch.cuda.synchronize()
     dist.barrier()
 
@@ -89,7 +96,7 @@ def main() -> None:
     try:
         with torch.cuda.stream(side):
             with torch.cuda.graph(graph):
-                group.all_to_all_single_4d(static_in, mode=0, tag="cg")
+                group.all_to_all_single_4d_borrowed(static_in, mode=0, tag="cg")
         torch.cuda.current_stream().wait_stream(side)
         torch.cuda.synchronize()
         captured = True

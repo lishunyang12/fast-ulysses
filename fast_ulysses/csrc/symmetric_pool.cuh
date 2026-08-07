@@ -18,18 +18,24 @@ public:
         void*                 sym_base;
         int64_t               nbytes;
         std::vector<uint64_t> peer_ptrs;  // nvshmem_ptr(sym_base, peer_global_pe)
-        at::Tensor            view;       // from_blob with no-op deleter (pool owns lifetime)
     };
 
-    // Reuse on (tag,shape,dtype) hit; otherwise collectively allocate a new segment and register it.
-    const Buffer& acquire(const std::vector<int64_t>& shape, c10::ScalarType dtype, const std::string& tag);
+    // Reuse on (tag,numel,dtype) hit; otherwise collectively allocate a new segment and register it.
+    //
+    // `numel` is a CAPACITY, not a shape: nvshmem_align is a collective, so on a miss every rank
+    // must ask for the same size AND miss together. Both are why the key is not the caller's
+    // output shape -- under uneven splits that differs per rank, and two calls whose shapes
+    // happen to collide on one rank but not on another would fork the hit/miss pattern and hang.
+    // Callers lay their own view over Buffer::sym_base, or copy out of it (see
+    // all_to_all_single_4d_borrowed and all_to_all_single_4d).
+    const Buffer& acquire(int64_t numel, c10::ScalarType dtype, const std::string& tag);
 
-    // Terminal collective op: before calling, release all from_blob views returned by acquire() and
+    // Terminal collective op: before calling, release all views built over acquire()'d buffers and
     // ensure no A2A/collective is in flight, since this nvshmem_free's the segments those views alias.
     void destroy();  // nvshmem_free all segments + clear registry
 
 private:
-    using Key = std::tuple<std::string, std::vector<int64_t>, c10::ScalarType>;
+    using Key = std::tuple<std::string, int64_t, c10::ScalarType>;
     int64_t               reserved_, used_ = 0;
     int                   world_size_;
     std::vector<int>      peer_global_pes_;

@@ -5,6 +5,9 @@ under a concurrent 3-GEMM chain (to_q/k/v-shaped): hidden% = (serial - concurren
 / a2a_alone. CE should approach 100%; the kernel paths sit near 0% under nvjet.
 
     torchrun --nproc_per_node=4 benchmark/bench_ce.py
+
+The DEFAULT copying entry point, so the copy-out is part of both the a2a being timed and the
+work that has to hide under the GEMMs -- which is the question a caller actually has.
 """
 
 from __future__ import annotations

@@ -17,14 +17,14 @@ namespace {
 // peer, src_off, dst_off, src_pitch, dst_pitch, width, rows, depth, src_slice, dst_slice
 constexpr int64_t kOpFields = 10;
 
-std::tuple<std::vector<int64_t>, at::Tensor> a2a_plan_debug(int64_t              b,
-                                                            int64_t              d,
-                                                            int64_t              rank,
-                                                            int64_t              world_size,
-                                                            std::vector<int64_t> seq_splits,
-                                                            std::vector<int64_t> head_splits,
-                                                            int64_t              mode,
-                                                            int64_t              elem_size)
+std::tuple<std::vector<int64_t>, int64_t, at::Tensor> a2a_plan_debug(int64_t              b,
+                                                                     int64_t              d,
+                                                                     int64_t              rank,
+                                                                     int64_t              world_size,
+                                                                     std::vector<int64_t> seq_splits,
+                                                                     std::vector<int64_t> head_splits,
+                                                                     int64_t              mode,
+                                                                     int64_t              elem_size)
 {
     A2ADims dims;
     dims.b           = b;
@@ -51,7 +51,7 @@ std::tuple<std::vector<int64_t>, at::Tensor> a2a_plan_debug(int64_t             
         a[i][8] = plan.ops[i].src_slice;
         a[i][9] = plan.ops[i].dst_slice;
     }
-    return {plan.output_shape, ops};
+    return {plan.output_shape, plan.window_numel, ops};
 }
 
 }  // namespace
@@ -60,6 +60,6 @@ std::tuple<std::vector<int64_t>, at::Tensor> a2a_plan_debug(int64_t             
 TORCH_LIBRARY_FRAGMENT(fast_ulysses, m)
 {
     m.def("a2a_plan_debug(int b, int d, int rank, int world_size, int[] seq_splits, "
-          "int[] head_splits, int mode, int elem_size) -> (int[], Tensor)",
+          "int[] head_splits, int mode, int elem_size) -> (int[], int, Tensor)",
           &ulysses::a2a_plan_debug);
 }

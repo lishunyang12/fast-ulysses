@@ -6,9 +6,10 @@ result against the reference built from ``all_to_all_single`` + permute, which i
 every Ulysses implementation agrees on. If this passes, the addressing is right and any later
 failure is a transport or synchronisation bug, not a layout bug.
 
-The window IS the output here: ``all_to_all_single_4d`` returns the window view, so every rank
-sends its own share through the window like any other peer's and there is no copy-out stage to
-replay.
+The window holds the whole output here: every rank sends its own share through it like any
+other peer's. ``all_to_all_single_4d_borrowed`` returns that window as-is and
+``all_to_all_single_4d`` copies all of it out in one flat copy, so neither adds addressing this
+replay would have to model.
 """
 
 from __future__ import annotations
@@ -25,13 +26,14 @@ GATHER_HEAD = 1
 
 
 def build_plan(b, d, rank, world_size, seq_splits, head_splits, mode, elem_size):
-    output_shape, ops = torch.ops.fast_ulysses.a2a_plan_debug(
+    output_shape, window_numel, ops = torch.ops.fast_ulysses.a2a_plan_debug(
         b, d, rank, world_size, list(seq_splits), list(head_splits), mode, elem_size
     )
     output_shape = list(output_shape)
     return {
         "output_shape": output_shape,
         "output_bytes": int(np.prod(output_shape)) * elem_size,
+        "window_numel": int(window_numel),
         "ops": ops.numpy(),
     }
 
@@ -133,6 +135,14 @@ def check(b, d, seq_splits, head_splits, mode, dtype=np.float32):
         got = raw[r].view(dtype).reshape(plans[r]["output_shape"])
         assert got.shape == expected[r].shape, f"rank {r}: {got.shape} != {expected[r].shape}"
         np.testing.assert_array_equal(got, expected[r], err_msg=f"rank {r} mode {mode}")
+
+    # Window sizing. The allocation is collective (nvshmem_align), so every rank must ask for the
+    # SAME capacity, and it must hold the largest rank's output -- under uneven splits that is not
+    # this rank's own. (run_plan above gives each simulated rank a window of exactly its own
+    # output size, so it would already have failed if an op wrote past that rank's result.)
+    windows = {p["window_numel"] for p in plans}
+    assert len(windows) == 1, f"window_numel differs across ranks: {windows}"
+    assert windows.pop() == max(int(np.prod(p["output_shape"])) for p in plans)
     return plans
 
 
@@ -141,8 +151,8 @@ def check(b, d, seq_splits, head_splits, mode, dtype=np.float32):
 @pytest.mark.parametrize("mode", [SCATTER_HEAD, GATHER_HEAD])
 def test_even(world_size, b, mode):
     plans = check(b, 4, [5] * world_size, [2] * world_size, mode)
-    # The uniform entry point allocates the window with a size-collective nvshmem_align, so
-    # every rank must arrive at the same output size.
+    # Even splits are the case where the window is not just the same SIZE on every rank (check()
+    # asserts that everywhere) but holds the same SHAPE.
     assert {tuple(p["output_shape"]) for p in plans} == {tuple(plans[0]["output_shape"])}
 
 
@@ -190,13 +200,21 @@ def test_batch_fusion_rule():
     [([5, 5, 5, 5], [2, 2, 2, 2]), ([7, 5, 5, 4], [3, 2, 2, 1]), ([9, 4, 6, 1], [4, 1, 3, 2])],
 )
 def test_fused_ops_survive_cuda_memcpy_3d(mode, seq_splits, head_splits):
-    """The one property the replay above cannot check.
+    """Tripwire for a FUTURE plan change. It cannot fail on the plan as it stands.
 
-    ``apply_ops`` steps the batch with ``src_slice`` directly, so a fused op with a slice
-    stride cudaMemcpy3DParms cannot express still replays correctly here -- while the device
-    copied the wrong bytes, because cudaMemcpy3DParms takes no slice stride and derives one as
-    pitch * ysize (issue_copy passes ysize = slice / pitch). Assert the arithmetic that makes
-    that derivation exact, on every op the plan chose to fuse.
+    cudaMemcpy3DParms takes no slice stride and derives one as pitch * ysize (issue_copy
+    passes ysize = slice / pitch), so a fused op only copies the right bytes on the device
+    when the slice stride is an exact multiple of the pitch with room for the rows. The
+    replay above would not notice a violation: ``apply_ops`` steps the batch with
+    ``src_slice`` directly.
+
+    Every op build_plan emits today satisfies that BY CONSTRUCTION -- scatter has
+    src_slice/src_pitch == s_me == rows and dst_slice/dst_pitch == seq_total >= rows, gather
+    is the mirror -- so the ratio assertions below have no reachable failing input. A mutant
+    with push_batched's whole expressibility guard replaced by ``depth > 1 && rows > 1``
+    produced bit-identical plans (a reviewer's check, not re-run here). Only ``rows > 1``
+    can fire, and that restates test_batch_fusion_rule. Kept only so that a plan emitting
+    some other stride trips here.
     """
     fused = 0
     for rank in range(len(seq_splits)):

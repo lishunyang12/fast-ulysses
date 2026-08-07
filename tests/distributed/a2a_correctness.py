@@ -3,6 +3,10 @@
 Pure data movement, so results must be bit-exact. Run on a multi-GPU host (ws in [2, 8]):
     torchrun --nproc_per_node=8 tests/distributed/a2a_correctness.py
 (or via pytest: tests/test_multigpu.py)
+
+Most of this file exercises the DEFAULT copying entry point. The two tag-aliasing blocks near the
+end use ``all_to_all_single_4d_borrowed`` instead, for the reason given at each: a copied result
+is the caller's own memory whatever the tags did, so it cannot show a tag collision.
 """
 
 from __future__ import annotations
@@ -82,11 +86,15 @@ def main() -> None:
     # Distinct-tag non-aliasing (replaces the old a2a_frame): two concurrently-live results of the SAME
     # shape must use distinct tags and not clobber each other. Run both a2a, THEN check both -- if out_q
     # aliased out_k's buffer, out_q would now hold k's data.
+    #
+    # BORROWED on purpose: the copying form gives each call its own tensor whatever the tags say,
+    # so out_q would be right even if the two tags shared one window, and this check would be
+    # blind. Only a borrowed result can show a tag collision.
     xq = torch.randn(b, 16, 4 * ws, 128, dtype=torch.bfloat16, device=dev)
     xk = torch.randn(b, 16, 4 * ws, 128, dtype=torch.bfloat16, device=dev)
     refq, refk = torch_a2a(xq, 0, ws, pg), torch_a2a(xk, 0, ws, pg)
-    outq = group.all_to_all_single_4d(xq, mode=0, tag="q")
-    outk = group.all_to_all_single_4d(xk, mode=0, tag="k")
+    outq = group.all_to_all_single_4d_borrowed(xq, mode=0, tag="q")
+    outk = group.all_to_all_single_4d_borrowed(xk, mode=0, tag="k")
     if not (torch.equal(outq, refq) and torch.equal(outk, refk)):
         raise AssertionError(f"TAG ALIAS rank={rank} ws={ws} (distinct tags clobbered each other)")
     if rank == 0:
@@ -94,9 +102,10 @@ def main() -> None:
     dist.barrier()
 
     # CE and the kernel paths share tag buffers and barrier epochs: interleave one base
-    # and one CE call on distinct tags and check both results stay intact.
-    outq = group.all_to_all_single_4d(xq, mode=0, tag="q_mix")
-    outk = group.all_to_all_single_4d(xk, mode=0, tag="k_mix")
+    # and one CE call on distinct tags and check both results stay intact. Borrowed for the
+    # same reason as the pair above.
+    outq = group.all_to_all_single_4d_borrowed(xq, mode=0, tag="q_mix")
+    outk = group.all_to_all_single_4d_borrowed(xk, mode=0, tag="k_mix")
     if not (torch.equal(outq, refq) and torch.equal(outk, refk)):
         raise AssertionError(f"CE MIX rank={rank} ws={ws} (base/ce interleave corrupted a result)")
     if rank == 0:

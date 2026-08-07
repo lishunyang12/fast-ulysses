@@ -14,14 +14,19 @@
 // cudaMemcpy3DAsync instead of b cudaMemcpy2DAsync calls; at b == 1 the plan never fuses, so
 // the calls are exactly the ones this path has always issued.
 //
-// NOTE (measured on CUDA 13.3, exclusive GPUs; alternatives tried and REVERTED):
-// - single-stream serial submission: local copy loses its overlap with the remote
-//   copies -- 0.82ms standalone, no upside elsewhere;
+// NOTE (alternatives tried and REVERTED):
 // - cudaMemcpy3DBatchAsync: the driver's pitched BATCH path (many copies in one call, not
 //   the plain cudaMemcpy3DAsync used above) is itself slow (0.82ms, and 1.35ms with
 //   cudaMemcpyFlagPreferOverlapWithCompute); it also rejects the LEGACY default stream with
-//   "invalid argument" (explicit streams required).
-// The per-peer stream pool below beat both on standalone time at equal hiding.
+//   "invalid argument" (explicit streams required). Measured on CUDA 13.3, exclusive GPUs.
+//
+// This file used to record a second reverted alternative -- "single-stream serial
+// submission: local copy loses its overlap with the remote copies, 0.82ms standalone" --
+// and concluded the per-peer stream pool beat it. THAT CONCLUSION IS WRONG on 4xH200 and
+// the fan-out it justified has been removed; see the measurements at the transfer below.
+// The observation behind it was right (serialising SELF too does lose the local/remote
+// overlap) but the fix is to keep self on the caller's stream, not to fan the remote copies
+// out.
 #include "a2a_plan.h"
 #include "ulysses_group.cuh"
 
@@ -66,6 +71,7 @@ void launch_a2a_ce(const void*                  src,
                    const std::vector<uint64_t>& peer_ptrs,
                    const A2APlan&               plan,
                    const CEResources&           ce,
+                   int                          rank,
                    cudaStream_t                 stream)
 {
     const int      ws        = static_cast<int>(peer_ptrs.size());
@@ -82,24 +88,63 @@ void launch_a2a_ce(const void*                  src,
     // wait that deadlocks the group (reproduced at ws=2 with a few undrained groups).
     // Create/destroy is a few us per call and depth-safe: the waits capture the dependency
     // at call time, and destroy defers until the event retires.
+    // ONE STREAM for the remote copies, and this rank's OWN share on the CALLER's stream.
+    //
+    // Fanning out per peer is the intuitive design and this file used to do it. Measured on
+    // 4xH200 NVLink, exclusive GPUs, wan-720p / wan-480p / h3, ms per call:
+    //
+    //     fan out, one stream per peer              2.273  1.018  1.683
+    //     everything serialised onto one stream     1.345  0.631  1.049   (1.7x faster)
+    //     remote serialised, self on the caller's   1.175  0.542  0.932   (1.9x faster)
+    //
+    // Concurrent copies contend for the same egress and each runs slower than it would with
+    // the link to itself, so serialising them is worth 1.7x on its own. The fan-out's stated
+    // purpose was keeping the LOCAL copy concurrent with the remote ones -- that is real, and
+    // it is why the file's old note recorded serialising as SLOWER, but it does not need a
+    // stream pool: our own share crosses no link, so issuing it on the caller's stream gets
+    // the same overlap for another 12-14% and no extra stream or event. custom_nccl_op
+    // measured the same two effects independently (a2a_ce.cpp:23-42: 186.8 -> 244.5 GB/s
+    // per-GPU egress serialised, and -24/-27% for hoisting self).
+    //
+    // Peers are visited in XOR-shift order, which nudges ranks into pairing up with no
+    // cross-rank coordination; custom_nccl_op measured that alone at +14%, not re-measured
+    // here.
     cudaEvent_t ready;
     ULYSSES_CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
     ULYSSES_CUDA_CHECK(cudaEventRecord(ready, stream));
-    for (int p = 0; p < ws; ++p) {
-        cudaStream_t cs = ce.streams[p];
-        ULYSSES_CUDA_CHECK(cudaStreamWaitEvent(cs, ready, 0));
+
+    auto emit = [&](int p, cudaStream_t on) {
         for (const CopyOp& op : plan.ops) {
-            if (op.peer != p) {
-                continue;
+            if (op.peer == p) {
+                issue_copy(reinterpret_cast<uint8_t*>(peer_ptrs[p]) + op.dst_offset, src_bytes + op.src_offset, op,
+                           on);
             }
-            issue_copy(reinterpret_cast<uint8_t*>(peer_ptrs[p]) + op.dst_offset, src_bytes + op.src_offset, op, cs);
         }
-        cudaEvent_t done;
-        ULYSSES_CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
-        ULYSSES_CUDA_CHECK(cudaEventRecord(done, cs));
-        ULYSSES_CUDA_CHECK(cudaStreamWaitEvent(stream, done, 0));
-        ULYSSES_CUDA_CHECK(cudaEventDestroy(done));
+    };
+
+    cudaStream_t xfer = ce.streams[0];
+    ULYSSES_CUDA_CHECK(cudaStreamWaitEvent(xfer, ready, 0));
+    for (int k = 1; k < ws; ++k) {
+        const int peer = rank ^ k;
+        if (peer < ws) {
+            emit(peer, xfer);
+        }
     }
+    // XOR only enumerates every peer when ws is a power of two; sweep for any it missed.
+    if ((ws & (ws - 1)) != 0) {
+        for (int p = 0; p < ws; ++p) {
+            if (p != rank && (p ^ rank) >= ws) {
+                emit(p, xfer);
+            }
+        }
+    }
+    emit(rank, stream);
+
+    cudaEvent_t done;
+    ULYSSES_CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
+    ULYSSES_CUDA_CHECK(cudaEventRecord(done, xfer));
+    ULYSSES_CUDA_CHECK(cudaStreamWaitEvent(stream, done, 0));
+    ULYSSES_CUDA_CHECK(cudaEventDestroy(done));
     ULYSSES_CUDA_CHECK(cudaEventDestroy(ready));
 }
 

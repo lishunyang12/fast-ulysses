@@ -31,6 +31,7 @@ void launch_a2a_ce(const void*                  src,
                    const std::vector<uint64_t>& peer_ptrs,
                    const A2APlan&               plan,
                    const CEResources&           ce,
+                   int                          rank,
                    cudaStream_t                 stream);
 
 class UlyssesGroup: public torch::CustomClassHolder {
@@ -62,8 +63,10 @@ public:
     }
 
     // Custom single-node NVLink flag barrier: replaces the slow nvshmem sync (~280us) that falls back on
-    // hardware without NVLS fabric. Call nvshmemx_quiet_on_stream first (so this rank's writes are globally
-    // visible). No-op when world_size==1.
+    // hardware without NVLS fabric. No nvshmem quiet is needed (or would help) before it: the transport
+    // issues raw cudaMemcpy2DAsync into nvshmem_ptr addresses, and quiet orders NVSHMEM operations, which
+    // those are not -- their completion is joined onto `stream` inside launch_a2a_ce and the flag store is
+    // stream-ordered after that. See the closing-barrier comment in bindings.cpp. No-op when world_size==1.
     //
     // `tag` picks the barrier state, of which there is ONE SET PER TAG -- see BarrierState. It is the
     // caller's tag, i.e. the same one that names the output buffer.

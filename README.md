@@ -12,24 +12,22 @@
 
 Ulysses sequence parallelism (DeepSpeed-Ulysses) shards long sequences across GPUs: one all-to-all before attention trades the sequence shard for a head shard, a second one trades back. For long-sequence / video DiT workloads (Wan, HunyuanVideo, ...) these two all-to-alls are the critical communication.
 
-`fast_ulysses` ships this 4D all-to-all as a standalone **torch custom op** (`torch.ops.fast_ulysses.all_to_all_single_4d`) that bypasses NCCL inside the node: outputs live on the NVSHMEM symmetric heap, data goes straight into peer memory over NVLink P2P, and a custom flag barrier synchronizes ranks — no host round-trip, no NCCL collective on the hot path.
+`fast_ulysses` ships this 4D all-to-all as a standalone **torch custom op** (`torch.ops.fast_ulysses.all_to_all_single_4d`) that bypasses NCCL inside the node: the transfer stages through the NVSHMEM symmetric heap, data goes straight into peer memory over NVLink P2P, and a custom flag barrier synchronizes ranks — no host round-trip, no NCCL collective on the hot path.
 
 ## Features
 
-- **Three transfer paths**:
-  - **non-TMA**: SM-resident vectorized direct writes, per-shape autotuned; works on every supported arch.
-  - **TMA** (sm90+): `cp.async.bulk` software pipeline, nearly zero SM usage.
-  - `use_tma=None` benchmarks both kernel paths at first call and caches the winner; forceable per call ([docs/API.md](docs/API.md)).
-  - **CE path** (`all_to_all_single_4d_ce`, chosen explicitly): a per-peer `cudaMemcpy2DAsync` fan-out on the DMA engines — **zero SM usage**, so the transfer keeps running at full NVLink bandwidth while compute kernels (e.g. cuBLAS nvjet GEMMs) hold every SM slot. The overlap path: 99% of the CE a2a hides under a concurrent GEMM chain vs 23–26% for the kernel paths (8×H200, Wan shapes).
-- **Grouped handshakes**: `barrier=False` lets several async a2as (e.g. one layer's q/k/v) share one handshake ([docs/API.md](docs/API.md)).
+- **One transfer path, on the copy engines**: pitched `cudaMemcpy2D/3DAsync` straight into peers' symmetric-heap addresses — **zero SM usage**, so the transfer runs at full link bandwidth while compute kernels hold every SM slot. The peer copies are serialised onto one stream and this rank's own share goes on the caller's stream; the SM-resident and TMA kernels and the runtime autotune that chose between them were removed.
+- **No autotune, no launch config**: the addressing is a host-side plan, so first calls are collective-safe by construction.
+- **Copy by default, borrow explicitly**: `all_to_all_single_4d` hands back a tensor the caller owns and has no lifetime rules; `all_to_all_single_4d_borrowed` hands back the symmetric window itself, which is faster by one copy of the output and valid only until the next call with that tag. The borrow is a separate function so it is visible at the call site ([docs/API.md](docs/API.md)).
+- **Grouped handshakes**: `barrier=False` lets several async borrowed a2as (e.g. one layer's q/k/v) share one CLOSING handshake — each call still opens with its own ([docs/API.md](docs/API.md)).
 - **Fusion examples** (QK RMSNorm + RoPE in the scatter kernel, standalone `rms_norm` / `rope` / `norm_rope`) live on the `examples/qk-norm-rope-fusion` branch.
 - Single node, NVLink P2P, `world_size ∈ [1, 8]` (odd sizes included).
-- Uniform splits (`s` and `n` divisible by `world_size`); `mode=0` enters attention, `mode=1` leaves it.
+- Even splits by default (`s` and `n` divisible by `world_size`), or per-rank `seq_splits` / `head_splits` for uneven shards — which is what lets a caller drop sequence padding ([docs/API.md](docs/API.md)). `mode=0` enters attention, `mode=1` leaves it.
 - `float16` / `bfloat16`; `d * elem_size` 16-byte aligned.
 
 ## Installation
 
-Requirements: **NVSHMEM 3.7+** (latest recommended), **PyTorch**, **CUDA 12 or 13**, and a GPU from sm80 (A100) / sm90 (H100/H200) / sm100 (B200) / sm120.
+Requirements: **PyTorch 2.13+**, **CUDA 12 or 13**, and a GPU from sm80 (A100) / sm90 (H100/H200) / sm100 (B200) / sm120. **NVSHMEM 3.4.5+** is used, and torch already depends on it (`nvidia-nvshmem-cu13`), so no separate install is needed — the build finds torch's copy automatically; `NVSHMEM_HOME` overrides it.
 
 ```bash
 NVSHMEM_HOME=<nvshmem install root> \
@@ -71,19 +69,23 @@ def main() -> None:
     n_global = 4 * ws  # must be divisible by world_size
     x = torch.randn(b, s_local, n_global, d, dtype=torch.bfloat16, device=dev)
 
-    # First call per shape micro-benchmarks and caches the best launch config;
-    # all ranks must issue the same (shape, mode, use_tma) call sequence.
-    out = group.all_to_all_single_4d(x, mode=0, tag="demo", use_tma=None)
+    # All ranks must issue the same (shape, mode, tag) call sequence.
+    out = group.all_to_all_single_4d(x, mode=0, tag="demo")
     assert out.shape == (b, s_local * ws, n_global // ws, d)
     if rank == 0:
         print(f"ws={ws} in={tuple(x.shape)} out={tuple(out.shape)}", flush=True)
 
-    # Concurrently-live results (e.g. q/k/v) must use distinct tags,
-    # otherwise they alias the same symmetric-heap buffer.
+    # A tag names one symmetric-heap buffer. Distinct tags for q/k/v are what the borrowed
+    # form below needs; the copying form above is fine either way.
     q = torch.randn(b, s_local, n_global, d, dtype=torch.bfloat16, device=dev)
     k = torch.randn(b, s_local, n_global, d, dtype=torch.bfloat16, device=dev)
     oq = group.all_to_all_single_4d(q, mode=0, tag="q")
     ok = group.all_to_all_single_4d(k, mode=0, tag="k")
+
+    # Same call without the copy-out: the result IS tag "q"'s window, so it must be consumed
+    # on this stream before the next call carrying tag "q". Nothing checks that.
+    oq_borrowed = group.all_to_all_single_4d_borrowed(q, mode=0, tag="q")
+    assert oq_borrowed.shape == oq.shape
 
     group.destroy()
     dist.destroy_process_group()
@@ -98,25 +100,40 @@ if __name__ == "__main__":
 | API | Summary |
 | --- | --- |
 | `UlyssesGroup(process_group=None, device=None, initial_pool_bytes=2<<30)` | Collective construction: NVSHMEM init + symmetric-heap pool. |
-| `group.all_to_all_single_4d(x, *, mode=0, tag="", use_tma=None)` | Uniform 4D all-to-all, kernel paths. |
-| `group.all_to_all_single_4d_async(..., barrier=True) -> AsyncA2AHandle` | Same op on a high-priority comm stream; `barrier=False` groups calls under one handshake. |
-| `group.all_to_all_single_4d_ce(x, *, mode=0, tag="")` | Same collective on the DMA engines — the overlap path. |
-| `group.all_to_all_single_4d_ce_async(..., barrier=True) -> AsyncA2AHandle` | Async CE variant; genuinely overlaps concurrent compute. |
+| `group.all_to_all_single_4d(x, *, mode=0, tag="", out=None)` | **The default.** Uniform 4D all-to-all on the copy engines, returning a tensor the caller owns. |
+| `group.all_to_all_single_4d_borrowed(x, *, mode=0, tag="")` | Same op without the copy-out: the result IS the symmetric window, valid only until the next call with that tag, and nothing enforces that. |
+| `group.all_to_all_single_4d_async(...) -> AsyncA2AHandle` | The default op on a high-priority comm stream. |
+| `group.all_to_all_single_4d_borrowed_async(..., barrier=True) -> AsyncA2AHandle` | The borrowed op on that stream; `barrier=False` groups calls under one closing handshake. |
 | `group.destroy()` | Release symmetric-heap resources (collective). |
 
-Shapes, the `use_tma` tri-state, tag semantics, and the **collective hard constraints** (violating the rank-uniform call sequence hangs the whole group): [docs/API.md](docs/API.md).
+Shapes, tag semantics, the per-tag barrier ordering contract, and the **collective hard constraints** (violating the rank-uniform call sequence hangs the whole group): [docs/API.md](docs/API.md).
 
 ## Benchmarks
 
-Wan2.2 (14B-class) 5s 720p attention shape (N=75600, H=40, D=128, bf16), one 8×H200 node (NVSwitch), `use_tma=None`, vs. `torch.distributed` permute + `all_to_all_single` (NCCL):
+4×H200 NVLink, exclusive GPUs, `world_size=4`, bf16, medians in ms. `base` is
+`torch.distributed` permute + `all_to_all_single` + permute; `raw` is `all_to_all_single`
+alone, without the relayout that makes its result usable.
 
-| ws | ours mode0 (GB/s) | ours mode1 (GB/s) | NCCL (GB/s) | speedup |
-| --- | --- | --- | --- | --- |
-| 2 | 356 | 356 | 171 | **2.1×** |
-| 4 | 300 | 308 | 200 | **1.5×** |
-| 8 | 303 | 303 | 204 | **1.5×** |
+| shape | MB/rank | base | ours | vs base | transfer only | vs raw |
+|---|---|---|---|---|---|---|
+| Wan 720p (s=75827, h=40, d=384) | 582 | 2.786 | **1.156** | **2.41×** | 1.133 | **1.19×** |
+| Wan 480p (s=32987, h=40, d=384) | 253 | 1.272 | **0.530** | **2.40×** | 0.507 | **1.28×** |
+| MiniMax-H3 (s=38051, h=56, d=384) | 409 | 2.034 | **0.916** | **2.22×** | 0.895 | **1.12×** |
 
-Full methodology, shape derivation, the CE-path overlap study, and reproduction commands: [docs/BENCHMARK.md](docs/BENCHMARK.md).
+Two separable wins. **Over half the baseline's time is its two permutes** (51–53%), which is SM
+work competing with the compute the collective is meant to hide behind; ours folds the relayout
+into the copies' addressing, so it costs nothing. And **the transfer alone beats a bare
+`all_to_all_single`** on the same bytes.
+
+Per-call overheads, same runs: the two barriers total 21–23 µs (under 2%), and host-side
+submission is ~40 µs and flat in the batch dimension.
+
+**Dropping the sequence padding is free here.** With per-rank `seq_splits` the uneven path costs
+the same as the even one (1.00× across three shapes and `b ∈ {1,2,4}`), because uneven is the
+general case in the plan and even is a special case of it. The baseline pays 5–8% for the same
+change, since shards of unequal length force it off its flat `all_to_all_single` path.
+
+Full stage-by-stage tables: [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
 ## Testing
 

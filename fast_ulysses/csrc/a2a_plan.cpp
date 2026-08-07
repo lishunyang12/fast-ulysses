@@ -1,5 +1,6 @@
 #include "a2a_plan.h"
 
+#include <algorithm>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -132,6 +133,14 @@ A2APlan build_plan(const A2ADims& dims, int mode, int64_t elem_size)
     A2APlan plan;
     plan.output_shape = (mode == kScatterHead) ? std::vector<int64_t>{dims.b, seq_total, n_me, dims.d} :
                                                  std::vector<int64_t>{dims.b, s_me, head_total, dims.d};
+
+    // Window size: the largest receive over all ranks. Every rank's output is dense from the
+    // window base, so this is just the max of the per-rank output sizes. See A2APlan.
+    for (int p = 0; p < dims.world_size; ++p) {
+        const int64_t peer_numel = (mode == kScatterHead) ? dims.b * seq_total * dims.head_splits[p] * dims.d :
+                                                            dims.b * dims.seq_splits[p] * head_total * dims.d;
+        plan.window_numel        = std::max(plan.window_numel, peer_numel);
+    }
 
     for (int p = 0; p < dims.world_size; ++p) {
         if (mode == kScatterHead) {
