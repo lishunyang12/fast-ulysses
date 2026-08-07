@@ -56,57 +56,28 @@ def main() -> None:
                 tag = f"t_{str(dtype).split('.')[-1]}_d{d}_m{mode}"
 
                 ref = torch_a2a(x, mode, ws, pg)
-                # use_tma=None (auto path) for every (dtype,d,mode); explicit True/False at d in {64,128}
-                # to cover both forced TMA / non-TMA uniform paths (d=256 only auto, avoid blowup). All
-                # ranks must pass the same use_tma (hard collective invariant). Forced TMA needs sm90+,
-                # so drop it on older GPUs (e.g. A100) where use_tma=True is a documented TORCH_CHECK error.
-                use_tma_list = [None, True, False] if d in (64, 128) else [None]
-                if torch.cuda.get_device_capability()[0] < 9:
-                    use_tma_list = [ut for ut in use_tma_list if ut is not True]
-                for use_tma in use_tma_list:
-                    ours = group.all_to_all_single_4d(
-                        x, mode=mode, tag=f"{tag}_ut{use_tma}", use_tma=use_tma
-                    )
-                    if not torch.equal(ours, ref):
-                        raise AssertionError(
-                            f"MISMATCH rank={rank} ws={ws} dtype={dtype} d={d} "
-                            f"mode={mode} use_tma={use_tma}"
-                        )
-                    if rank == 0:
-                        print(
-                            f"OK ws={ws} {str(dtype).split('.')[-1]} d={d} mode={mode} "
-                            f"use_tma={use_tma} shape={tuple(ours.shape)}",
-                            flush=True,
-                        )
-                    dist.barrier()
-
-                # CE (copy-engine) path: same reference, must also be bit-exact
-                # (b=2 exercises the per-(peer, b) memcpy loop).
-                ours_ce = group.all_to_all_single_4d_ce(x, mode=mode, tag=f"{tag}_ce")
-                if not torch.equal(ours_ce, ref):
+                ours = group.all_to_all_single_4d(x, mode=mode, tag=tag)
+                if not torch.equal(ours, ref):
                     raise AssertionError(
-                        f"CE MISMATCH rank={rank} ws={ws} dtype={dtype} d={d} mode={mode}"
+                        f"MISMATCH rank={rank} ws={ws} dtype={dtype} d={d} mode={mode}"
                     )
                 if rank == 0:
                     print(
-                        f"OK[ce] ws={ws} {str(dtype).split('.')[-1]} d={d} mode={mode} "
-                        f"shape={tuple(ours_ce.shape)}",
+                        f"OK ws={ws} {str(dtype).split('.')[-1]} d={d} mode={mode} "
+                        f"shape={tuple(ours.shape)}",
                         flush=True,
                     )
                 dist.barrier()
 
-    # Forcing TMA at d=512 must raise (tensormap boxDim cap), not corrupt. The check fires before any
-    # barrier/launch, so all ranks raise together and stay in lockstep.
-    if torch.cuda.get_device_capability()[0] >= 9:
-        x = torch.randn(b, 16, 4 * ws, 512, dtype=torch.bfloat16, device=dev)
-        try:
-            group.all_to_all_single_4d(x, mode=0, tag="tma_d512", use_tma=True)
-        except RuntimeError:
-            if rank == 0:
-                print(f"OK[forced-tma-d512-raises] ws={ws}", flush=True)
-        else:
-            raise AssertionError(f"use_tma=True with d=512 should raise, rank={rank}")
-        dist.barrier()
+    # d=512 used to be rejected because TMA's tensormap has a boxDim cap. The copy engines have
+    # no such limit, so it is now an ordinary shape and is checked like any other.
+    x = torch.randn(b, 16, 4 * ws, 512, dtype=torch.bfloat16, device=dev)
+    ref = torch_a2a(x, 0, ws, pg)
+    if not torch.equal(group.all_to_all_single_4d(x, mode=0, tag="d512"), ref):
+        raise AssertionError(f"MISMATCH rank={rank} ws={ws} d=512 mode=0")
+    if rank == 0:
+        print(f"OK[d512] ws={ws}", flush=True)
+    dist.barrier()
 
     # Distinct-tag non-aliasing (replaces the old a2a_frame): two concurrently-live results of the SAME
     # shape must use distinct tags and not clobber each other. Run both a2a, THEN check both -- if out_q
@@ -125,7 +96,7 @@ def main() -> None:
     # CE and the kernel paths share tag buffers and barrier epochs: interleave one base
     # and one CE call on distinct tags and check both results stay intact.
     outq = group.all_to_all_single_4d(xq, mode=0, tag="q_mix")
-    outk = group.all_to_all_single_4d_ce(xk, mode=0, tag="k_mix")
+    outk = group.all_to_all_single_4d(xk, mode=0, tag="k_mix")
     if not (torch.equal(outq, refq) and torch.equal(outk, refk)):
         raise AssertionError(f"CE MIX rank={rank} ws={ws} (base/ce interleave corrupted a result)")
     if rank == 0:
@@ -133,7 +104,7 @@ def main() -> None:
     dist.barrier()
 
     # Async CE roundtrip: comm-stream launch, wait() on the main stream.
-    h = group.all_to_all_single_4d_ce_async(xq, mode=0, tag="ce_async")
+    h = group.all_to_all_single_4d_async(xq, mode=0, tag="ce_async")
     out_async = h.wait()
     if not torch.equal(out_async, refq):
         raise AssertionError(f"CE ASYNC MISMATCH rank={rank} ws={ws}")

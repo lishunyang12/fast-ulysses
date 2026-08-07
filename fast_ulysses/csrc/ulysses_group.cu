@@ -1,4 +1,3 @@
-#include "tma_ptx.cuh"
 #include "ulysses_group.cuh"
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -15,21 +14,35 @@ static bool g_world_inited = false;
 static int  g_live_groups  = 0;
 
 // ---- Custom NVLink flag barrier ----
-// Flag layout: each rank holds uint64 flags[ws]. On arrival, rank r writes epoch into every peer p's
-// flags[r] (P2P, release/sys), then spins until its own flags[0..ws-1] all == epoch (acquire/sys).
-// Monotonically increasing epoch means no reset and no ABA. Strict lockstep (SPMD collective) keeps
-// epoch identical across ranks throughout.
+// Flag layout: each rank holds uint64 flags[ws] PER TAG. On arrival, rank r publishes epoch into
+// every peer p's flags[r] (P2P, release/sys MAX), then spins until its own flags[0..ws-1] all >= epoch
+// (acquire/sys). Monotonically increasing epoch means no reset and no ABA. Strict lockstep within a
+// tag (SPMD collective) keeps epoch identical across ranks throughout.
 struct BarPeers {
     uint64_t p[8];
 };
 
-__global__ void ulysses_barrier_kernel(uint64_t* local, BarPeers peers, int ws, int rank, uint64_t epoch)
+__global__ void ulysses_barrier_kernel(uint64_t* local, BarPeers peers, int ws, int rank, uint64_t* epoch_counter)
 {
+    // The epoch is advanced ON THE DEVICE, not passed in from the host. That is what makes a captured
+    // call replayable: a host-computed epoch is a constant baked into the graph, so every replay
+    // announces the same value, the peer flags already hold it from the previous replay, and the wait
+    // is satisfied by stale state -- a handshake that silently does nothing. (In the NCCL reference
+    // build of this operator that corrupted 260k elements on the FIRST replay.)
+    //
+    // atomicAdd rather than a plain read-modify-write: barrier state is per tag and a tag's calls are
+    // ordered, so two of these are never resident on one counter in correct use; the atomic keeps a
+    // caller who breaks that contract from losing an epoch outright instead of failing.
+    __shared__ uint64_t epoch;
+    if (threadIdx.x == 0)
+        epoch = atomicAdd(reinterpret_cast<unsigned long long*>(epoch_counter), 1ULL) + 1;
+    __syncthreads();  // must precede the early-out: every launched thread has to reach it
+
     int t = threadIdx.x;
     if (t >= ws)
         return;
     uint64_t* remote = reinterpret_cast<uint64_t*>(peers.p[t]) + rank;  // peer t's flags[rank]
-    st_release_sys_u64(remote, epoch);
+    red_release_sys_max_u64(remote, epoch);
     uint64_t  v;
     uint64_t* mine = local + t;  // own flags[t] (written by peer t)
     do {
@@ -37,44 +50,44 @@ __global__ void ulysses_barrier_kernel(uint64_t* local, BarPeers peers, int ws, 
     } while (v < epoch);
 }
 
-void UlyssesGroup::ensure_bar_init_(cudaStream_t stream)
+const UlyssesGroup::BarrierState& UlyssesGroup::barrier_state_(const std::string& tag, cudaStream_t stream)
 {
-    if (bar_ready_)
-        return;
-    const auto& buf = pool_->acquire({static_cast<int64_t>(world_size_)}, at::kLong, "__ulysses_sync__");
-    bar_local_      = buf.sym_base;
-    bar_peers_      = buf.peer_ptrs;
-    ULYSSES_CUDA_CHECK(
-        cudaMemsetAsync(bar_local_, 0, world_size_ * sizeof(uint64_t), stream));  // init 0; epoch starts at 1
+    auto it = barriers_.find(tag);
+    if (it != barriers_.end())
+        return it->second;
+
+    BarrierState st;
+    // The tag goes in the pool name, so each tag's handshake gets its own flags -- see BarrierState.
+    const auto& buf = pool_->acquire({static_cast<int64_t>(world_size_)}, at::kLong, "__ulysses_sync__" + tag);
+    st.my_flags     = buf.sym_base;
+    st.peer_flags   = buf.peer_ptrs;
+    // Epoch counter: this rank's own device memory, never addressed by a peer.
+    ULYSSES_CUDA_CHECK(cudaMalloc(&st.epoch, sizeof(uint64_t)));
+    ULYSSES_CUDA_CHECK(cudaMemsetAsync(st.epoch, 0, sizeof(uint64_t), stream));  // first kernel publishes 1
+    ULYSSES_CUDA_CHECK(cudaMemsetAsync(st.my_flags, 0, world_size_ * sizeof(uint64_t), stream));
     // One slow sync: ensure all ranks finish clearing before anyone writes a flag (otherwise the
     // clear could overwrite an already-written epoch).
     nvshmemx_barrier_on_stream(team_, stream);
-    bar_ready_ = true;
+    return barriers_.emplace(tag, std::move(st)).first->second;
 }
 
-void UlyssesGroup::fast_barrier_kernel_(cudaStream_t stream)
-{
-    BarPeers peers;
-    for (int i = 0; i < world_size_; ++i)
-        peers.p[i] = bar_peers_[i];
-    ulysses_barrier_kernel<<<1, 32, 0, stream>>>(
-        reinterpret_cast<uint64_t*>(bar_local_), peers, world_size_, my_rank_, bar_epoch_);
-    ULYSSES_CUDA_CHECK(cudaGetLastError());  // catch a barrier-kernel launch failure
-}
-
-void UlyssesGroup::fast_barrier(cudaStream_t stream)
+void UlyssesGroup::fast_barrier(cudaStream_t stream, const std::string& tag)
 {
     if (world_size_ == 1)
         return;
-    ensure_bar_init_(stream);
-    ++bar_epoch_;
+    const BarrierState& st = barrier_state_(tag, stream);
+    BarPeers            peers;
+    for (int i = 0; i < world_size_; ++i)
+        peers.p[i] = st.peer_flags[i];
     // NOTE (measured on 4xH200, CUDA 13.3): a cuStreamWriteValue64/WaitValue64 variant of
     // this barrier -- attractive on paper because the CE a2a path would then never need an
     // SM slot -- was tried and REVERTED: stream memops interfered with concurrent GEMMs
     // (overlap hidden% dropped from +34% to -28% with WRITE_VALUE_DEFAULT and -15% with
     // NO_MEMORY_BARRIER). The 1-block spin kernel only needs an SM slot at a kernel
     // boundary and empirically wins under compute pressure.
-    fast_barrier_kernel_(stream);
+    ulysses_barrier_kernel<<<1, 32, 0, stream>>>(
+        reinterpret_cast<uint64_t*>(st.my_flags), peers, world_size_, my_rank_, st.epoch);
+    ULYSSES_CUDA_CHECK(cudaGetLastError());  // catch a barrier-kernel launch failure
 }
 
 int64_t UlyssesGroup::uniqueid_nints()
@@ -127,11 +140,6 @@ UlyssesGroup::UlyssesGroup(std::vector<int64_t> peer_global_pes,
     device_id_(static_cast<int>(device_id))
 {
     TORCH_CHECK(g_world_inited, "init_world must be called before constructing UlyssesGroup");
-    // Cache compute capability major (TMA cp.async.bulk.tensor is Hopper(sm90)+ only); whether a call
-    // actually takes the TMA path is decided per call by resolve_config (explicit use_tma, or auto-measured).
-    int major = 0;
-    ULYSSES_CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id_));
-    sm_major_ = major;
     TORCH_CHECK(
         world_size_ >= 1 && world_size_ <= 8, "world_size must be in [1, 8] (single-node NVLink), got ", world_size_);
     ULYSSES_CUDA_CHECK(cudaSetDevice(device_id_));
@@ -139,8 +147,21 @@ UlyssesGroup::UlyssesGroup(std::vector<int64_t> peer_global_pes,
     for (auto pe : peer_global_pes)
         peer_global_pes_.push_back(static_cast<int>(pe));
 
-    // team: if the group covers the whole world contiguously -> TEAM_WORLD; else a contiguous stride-1
-    // subgroup via split_strided.
+    // team: the whole world -> TEAM_WORLD; else the strided slice of it that this PE set describes.
+    // The stride comes from the PE list, so the 2-D parallel layout works: tp=2 x ulysses-sp=4 on 8
+    // GPUs gives the sp groups {0,2,4,6} and {1,3,5,7}, stride 2, and both are live at once.
+    //
+    // Each PE passes its OWN triplet below, which is not the shape the API is built for: NVSHMEM's
+    // own nvshmem_team_split_2d gets its two axis teams by looping split_strided with EVERY PE in
+    // EVERY call, non-members included. What the one-call-per-PE form here rests on was READ out of
+    // NVSHMEM 3.7.2's team_internal.cpp and has NOT been run: nvshmemi_team_split_strided wraps its
+    // body in PARENT-team collectives -- a barrier before, quiet + team_sync + an error allreduce --
+    // while the body, the AND-reduce that picks the team index, runs over the CHILD triplet alone.
+    // Hence the contract comm.py states: the live groups must PARTITION the job, every PE in
+    // exactly one and all of them constructing together, so those parent-team collectives still
+    // pair up one for one. A rank that builds no group, or a second one by itself, hangs the job
+    // inside the split. Two disjoint teams may come back with the SAME team index -- the psync that
+    // index names is each PE's own, so teams sharing no PE never meet in it.
     const int gpes          = nvshmem_n_pes();
     bool      is_full_world = (world_size_ == gpes);
     for (int i = 0; i < world_size_ && is_full_world; ++i)
@@ -151,89 +172,42 @@ UlyssesGroup::UlyssesGroup(std::vector<int64_t> peer_global_pes,
         owns_team_ = false;
     }
     else {
-        int start = peer_global_pes_[0];
+        const int   start  = peer_global_pes_[0];
+        const int   stride = world_size_ > 1 ? peer_global_pes_[1] - start : 1;
+        std::string pes;  // the offending list, named by both checks below (<= 8 entries)
+        for (int pe : peer_global_pes_)
+            pes += std::to_string(pe) + " ";
+        // A PE set that is not an arithmetic progression is not a strided team and has no other
+        // representation here -- refuse it by name instead of splitting some other PE set.
+        TORCH_CHECK(stride >= 1, "process-group ranks must be increasing; got [", pes, "]");
         for (int i = 1; i < world_size_; ++i)
-            TORCH_CHECK(peer_global_pes_[i] == start + i, "phase-1 only supports a contiguous PE subgroup");
+            TORCH_CHECK(peer_global_pes_[i] == start + i * stride,
+                        "process-group ranks must be evenly strided (they become an NVSHMEM strided team); got [",
+                        pes,
+                        "], which breaks stride ",
+                        stride,
+                        " at index ",
+                        i,
+                        " (rank ",
+                        peer_global_pes_[i],
+                        ", expected ",
+                        start + i * stride,
+                        ")");
         nvshmem_team_config_t cfg;
         std::memset(&cfg, 0, sizeof(cfg));
-        TORCH_CHECK(nvshmem_team_split_strided(NVSHMEM_TEAM_WORLD, start, 1, world_size_, &cfg, 0, &team_) == 0,
-                    "nvshmem_team_split_strided failed");
+        TORCH_CHECK(nvshmem_team_split_strided(NVSHMEM_TEAM_WORLD, start, stride, world_size_, &cfg, 0, &team_) == 0,
+                    "nvshmem_team_split_strided(start=",
+                    start,
+                    ", stride=",
+                    stride,
+                    ", size=",
+                    world_size_,
+                    ") failed");
         owns_team_ = true;
     }
 
     pool_ = std::make_unique<SymmetricHeapPool>(reserved_bytes, world_size_, peer_global_pes_);
     ++g_live_groups;
-}
-
-// See the resolve_config / hang-safety notes in ulysses_group.cuh. finish is the real per-call tail (quiet +
-// fast_barrier); every micro-benchmark times launch+finish so its ranking matches steady state and the two
-// paths' times are directly comparable.
-UlyssesGroup::PathConfig UlyssesGroup::resolve_config(const Ulysses4DDims&         dims,
-                                                      int                          mode,
-                                                      int                          use_tma_i,
-                                                      const void*                  src,
-                                                      const std::vector<uint64_t>& peers,
-                                                      int                          elem,
-                                                      cudaStream_t                 stream)
-{
-    auto finish = [this, stream] {
-        nvshmemx_quiet_on_stream(stream);
-        fast_barrier(stream);
-    };
-    // Autotune the given path (cached per (ws,mode,tma,dims)).
-    auto resolve_path = [&](bool tma) -> A2AConfig {
-        const ConfigKey key = config_key(world_size_, mode, tma, dims);
-        auto            it  = cfg_cache_.find(key);
-        if (it != cfg_cache_.end())
-            return it->second;
-        A2AConfig cfg   = tma ? resolve_config_tma(src, peers, dims, mode, elem, false, stream, finish) :
-                                resolve_config_nontma(src, peers, dims, mode, elem, stream, false, finish);
-        cfg_cache_[key] = cfg;
-        return cfg;
-    };
-
-    // Explicit path: force it. tile_n=0 is the resolve_config_tma sentinel for "TMA infeasible": d > 256
-    // (tensormap boxDim cap) or no config fits the device's dynamic-smem cap (e.g. sm_120's ~99KB) --
-    // forced TMA must fail loudly, not corrupt.
-    if (use_tma_i == 1) {
-        const A2AConfig cfg = resolve_path(true);
-        TORCH_CHECK(cfg.tile_n > 0,
-                    "use_tma=True: TMA infeasible for this shape/device (needs d <= 256 and a config that "
-                    "fits the dynamic-smem cap)");
-        return {true, cfg};
-    }
-    if (use_tma_i == 0)
-        return {false, resolve_path(false)};
-
-    // Auto: sm<9 has no TMA; sm90+ picks the faster of the two paths (runtime replacement of the DiT table).
-    if (sm_major_ < 9)
-        return {false, resolve_path(false)};
-    const std::tuple<int, int, int, int> akey{mode, dims.n_local, dims.s_local, dims.d};
-    auto                                 ap = auto_path_cache_.find(akey);
-    if (ap != auto_path_cache_.end())
-        return {ap->second, resolve_path(ap->second)};
-    // First auto call for this shape: tune both paths, time each real per-call, keep the faster.
-    const A2AConfig cfg_t = resolve_path(true);
-    if (cfg_t.tile_n == 0) {  // TMA infeasible on this device: only the non-TMA path remains
-        auto_path_cache_[akey] = false;
-        return {false, resolve_path(false)};
-    }
-    const A2AConfig cfg_n = resolve_path(false);
-    const float     t_n   = microbench_us(
-        [&] {
-            launch_a2a(src, peers, dims, mode, elem, cfg_n, stream);
-            finish();
-        },
-        stream);
-    const float t_t = microbench_us(
-        [&] {
-            launch_a2a_tma(src, peers, dims, mode, elem, cfg_t, stream);
-            finish();
-        },
-        stream);
-    const bool tma         = t_t <= t_n;
-    auto_path_cache_[akey] = tma;
-    return {tma, tma ? cfg_t : cfg_n};
 }
 
 const CEResources& UlyssesGroup::ce_resources()
@@ -245,16 +219,6 @@ const CEResources& UlyssesGroup::ce_resources()
         ce_ready_ = true;
     }
     return ce_;
-}
-
-A2AConfig UlyssesGroup::resolve_config_cached(const ConfigKey& key, const std::function<A2AConfig()>& tune)
-{
-    auto it = cfg_cache_.find(key);
-    if (it != cfg_cache_.end())
-        return it->second;
-    const A2AConfig cfg = tune();
-    cfg_cache_[key]     = cfg;
-    return cfg;
 }
 
 void UlyssesGroup::destroy()
@@ -271,6 +235,11 @@ void UlyssesGroup::destroy()
         ce_       = {};
         ce_ready_ = false;
     }
+    // Epoch counters only (unchecked, like the stream teardown above); the flags they go with are
+    // pool segments and go away with pool_->destroy().
+    for (auto& [tag, st] : barriers_)
+        cudaFree(st.epoch);
+    barriers_.clear();
     if (pool_)
         pool_->destroy();
     if (owns_team_)

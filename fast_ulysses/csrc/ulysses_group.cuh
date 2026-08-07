@@ -1,12 +1,14 @@
 #pragma once
-#include "a2a_config.cuh"
+#include "a2a_plan.h"
 #include "symmetric_pool.cuh"
+#include "ulysses_common.cuh"
 #include <cstdint>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <map>
 #include <memory>
 #include <nvshmem.h>
+#include <string>
 #include <torch/custom_class.h>
 #include <vector>
 
@@ -20,14 +22,14 @@ struct CEResources {
     std::vector<cudaStream_t> streams;
 };
 
-// CE transfer path: per-peer cudaMemcpy2DAsync fan-out over ce.streams, joined back to
-// `stream` with events. The caller appends the flag barrier (no nvshmem quiet needed:
-// these are not NVSHMEM proxy writes). Rationale: all_to_all_ce.cu file header.
+// CE transfer path: issues `plan.ops` as a per-peer cudaMemcpy2D/3DAsync fan-out over
+// ce.streams, joined back to `stream` with events. The addressing comes from build_plan
+// (a2a_plan.h); `peer_ptrs[p]` is the base of peer p's symmetric window, which op offsets are
+// relative to. The caller appends the flag barrier (no nvshmem quiet needed: these are not
+// NVSHMEM proxy writes). Rationale: all_to_all_ce.cu file header.
 void launch_a2a_ce(const void*                  src,
                    const std::vector<uint64_t>& peer_ptrs,
-                   const Ulysses4DDims&         dims,
-                   int                          mode,
-                   int                          elem_size,
+                   const A2APlan&               plan,
                    const CEResources&           ce,
                    cudaStream_t                 stream);
 
@@ -59,90 +61,55 @@ public:
         return team_;
     }
 
-    // Device compute capability major (cached via cudaDeviceGetAttribute at construction). resolve_config uses
-    // it for the auto path choice (sm<9 has no TMA).
-    int sm_major() const
-    {
-        return sm_major_;
-    }
-
-    struct PathConfig {
-        bool      tma;
-        A2AConfig cfg;
-    };
-
-    // Resolve the launch path + config for (dims,mode). use_tma_i is the tri-state -1 auto / 0 non-TMA /
-    // 1 TMA (the sm<9 error for an explicit 1 is enforced by the caller). Returns the path to launch and
-    // its config; a cache hit returns directly.
-    //
-    // Explicit 0/1: micro-benchmark that path's candidates, keep the fastest. Auto (-1): on sm<9 -> non-TMA;
-    // on sm90+ micro-benchmark BOTH paths and pick the faster (the runtime replacement of the old static DiT
-    // table -- "tune the best path+config and cache it"), memoised in auto_path_cache_.
-    //
-    // The microbench times the REAL per-call op (launch + quiet + fast_barrier) so its ranking matches steady
-    // state, and the two paths' times are directly comparable. The fast_barrier makes the miss branch
-    // cross-rank, but it is HANG-SAFE: pure-lazy SPMD (no tune()) means all ranks issue the same
-    // (shape,mode,use_tma) sequence and miss the same entry on the first call together -> equal barrier calls
-    // in lockstep (the candidate count is a function of rank-invariant dims, so it is identical on every rank).
-    // A cache-hit rank and a miss rank never coexist for the same call, so no rank blocks alone.
-    //
-    // The auto path choice is a per-rank local timing decision, so on a near-tie shape different ranks may pick
-    // different kernels. This is harmless: the two paths are functionally equivalent P2P writes (each rank
-    // writes its own region correctly either way), and per-call barrier counts stay equal regardless of path.
-    //
-    // Thread safety: resolve_config/all_to_all on the same group instance must be called serially (SPMD
-    // single-threaded; the caches are lock-free, so concurrent multi-stream use is not thread-safe).
-    PathConfig resolve_config(const Ulysses4DDims&         dims,
-                              int                          mode,
-                              int                          use_tma_i,
-                              const void*                  src,
-                              const std::vector<uint64_t>& peers,
-                              int                          elem,
-                              cudaStream_t                 stream);
-
-    // Generic cfg_cache_ front for extra paths (e.g. the QK-fused scatter): hit returns the cached
-    // config, miss runs tune() once and caches. Same hang-safety contract as resolve_config: under
-    // SPMD all ranks miss the same key on the first call together (tune's microbench barriers stay
-    // in lockstep). Serial access only (see resolve_config comment).
-    A2AConfig resolve_config_cached(const ConfigKey& key, const std::function<A2AConfig()>& tune);
-
     // Custom single-node NVLink flag barrier: replaces the slow nvshmem sync (~280us) that falls back on
     // hardware without NVLS fabric. Call nvshmemx_quiet_on_stream first (so this rank's writes are globally
     // visible). No-op when world_size==1.
-    void fast_barrier(cudaStream_t stream);
+    //
+    // `tag` picks the barrier state, of which there is ONE SET PER TAG -- see BarrierState. It is the
+    // caller's tag, i.e. the same one that names the output buffer.
+    void fast_barrier(cudaStream_t stream, const std::string& tag);
 
     // Lazily create (world_size streams + events) and return the CE transfer resources.
     const CEResources& ce_resources();
 
 private:
     int                                my_rank_, world_size_, device_id_;
-    int                                sm_major_ = 0;  // cached cudaDeviceGetAttribute(major) at construction
     std::vector<int>                   peer_global_pes_;
     nvshmem_team_t                     team_;
     bool                               owns_team_ = false;
     bool                               destroyed_ = false;
     std::unique_ptr<SymmetricHeapPool> pool_;
 
-    // cfg_cache_ holds the best config per (ws,mode,tma,n_local,s_local,d) (key excludes b/elem -- 2B path
-    // only; the tma bit distinguishes the two paths). Lock-free std::map, must be accessed serially (see
-    // resolve_config comment).
-    std::map<ConfigKey, A2AConfig> cfg_cache_;
-    // auto_path_cache_ memoises the best path for the auto (use_tma=None) case per (mode,n_local,s_local,d)
-    // -- true=TMA -- so a repeat auto call skips the two-path micro-benchmark.
-    std::map<std::tuple<int, int, int, int>, bool> auto_path_cache_;
-
     // CE transfer resources (lazy; see ce_resources()).
     CEResources ce_;
     bool        ce_ready_ = false;
 
-    // fast_barrier state: symmetric flag buffer (uint64[ws]) + monotonic epoch (incremented lockstep per rank).
-    bool                  bar_ready_ = false;
-    uint64_t              bar_epoch_ = 0;
-    void*                 bar_local_ = nullptr;  // this rank's flag base
-    std::vector<uint64_t> bar_peers_;            // per-peer flag base (including self)
+    // fast_barrier state: symmetric flag buffer (uint64[ws]) + monotonic epoch. ONE SET PER TAG.
+    //
+    // The epoch protocol needs every rank to assign epochs to the same handshakes in the same order,
+    // and program order gives that only WITHIN a tag: the contract says an outstanding async result
+    // must be waited on before the next call with THAT tag, and says nothing about other tags. An
+    // async call on the comm stream and a sync call on the caller's stream, on different tags, run on
+    // unordered streams; with one counter for the whole group their barrier kernels interleave
+    // differently on different ranks, so a rank ends up waiting on an epoch its peer published for the
+    // OTHER collective -- which says nothing about the transfer it actually cares about, and the
+    // window is read before it is written. Measured in the NCCL reference build of this operator (4
+    // ranks): a non-atomic per-group increment HUNG at 2000 iterations; making it atomic fixed the
+    // hang and NOT the race (torn results at iteration 47 / 87 / 126). Per tag there is nothing to
+    // interleave.
+    //
+    // The flags are a symmetric-heap buffer like the data (the tag goes in the pool name); the epoch
+    // is this rank's own device memory, never addressed by a peer, and device-side so that a captured
+    // graph advances it on replay -- see ulysses_barrier_kernel.
+    struct BarrierState {
+        void*                 my_flags = nullptr;  // this rank's flag base
+        std::vector<uint64_t> peer_flags;          // per-peer flag base (including self)
+        uint64_t*             epoch = nullptr;     // device counter, incremented by the kernel
+    };
+    std::map<std::string, BarrierState> barriers_;
 
-    void ensure_bar_init_(cudaStream_t stream);      // shared flag-buffer init
-    void fast_barrier_kernel_(cudaStream_t stream);  // launch the spin-kernel barrier at bar_epoch_
+    // This tag's barrier state, created on first use (collective pool alloc + zeroed flags).
+    const BarrierState& barrier_state_(const std::string& tag, cudaStream_t stream);
 };
 
 }  // namespace ulysses

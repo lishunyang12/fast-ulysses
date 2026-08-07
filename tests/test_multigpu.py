@@ -38,11 +38,38 @@ def _nprocs() -> list[int]:
 
 
 @pytest.mark.parametrize("nproc", _nprocs())
-@pytest.mark.parametrize("worker", ["a2a_correctness.py", "a2a_async.py"])
+@pytest.mark.parametrize(
+    "worker",
+    [
+        "a2a_correctness.py",
+        "a2a_async.py",
+        # Adversarial workers. Each builds one specific unsafe timing and is worth only as much as
+        # that timing: each module docstring names the NEGATIVE CONTROL (the line to delete to make
+        # it fail) and what its failure looks like. Re-run those controls after any barrier change.
+        "a2a_window_race.py",
+        "a2a_cudagraph.py",
+        "a2a_ce_flag_ordering.py",
+        "a2a_overlapping_barriers.py",
+    ],
+)
 def test_multigpu_worker(worker, nproc):
     ngpu = torch.cuda.device_count()
     if ngpu < max(nproc, 2):
         pytest.skip(f"needs >={max(nproc, 2)} GPUs, found {ngpu}")
+    _run_worker(worker, nproc)
+
+
+def test_multigpu_subgroup():
+    """tp=2 x ulysses-sp: two stride-2 subgroups of the same job, live together."""
+    env = os.environ.get("FAST_ULYSSES_TEST_NPROC")
+    nproc = int(env) if env else min(torch.cuda.device_count(), 8)
+    nproc -= nproc % 2  # tp=2 needs an even world
+    if nproc < 4:
+        pytest.skip(f"needs >=4 GPUs for tp=2 x sp>=2, found {torch.cuda.device_count()}")
+    _run_worker("a2a_subgroup.py", nproc)
+
+
+def _run_worker(worker: str, nproc: int) -> None:
     # Timeout teardown: a plain subprocess.run timeout SIGKILLs only the torchrun launcher
     # and orphans the rank workers (they live in their own sessions) -- a hung fast_barrier
     # spin kernel then keeps them pinned on the GPUs indefinitely, and inherited stdout

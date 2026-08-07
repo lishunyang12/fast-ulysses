@@ -92,12 +92,12 @@ def main():
 
     # 5) CE grouping: q/k defer, v publishes -- same contract as the base path, and the CE
     #    fan-out's join events must chain correctly across the deferred calls.
-    cq = group.all_to_all_single_4d_ce(q, mode=0, tag="cq").clone()
-    ck = group.all_to_all_single_4d_ce(k, mode=0, tag="ck").clone()
-    cv = group.all_to_all_single_4d_ce(v, mode=0, tag="cv").clone()
-    hq = group.all_to_all_single_4d_ce_async(q, mode=0, tag="caq", barrier=False)
-    hk = group.all_to_all_single_4d_ce_async(k, mode=0, tag="cak", barrier=False)
-    hv = group.all_to_all_single_4d_ce_async(v, mode=0, tag="cav", barrier=True)
+    cq = group.all_to_all_single_4d(q, mode=0, tag="cq").clone()
+    ck = group.all_to_all_single_4d(k, mode=0, tag="ck").clone()
+    cv = group.all_to_all_single_4d(v, mode=0, tag="cv").clone()
+    hq = group.all_to_all_single_4d_async(q, mode=0, tag="caq", barrier=False)
+    hk = group.all_to_all_single_4d_async(k, mode=0, tag="cak", barrier=False)
+    hv = group.all_to_all_single_4d_async(v, mode=0, tag="cav", barrier=True)
     oq, ok_, ov = hq.wait(), hk.wait(), hv.wait()
     torch.cuda.synchronize()
     check(
@@ -110,10 +110,10 @@ def main():
     #    deadlocked within a handful of undrained groups when the host ran far ahead of the
     #    device (a pending wait could resolve against a later re-record).
     w = torch.randn(1, 8, ws, 32, device=dev, dtype=torch.bfloat16)
-    wref = group.all_to_all_single_4d_ce(w, mode=0, tag="pileref").clone()
+    wref = group.all_to_all_single_4d(w, mode=0, tag="pileref").clone()
     for _ in range(20):
-        group.all_to_all_single_4d_ce_async(w, mode=0, tag="pile", barrier=False)
-    hw = group.all_to_all_single_4d_ce_async(w, mode=0, tag="pile2", barrier=True)
+        group.all_to_all_single_4d_async(w, mode=0, tag="pile", barrier=False)
+    hw = group.all_to_all_single_4d_async(w, mode=0, tag="pile2", barrier=True)
     got_w = hw.wait()
     torch.cuda.synchronize()
     check("CE deferred deep pile (20 undrained groups)", torch.equal(got_w, wref))

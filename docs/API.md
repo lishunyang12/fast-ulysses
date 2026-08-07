@@ -13,12 +13,15 @@ Shape conventions used throughout: `b` batch, `d` head dim, `ws = world_size`,
 
 | Parameter | Type | Meaning |
 | --- | --- | --- |
-| `process_group` | `torch.distributed.ProcessGroup` or `None` | Bootstrap process group; `None` uses `dist.group.WORLD`. **Must span all ranks** — the NVSHMEM bootstrap is world-collective, so a subgroup raises `NotImplementedError`. |
+| `process_group` | `torch.distributed.ProcessGroup` or `None` | Bootstrap process group; `None` uses `dist.group.WORLD`. A subgroup is allowed if its ranks are **evenly strided** (they become an NVSHMEM strided team) — e.g. the sp slice `{0,2,4,6}` of a tp2 × sp4 mesh. A non-arithmetic rank list raises. |
 | `device` | `torch.device` or `None` | This rank's CUDA device; `None` uses the current device. |
 | `initial_pool_bytes` | `int` | NVSHMEM symmetric-heap reservation, default `2<<30` (2 GiB); every collective's output buffer comes from this pool (reused per `tag`). The heap is sized by the **first live** group — a later, larger request only warns; destroying all groups lets the next one re-size. |
 
-Construction broadcasts the NVSHMEM unique id over `torch.distributed` and is itself collective:
-**all ranks must construct the group together**.
+Construction broadcasts the NVSHMEM unique id over `torch.distributed` and is collective over the
+**whole job**, not over `process_group`: the NVSHMEM bootstrap, the team split and every
+symmetric-heap allocation are all-PE collectives. **Every rank must construct its group together**
+— under 2-D parallelism that means both sp groups at once — and concurrently-live groups must then
+allocate the same shapes in the same order (a new `tag+shape+dtype` allocates from the shared heap).
 
 ## `all_to_all_single_4d(x, *, mode=0, tag="", use_tma=None) -> Tensor`
 

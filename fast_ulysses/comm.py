@@ -37,8 +37,15 @@ class UlyssesGroup:
 
     Wraps the C++ ``UlyssesGroup`` custom class: construction broadcasts the NVSHMEM unique id
     via ``torch.distributed``, initializes NVSHMEM, and reserves a symmetric-heap pool that all
-    collectives allocate their outputs from (buffers reused per tag+shape+dtype). Construction
-    is itself collective: ALL ranks must build the group together.
+    collectives allocate their outputs from (buffers reused per tag+shape+dtype).
+
+    ``process_group`` may be a strided subgroup -- that is what 2-D parallelism needs (tp=2 x
+    ulysses-sp=4 on 8 GPUs: the sp groups are {0,2,4,6} and {1,3,5,7}) -- but construction stays
+    collective over the WHOLE JOB, never over just that subgroup: the NVSHMEM bootstrap,
+    ``nvshmem_team_split_strided`` and every symmetric-heap allocation are collectives over all
+    PEs. So EVERY rank must build its group together, and concurrently-live groups must keep
+    allocating in step afterwards -- the first call carrying a given tag+shape+dtype allocates
+    from the shared heap, so both sp groups have to issue the same shapes in the same order.
     """
 
     def __init__(
@@ -49,7 +56,9 @@ class UlyssesGroup:
     ) -> None:
         """
         Args:
-            process_group: bootstrap process group; ``None`` uses ``dist.group.WORLD``.
+            process_group: bootstrap process group; ``None`` uses ``dist.group.WORLD``. Its ranks
+                must be evenly strided (any stride); pass the ulysses subgroup here under 2-D
+                parallelism.
             device: this rank's CUDA device; ``None`` uses the current device.
             initial_pool_bytes: NVSHMEM symmetric-heap reservation (default 2 GiB); every
                 collective's output buffer is carved from this pool.
@@ -59,13 +68,6 @@ class UlyssesGroup:
         self.rank = dist.get_rank(pg)
         self.world_size = dist.get_world_size(pg)
         self.peer_global_ranks = list(dist.get_process_group_ranks(pg))
-        if self.world_size != dist.get_world_size():
-            # The uid broadcast below runs on WORLD and nvshmem_team_split_strided is a
-            # world-collective -- a subgroup-only construction would hang, so reject it up front.
-            raise NotImplementedError(
-                "process_group must span all ranks (NVSHMEM bootstrap is world-collective); "
-                f"got a subgroup of {self.world_size}/{dist.get_world_size()} ranks"
-            )
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
         self.device = device
@@ -99,6 +101,10 @@ class UlyssesGroup:
         else:
             uid = [0] * cls.uniqueid_nints()
         uid_t = torch.tensor(uid, dtype=torch.int64, device=device)
+        # Generated on GLOBAL rank 0 and broadcast on WORLD -- NOT on ``pg``, even when ``pg`` is a
+        # subgroup. init_world below bootstraps ONE NVSHMEM job of dist.get_world_size() PEs, and
+        # every PE of it must join with the SAME id. Narrowing this broadcast to ``pg`` would give
+        # each subgroup its own id, and a job-sized bootstrap fed two ids never completes.
         dist.broadcast(uid_t, src=0, group=dist.group.WORLD)
         cls.init_world(uid_t.tolist(), dist.get_rank(), dist.get_world_size())
 
@@ -166,18 +172,19 @@ class UlyssesGroup:
         *,
         mode: int = 0,
         tag: str = "",
-        use_tma: bool | None = None,
     ) -> torch.Tensor:
-        """Uniform 4D all-to-all: mode0 scatters heads / gathers sequence; mode1 is its inverse.
+        """Uniform 4D all-to-all: mode0 scatters heads / gathers sequence, mode1 inverts it.
 
-        Collective -- every rank MUST issue the SAME (shape, mode, use_tma) call sequence
-        (sync and async count together), or the whole group hangs. First call per shape
-        micro-benchmarks and caches the launch config; use_tma None/True/False picks
-        auto/TMA/non-TMA. Concurrently-live results (e.g. q/k/v) MUST use distinct tags,
-        else they alias one symmetric-heap buffer. Full contract: docs/API.md.
+        The transfer rides the DMA engines (zero SM), so it overlaps compute that an
+        SM-resident collective cannot. Collective -- every rank MUST issue the SAME
+        (shape, mode) call sequence (sync and async count together), or the group hangs.
+        Concurrently-live results (e.g. q/k/v) MUST use distinct tags, else they alias one
+        symmetric-heap buffer. Deliberately no ``barrier`` parameter on the sync form: a
+        deferred result would be an unreadable view with nothing left to publish it.
+        Full contract: docs/API.md.
         """
         return torch.ops.fast_ulysses.all_to_all_single_4d(
-            self._group, x.contiguous(), mode, tag, use_tma
+            self._group, x.contiguous(), mode, tag
         )
 
     def all_to_all_single_4d_async(
@@ -186,11 +193,11 @@ class UlyssesGroup:
         *,
         mode: int = 0,
         tag: str = "",
-        use_tma: bool | None = None,
         barrier: bool = True,
     ) -> AsyncA2AHandle:
-        """Async variant on the group's comm stream; handle.wait() makes the caller's stream
-        wait (GPU-side) and returns the output view. Same collective contract as the sync call.
+        """Async form on the group's comm stream; handle.wait() makes the caller's stream
+        wait (GPU-side) and returns the output view. Same collective contract as the sync
+        call.
 
         Barrier kernels must execute in submission order: wait() every outstanding handle
         BEFORE the next sync collective. barrier=False defers the handshake so several calls
@@ -201,45 +208,6 @@ class UlyssesGroup:
         out, ev_done = self._launch_on_comm_stream(
             [ev_free],
             lambda: torch.ops.fast_ulysses.all_to_all_single_4d(
-                self._group, x, mode, tag, use_tma, barrier
-            ),
-        )
-        return AsyncA2AHandle(out, ev_done)
-
-    def all_to_all_single_4d_ce(
-        self,
-        x: torch.Tensor,
-        *,
-        mode: int = 0,
-        tag: str = "",
-    ) -> torch.Tensor:
-        """CE (copy-engine) variant: same collective contract as all_to_all_single_4d, but
-        the transfer rides the DMA engines (zero SM) and so overlaps compute that starves
-        the kernel paths. Explicit choice -- the use_tma auto-tune never picks CE; prefer
-        the kernel paths for tiny shapes (~world_size memcpy launches per call).
-        Deliberately no ``barrier`` parameter: a deferred sync result would be an
-        unreadable view with nothing left to publish it. Full contract: docs/API.md.
-        """
-        return torch.ops.fast_ulysses.all_to_all_single_4d_ce(
-            self._group, x.contiguous(), mode, tag
-        )
-
-    def all_to_all_single_4d_ce_async(
-        self,
-        x: torch.Tensor,
-        *,
-        mode: int = 0,
-        tag: str = "",
-        barrier: bool = True,
-    ) -> AsyncA2AHandle:
-        """Async CE variant; the in-flight window genuinely overlaps concurrent
-        GEMMs/attention. Ordering and barrier=False grouping exactly as in
-        all_to_all_single_4d_async. Full contract: docs/API.md.
-        """
-        x, ev_free = self._stage_input(x.contiguous(), tag)
-        out, ev_done = self._launch_on_comm_stream(
-            [ev_free],
-            lambda: torch.ops.fast_ulysses.all_to_all_single_4d_ce(
                 self._group, x, mode, tag, barrier
             ),
         )

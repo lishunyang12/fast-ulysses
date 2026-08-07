@@ -55,23 +55,14 @@ def main() -> None:
         for _ in range(GEMMS):
             _ = a @ w
 
+    # One transport now. The kernel and TMA paths this used to rank it against are gone --
+    # they could not overlap a dependent GEMM chain, which is what this benchmark measures.
     paths = {
-        "base": (
-            lambda tag: group.all_to_all_single_4d(x, mode=0, tag=tag, use_tma=False),
-            lambda tag: group.all_to_all_single_4d_async(x, mode=0, tag=tag, use_tma=False),
-        ),
-        "tma": (
-            lambda tag: group.all_to_all_single_4d(x, mode=0, tag=tag, use_tma=True),
-            lambda tag: group.all_to_all_single_4d_async(x, mode=0, tag=tag, use_tma=True),
-        ),
         "ce": (
-            lambda tag: group.all_to_all_single_4d_ce(x, mode=0, tag=tag),
-            lambda tag: group.all_to_all_single_4d_ce_async(x, mode=0, tag=tag),
+            lambda tag: group.all_to_all_single_4d(x, mode=0, tag=tag),
+            lambda tag: group.all_to_all_single_4d_async(x, mode=0, tag=tag),
         ),
     }
-    if torch.cuda.get_device_capability()[0] < 9:
-        del paths["tma"]
-
     t_gemm = bench(gemms)
     if rank == 0:
         print(f"gemm_only({GEMMS}x): {t_gemm:.3f} ms", flush=True)

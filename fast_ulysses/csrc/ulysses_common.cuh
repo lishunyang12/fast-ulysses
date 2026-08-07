@@ -2,83 +2,36 @@
 #include <c10/util/Exception.h>
 #include <cstdint>
 #include <cuda_runtime.h>
-#include <functional>
 #include <vector>
 
 namespace ulysses {
 
 // Check a CUDA runtime call's status and throw (TORCH_CHECK) on failure, including the call text and the
-// driver error string. Use for real (non-autotune-probe) runtime calls; for kernel launches pass
-// cudaGetLastError(). The autotune OOR probe deliberately inspects cudaGetLastError() itself, so it does
-// NOT use this macro.
+// driver error string. For kernel launches pass cudaGetLastError().
 #define ULYSSES_CUDA_CHECK(expr)                                                                                       \
     do {                                                                                                               \
         cudaError_t err_ = (expr);                                                                                     \
         TORCH_CHECK(err_ == cudaSuccess, "CUDA error (" #expr "): ", cudaGetErrorString(err_));                        \
     } while (0)
 
-// Shared host/device dim descriptor (int32 fields; kernels use int64 for addressing).
-struct Ulysses4DDims {
-    int32_t b, s_local, s_global, n_local, n_global, d, rank;
-};
+// System-scope release publish / acquire load, used by fast_barrier on every arch. These were
+// in tma_ptx.cuh, which was TMA-only otherwise and is gone with the TMA path.
 
-struct A2AConfig;  // a2a_config.cuh
+// The publish is a MAX, not a store, so a flag can never move backwards. Barrier state is per
+// tag and a tag's calls are ordered, so with the contract kept this cannot arise and the MAX is
+// NOT load-bearing; what it buys is that a caller who breaks the same-tag contract cannot pin a
+// peer's flag BELOW the epoch that peer is waiting for. Carried over from the NCCL reference
+// build of this operator, which publishes the same way.
+__device__ __forceinline__ void red_release_sys_max_u64(uint64_t* addr, uint64_t v)
+{
+    asm volatile("red.release.sys.global.max.u64 [%0], %1;" ::"l"(addr), "l"(v) : "memory");
+}
 
-template<int WS>
-struct PeerPtrs {
-    void* p[WS];
-};
-
-// Free function: pure-CUDA vectorized direct write to peer symmetric memory (host already
-// resolved peer_ptrs via nvshmem_ptr). Launch with the given config (no env, no autotune).
-void launch_a2a(const void*                  src,
-                const std::vector<uint64_t>& peer_ptrs,
-                const Ulysses4DDims&         dims,
-                int                          mode,
-                int                          elem_size,
-                const A2AConfig&             cfg,
-                cudaStream_t                 stream);
-
-// Local microbench shared by both resolve paths: warmup + time 10 iters, return us/call. run_once
-// is the REAL per-call op (launch + quiet + fast_barrier), so its ranking matches steady state;
-// hang-safety of the barrier inside: see the resolve_config note in ulysses_group.cuh.
-float microbench_us(const std::function<void()>& run_once, cudaStream_t stream);
-
-// SM count of the current device, cached (defined in all_to_all.cu, like microbench_us).
-int sm_count_cached();
-
-// non-TMA config resolution: micro-benchmark sweep over threads x unroll x blocks, keep the fastest (result
-// held by the group's cfg_cache_). finish: the per-call quiet+barrier, appended to each timed run so the
-// measurement reflects real per-call cost. verbose: print the chosen config (rank 0 only).
-A2AConfig resolve_config_nontma(const void*                  src,
-                                const std::vector<uint64_t>& peer_ptrs,
-                                const Ulysses4DDims&         dims,
-                                int                          mode,
-                                int                          elem_size,
-                                cudaStream_t                 stream,
-                                bool                         verbose,
-                                const std::function<void()>& finish);
-
-// TMA version (fewer SMs, better comm/compute overlap); uniform mode0/mode1. See all_to_all_tma.cu.
-// Launch with the given config (build maps + launch only; no team, no autotune, no env).
-void launch_a2a_tma(const void*                  src,
-                    const std::vector<uint64_t>& peer_ptrs,
-                    const Ulysses4DDims&         dims,
-                    int                          mode,
-                    int                          elem_size,
-                    const A2AConfig&             cfg,
-                    cudaStream_t                 stream);
-
-// TMA config resolution: pick the best candidate by micro-benchmark (result cached in the group's
-// cfg_cache_; a hit skips the micro-benchmark). finish: per-call quiet+barrier appended to each timed run.
-// verbose: rank-0 debug printing.
-A2AConfig resolve_config_tma(const void*                  src,
-                             const std::vector<uint64_t>& peer_ptrs,
-                             const Ulysses4DDims&         dims,
-                             int                          mode,
-                             int                          elem_size,
-                             bool                         verbose,
-                             cudaStream_t                 stream,
-                             const std::function<void()>& finish);
+__device__ __forceinline__ uint64_t ld_acquire_sys_u64(const uint64_t* addr)
+{
+    uint64_t v;
+    asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(v) : "l"(addr) : "memory");
+    return v;
+}
 
 }  // namespace ulysses

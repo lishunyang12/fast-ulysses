@@ -88,7 +88,7 @@ def main() -> None:
         # the launch config so the timed iterations all hit the cache.
         remote = x.numel() * 2 * (ws - 1) / ws  # bytes leaving this rank over NVLink
         ours = timed(
-            lambda: group.all_to_all_single_4d(x, mode=mode, tag=f"tk{mode}_{N}", use_tma=ut)
+            lambda: group.all_to_all_single_4d(x, mode=mode, tag=f"tk{mode}_{N}")
         )
         nccl = timed(lambda: oracle(x, ws, pg))
         if rank == 0:

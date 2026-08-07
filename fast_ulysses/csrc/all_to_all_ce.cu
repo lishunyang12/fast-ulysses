@@ -1,5 +1,5 @@
 // CE (copy-engine) transfer path for the uniform 4D all-to-all: per-peer pitched
-// cudaMemcpy2DAsync fan-out on dedicated streams, joined back to the launching stream
+// cudaMemcpy2D/3DAsync fan-out on dedicated streams, joined back to the launching stream
 // with events. The data movement uses DMA engines and zero SMs, so -- unlike the
 // SM-resident scatter or the (1-block) TMA kernel, which cannot get a block slot while
 // e.g. cuBLAS nvjet GEMMs hold every SM -- it runs at full NVLink bandwidth concurrently
@@ -8,68 +8,68 @@
 // concurrent GEMM chain where the kernel paths overlap ~25-38% -- net exposed time
 // ~0.05ms/call vs ~0.36-0.38ms.
 //
-// Per-peer transfer shape (mode0): destination peer p receives, for every (b, s) row,
-// the contiguous n_local*d block at head-column p: s_local rows of n_local*d*elem bytes,
-// source pitch n_global*d*elem, contiguous destination rows -> one pitched 2D copy per
-// (peer, b). mode1 is the inverse (contiguous source rows, pitched destination).
-// Addressing mirrors a2a_copy_generic (all_to_all.cu) byte for byte.
+// This file computes no offsets: the (peer, offset, pitch, rows) addressing is built by
+// build_plan in a2a_plan.cpp, which is host-only and tested without a GPU (tests/test_plan.py).
+// A plan op may carry the whole batch (CopyOp::depth), in which case it issues as one
+// cudaMemcpy3DAsync instead of b cudaMemcpy2DAsync calls; at b == 1 the plan never fuses, so
+// the calls are exactly the ones this path has always issued.
 //
 // NOTE (measured on CUDA 13.3, exclusive GPUs; alternatives tried and REVERTED):
 // - single-stream serial submission: local copy loses its overlap with the remote
 //   copies -- 0.82ms standalone, no upside elsewhere;
-// - cudaMemcpy3DBatchAsync: the driver's pitched batch path is itself slow (0.82ms,
-//   and 1.35ms with cudaMemcpyFlagPreferOverlapWithCompute); it also rejects the
-//   LEGACY default stream with "invalid argument" (explicit streams required).
+// - cudaMemcpy3DBatchAsync: the driver's pitched BATCH path (many copies in one call, not
+//   the plain cudaMemcpy3DAsync used above) is itself slow (0.82ms, and 1.35ms with
+//   cudaMemcpyFlagPreferOverlapWithCompute); it also rejects the LEGACY default stream with
+//   "invalid argument" (explicit streams required).
 // The per-peer stream pool below beat both on standalone time at equal hiding.
+#include "a2a_plan.h"
 #include "ulysses_group.cuh"
 
 namespace ulysses {
 
 namespace {
 
-// One pitched 2D copy: (peer p, batch i) -> pointers and pitches in bytes.
-struct CopyOp {
-    const uint8_t* src;
-    uint8_t*       dst;
-    int64_t        spitch, dpitch;
-};
-
-CopyOp make_op(const void* src, uint64_t peer_ptr, const Ulysses4DDims& dims, int mode, int elem_size, int p, int i)
+// One CopyOp -> one CUDA call. depth > 1 is the batch dimension folded in by the plan;
+// cudaMemcpy3DParms takes no slice stride and derives one as pitch * ysize, which is why
+// push_batched only fuses when the strides divide the pitches (a2a_plan.cpp).
+void issue_copy(void* dst, const void* src, const CopyOp& op, cudaStream_t stream)
 {
-    const int64_t row_w  = static_cast<int64_t>(dims.n_local) * dims.d * elem_size;
-    const int64_t pitchg = static_cast<int64_t>(dims.n_global) * dims.d * elem_size;
-    CopyOp        op;
-    if (mode == 0) {
-        op.src = static_cast<const uint8_t*>(src) + static_cast<int64_t>(i) * dims.s_local * pitchg
-                 + static_cast<int64_t>(p) * row_w;
-        op.spitch = pitchg;
-        op.dst    = reinterpret_cast<uint8_t*>(peer_ptr)
-                 + (static_cast<int64_t>(i) * dims.s_global + static_cast<int64_t>(dims.rank) * dims.s_local) * row_w;
-        op.dpitch = row_w;
+    if (op.depth <= 1) {
+        ULYSSES_CUDA_CHECK(cudaMemcpy2DAsync(dst,
+                                             static_cast<size_t>(op.dst_pitch),
+                                             src,
+                                             static_cast<size_t>(op.src_pitch),
+                                             static_cast<size_t>(op.width),
+                                             static_cast<size_t>(op.rows),
+                                             cudaMemcpyDefault,
+                                             stream));
+        return;
     }
-    else {
-        op.src = static_cast<const uint8_t*>(src)
-                 + (static_cast<int64_t>(i) * dims.s_global + static_cast<int64_t>(p) * dims.s_local) * row_w;
-        op.spitch = row_w;
-        op.dst    = reinterpret_cast<uint8_t*>(peer_ptr) + static_cast<int64_t>(i) * dims.s_local * pitchg
-                 + static_cast<int64_t>(dims.rank) * row_w;
-        op.dpitch = pitchg;
-    }
-    return op;
+    cudaMemcpy3DParms parms = {};
+    parms.srcPtr            = make_cudaPitchedPtr(const_cast<void*>(src),
+                                       static_cast<size_t>(op.src_pitch),
+                                       static_cast<size_t>(op.width),
+                                       static_cast<size_t>(op.src_slice / op.src_pitch));
+    parms.dstPtr            = make_cudaPitchedPtr(dst,
+                                       static_cast<size_t>(op.dst_pitch),
+                                       static_cast<size_t>(op.width),
+                                       static_cast<size_t>(op.dst_slice / op.dst_pitch));
+    parms.extent =
+        make_cudaExtent(static_cast<size_t>(op.width), static_cast<size_t>(op.rows), static_cast<size_t>(op.depth));
+    parms.kind = cudaMemcpyDefault;
+    ULYSSES_CUDA_CHECK(cudaMemcpy3DAsync(&parms, stream));
 }
 
 }  // namespace
 
 void launch_a2a_ce(const void*                  src,
                    const std::vector<uint64_t>& peer_ptrs,
-                   const Ulysses4DDims&         dims,
-                   int                          mode,
-                   int                          elem_size,
+                   const A2APlan&               plan,
                    const CEResources&           ce,
                    cudaStream_t                 stream)
 {
-    const int     ws    = static_cast<int>(peer_ptrs.size());
-    const int64_t row_w = static_cast<int64_t>(dims.n_local) * dims.d * elem_size;
+    const int      ws        = static_cast<int>(peer_ptrs.size());
+    const uint8_t* src_bytes = static_cast<const uint8_t*>(src);
     // Fan out: every CE stream waits for the launching stream (inputs ready), copies its
     // peer's slice, and the launching stream joins all copies before the caller's barrier.
     // The shared source-egress NVLink port caps aggregate bandwidth regardless of stream
@@ -88,10 +88,11 @@ void launch_a2a_ce(const void*                  src,
     for (int p = 0; p < ws; ++p) {
         cudaStream_t cs = ce.streams[p];
         ULYSSES_CUDA_CHECK(cudaStreamWaitEvent(cs, ready, 0));
-        for (int i = 0; i < dims.b; ++i) {
-            const CopyOp op = make_op(src, peer_ptrs[p], dims, mode, elem_size, p, i);
-            ULYSSES_CUDA_CHECK(
-                cudaMemcpy2DAsync(op.dst, op.dpitch, op.src, op.spitch, row_w, dims.s_local, cudaMemcpyDefault, cs));
+        for (const CopyOp& op : plan.ops) {
+            if (op.peer != p) {
+                continue;
+            }
+            issue_copy(reinterpret_cast<uint8_t*>(peer_ptrs[p]) + op.dst_offset, src_bytes + op.src_offset, op, cs);
         }
         cudaEvent_t done;
         ULYSSES_CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
