@@ -21,10 +21,12 @@ Ulysses sequence parallelism (DeepSpeed-Ulysses) shards long sequences across GP
 - **Copy by default, borrow explicitly**: `all_to_all_single_4d` hands back a tensor the caller owns and has no lifetime rules; `all_to_all_single_4d_borrowed` hands back the symmetric window itself, which is faster by one copy of the output and valid only until the next call with that tag. The borrow is a separate function so it is visible at the call site ([docs/API.md](docs/API.md)).
 - **Grouped handshakes**: `barrier=False` lets several async borrowed a2as (e.g. one layer's q/k/v) share one CLOSING handshake — each call still opens with its own ([docs/API.md](docs/API.md)).
 - **Fusion examples** (QK RMSNorm + RoPE in the scatter kernel, standalone `rms_norm` / `rope` / `norm_rope`) live on the `examples/qk-norm-rope-fusion` branch.
-- Single node, `world_size ∈ [1, 8]` (odd sizes included). **NVLink or PCIe** — the requirement is
-  that every pair of GPUs in a group is P2P-mappable, not that they share an NVSwitch fabric. On a
-  two-socket PCIe box that includes pairs on different root complexes. `fast-ulysses doctor` prints
-  the pairwise matrix; a group spanning an unreachable pair is refused at construction.
+- Single node, `world_size ∈ [1, 8]` (odd sizes included). The requirement is that every pair of
+  GPUs in a group is P2P-mappable, not that they share an NVSwitch fabric; `fast-ulysses doctor`
+  prints the matrix, and a group spanning an unreachable pair is refused at construction.
+  **Correct on PCIe, but only FAST within one socket** — a group crossing a socket boundary is
+  slower than `torch.distributed`, badly so at 8 ranks
+  ([docs/BENCHMARK.md](docs/BENCHMARK.md#the-limit-crossing-a-socket-boundary)).
 - **Reserve, then seal**: `reserve()` pre-sizes every window the process will use, after which an
   undeclared call is an error rather than a symmetric allocation in the middle of a collective
   ([docs/API.md](docs/API.md)).
@@ -128,7 +130,16 @@ the same as the even one (1.00× across three shapes and `b ∈ {1,2,4}`), becau
 general case in the plan and even is a special case of it. The baseline pays 5–8% for the same
 change, since shards of unequal length force it off its flat `all_to_all_single` path.
 
-Full stage-by-stage tables: [docs/BENCHMARK.md](docs/BENCHMARK.md).
+Measured again at 8 ranks on A100, H200 and B200 — one node each, same container, same venv, and
+the same `.so` — the advantage holds across three generations at 1.66–2.15×, and the collective
+hides essentially completely under a concurrent GEMM chain (86% on B200, ~105% on A100).
+
+**It does not hold across a socket boundary.** Within one socket of a PCIe box the operator is
+1.86×, as expected; spanning both sockets of that box it is 7× *slower* than `torch.distributed` at
+8 ranks. The cause is the algorithm, not the link — see
+[docs/BENCHMARK.md](docs/BENCHMARK.md#the-limit-crossing-a-socket-boundary).
+
+Full stage-by-stage tables, all four generations: [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
 ## Testing
 
