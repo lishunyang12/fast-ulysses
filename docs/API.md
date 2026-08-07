@@ -3,7 +3,7 @@
 Everything is exposed from the top-level package:
 
 ```python
-from fast_ulysses import UlyssesGroup, AsyncA2AHandle, rms_norm, rope, norm_rope
+from fast_ulysses import UlyssesGroup, AsyncA2AHandle
 ```
 
 Shape conventions used throughout: `b` batch, `d` head dim, `ws = world_size`,
@@ -13,9 +13,9 @@ Shape conventions used throughout: `b` batch, `d` head dim, `ws = world_size`,
 
 | Parameter | Type | Meaning |
 | --- | --- | --- |
-| `process_group` | `torch.distributed.ProcessGroup` or `None` | Bootstrap process group; `None` uses `dist.group.WORLD`. |
+| `process_group` | `torch.distributed.ProcessGroup` or `None` | Bootstrap process group; `None` uses `dist.group.WORLD`. **Must span all ranks** — the NVSHMEM bootstrap is world-collective, so a subgroup raises `NotImplementedError`. |
 | `device` | `torch.device` or `None` | This rank's CUDA device; `None` uses the current device. |
-| `initial_pool_bytes` | `int` | NVSHMEM symmetric-heap reservation, default `2<<30` (2 GiB). Every collective's output buffer is carved from this pool (reused per `tag`). |
+| `initial_pool_bytes` | `int` | NVSHMEM symmetric-heap reservation, default `2<<30` (2 GiB). Every collective's output buffer is carved from this pool (reused per `tag`). NVSHMEM sizes the heap when it (re)initializes — i.e. from the first **live** group; while any group is alive, a later group's larger request may not be backed (it warns). Destroying all groups finalizes NVSHMEM, so the next group re-initializes with its own size. |
 
 Construction broadcasts the NVSHMEM unique id with `dist.broadcast`, runs `init_world`, and wraps
 the sequence in `dist.barrier`s — **all ranks must construct the group together** (construction is
@@ -42,7 +42,9 @@ itself collective).
 - `None` (auto): sm<9 → non-TMA; **sm90+ → on first sight of a shape, both paths are
   micro-benchmarked at runtime and the faster one is cached**; later calls hit the cache directly.
   This replaces any offline static table and adapts to the actual hardware.
-- `True`: force TMA (requires sm90+, otherwise a `TORCH_CHECK` error).
+- `True`: force TMA. `TORCH_CHECK` error when TMA is unavailable or infeasible: sm<9, `d > 256`
+  (tensormap boxDim cap), or no tile config fits the device's dynamic-smem cap (e.g. sm_120's
+  ~99KB). The auto path treats these cases as "non-TMA only" instead of erroring.
 - `False`: force non-TMA.
 
 **Collective hard constraints (violating them hangs the whole group)**
@@ -72,75 +74,41 @@ dependency forces the comm-stream barriers to complete first.
 **Overlap in practice (measured on 8×H200)**: the direct-write scatter is an SM-resident large
 grid; cooperative-launch GEMMs (e.g. cuBLAS nvjet) release no SM slots while running, so the a2a
 can only wait for them to drain (nsys shows zero overlap). The async API pays off in
-non-cooperative compute windows, or with a future copy-engine / SM-carveout transfer path.
+non-cooperative compute windows — or use the CE path below, which overlaps by construction.
+
+## `all_to_all_single_4d_ce(x, *, mode=0, tag="") -> Tensor`
+
+CE (**copy-engine**) transfer path — the third path next to the SM scatter (`use_tma=False`) and
+TMA (`use_tma=True`). Identical collective semantics, layouts, tag-scoped output buffers and
+barrier epochs, but the transfer is a per-peer `cudaMemcpy2DAsync` fan-out on the GPU's DMA
+engines (one pitched 2D copy per `(peer, b)`; internal per-peer streams joined back with events,
+then the usual flag barrier).
+
+Why it exists: the DMA engines use **no SMs at all**, so the transfer keeps running at full NVLink
+bandwidth while compute kernels hold every SM block slot. Measured on 4×H200: 385 GB/s per peer,
+pitched rows of `n_local*d*2B` at zero throughput loss, **unaffected by a full-SM spin kernel** —
+whereas both kernel paths serialize behind nvjet GEMMs. Pair it with
+`all_to_all_single_4d_ce_async` to actually hide the a2a behind concurrent compute.
+
+Notes:
+- Path choice is explicit; the `use_tma=None` auto-tune does **not** consider CE.
+- No autotune micro-benchmark, no launch config — first calls are collective-safe by construction.
+- Per call it issues ~`world_size` memcpy launches (a few µs each): prefer the kernel paths for
+  tiny shapes or latency-bound regimes.
+- Same rank-uniform call-sequence constraint as every other collective (sync and async advance the
+  same barrier epoch).
+
+## `all_to_all_single_4d_ce_async(x, *, mode=0, tag="") -> AsyncA2AHandle`
+
+Async CE variant (same comm-stream launch and ordering constraint as
+`all_to_all_single_4d_async`). Because the transfer rides the DMA engines, the in-flight window
+overlaps concurrent GEMMs/attention instead of time-slicing with them.
 
 ## `destroy() -> None`
 
-Releases the symmetric-heap resources (internally `dist.barrier` first, then destroy). All ranks
-must call it together.
-
----
-
-# Fused QK RMSNorm + RoPE
-
-DiT models (e.g. Wan) apply **RMSNorm + RoPE** to q/k right before attention — memory-bound
-elementwise work. This library provides them as fused ops with semantics strictly matching Wan:
-RMSNorm accumulates in fp32, eps inside `rsqrt`, per-channel weight, no bias; RoPE covers the full
-`head_dim`. The fused `norm_rope` stays in fp32 throughout (no intermediate rounding after the
-norm), which is more accurate than two separate steps.
-
-Shared conventions: `x` is `(b, seq, n, d)`, `float16`/`bfloat16`, `d` a power of two and `≤1024`;
-`weight`/`cos`/`sin` are **fp32** CUDA tensors; `cos`/`sin` are `(seq, d/2)`, indexed by each row's
-sequence position.
-
-- `mode`: `"per_head"` (reduce over `d`, `weight` shaped `[d]`) or `"cross_head"` (reduce over the
-  whole `n*d` row, `weight` shaped `[n*d]`, one RMS scalar shared by all heads of a token — Wan's
-  default).
-- `interleaved`: `True` = GPT-J adjacent pairs `(x[2i], x[2i+1])`; `False` = NeoX half-split pairs
-  `(x[i], x[i+d/2])`.
-
-## Standalone ops (single-GPU, no group required)
-
-| API | Summary |
-| --- | --- |
-| `rms_norm(x, weight, *, mode="per_head", eps=1e-6)` | Standalone RMSNorm. |
-| `rope(x, cos, sin, *, interleaved=True)` | Standalone RoPE. |
-| `norm_rope(x, weight, cos, sin, *, mode="per_head", interleaved=True, eps=1e-6)` | Fused norm → rope (one read/write pass). |
-
-## `all_to_all_single_4d_qk(x, weight, cos, sin, *, mode="cross_head", interleaved=True, eps=1e-6, tag="", use_tma=None) -> Tensor`
-
-mode0 Ulysses input all-to-all that **fuses the q/k norm+rope into the scatter kernel itself** —
-norm+rope runs as an in-register epilogue right before the data is P2P-written to the peer GPU
-(compute-while-moving, saving the two extra full HBM read/write passes of standalone norm/rope).
-The fused kernel shares the memory-access structure of the non-TMA fast a2a kernel: grid-stride +
-`uint4` vectorization + UNROLL register-prefetch pipeline + runtime `threads×unroll×blocks`
-autotune (first call per shape micro-benchmarks and caches, with the same hang-safety argument as
-the plain a2a).
-
-- **cross-head (Wan default)**: a tiny vectorized `[b·s_local]` inv-rms pre-reduction runs first
-  (one extra read of the source, ~10% of the a2a time); the scatter then takes a pure elementwise
-  fast path (with `interleaved=True` it is fully isomorphic to the plain a2a — one `uint4` per
-  thread).
-- **per-head**: no pre-reduction; each d-row's `Σx²` is computed in-kernel by segmented warp
-  shuffles across `vecs/2` adjacent lanes (no smem, no `__syncthreads`).
-- Constraints: `d` a power of two with `d·elem_size ≥ 32B` (i.e. `d ≥ 16` for fp16/bf16); per-head
-  additionally needs `d·elem_size ≤ 1024B` (the row reduction must fit one warp).
-
-Input `(b, s_local, n_global, d)` (this rank holds all heads of its sequence shard), output
-`(b, s_global, n_local, d)`. `cos`/`sin` are `(s_local, d/2)` and must be **pre-sliced by the
-caller to this rank's global positions**. `v` takes no norm/rope — keep using
-`all_to_all_single_4d` for it. Collective constraints are the same as `all_to_all_single_4d`.
-(The fused path uses the direct-write kernel only — the TMA copy engine cannot transform data in
-flight, so `use_tma` is ignored.)
-
-## `all_to_all_single_4d_qk2(q, k, weight_q, weight_k, cos, sin, *, mode="cross_head", interleaved=True, eps=1e-6, tag="", use_tma=None) -> (Tensor, Tensor)`
-
-**q and k in one collective call**: two fused scatters back-to-back, then a **single shared
-quiet + NVLink flag barrier** (half the synchronization latency of two `all_to_all_single_4d_qk`
-calls — the barrier is pure latency, so sharing it is a net win). q/k share shape/dtype/`cos`/`sin`
-and use their own norm weights; outputs land in distinct buffers (`tag::q` / `tag::k`). Results are
-**bitwise identical** to two single fused calls. Exposed as one op so the per-group barrier count
-stays in lockstep across ranks.
+Releases the symmetric-heap resources (internally: drain the comm stream, `dist.barrier`, then
+destroy). All ranks must call it together. Dropping a group without calling `destroy()` leaks the
+symmetric heap (with a warning) — the teardown is collective, so it cannot run from GC.
 
 ---
 
@@ -159,6 +127,5 @@ Read by the library / build / tests:
 | Variable | Where | Meaning |
 | --- | --- | --- |
 | `FAST_ULYSSES_CUDA_ARCH` | build (`setup.py`) | Target compute capabilities, `;`-separated. Default `80;90;100;120`. |
-| `FAST_ULYSSES_QK_TUNE_VERBOSE` | runtime (fused qk ops) | `1` prints each rank's autotune choice. |
 | `FAST_ULYSSES_USE_TMA` | `benchmark/bench_uniform.py` | Unset → auto, `0` → non-TMA, else → TMA. |
 | `FAST_ULYSSES_TEST_NPROC` | `tests/test_multigpu.py` | Overrides the torchrun process count (e.g. odd world sizes). |
