@@ -10,8 +10,8 @@ Needs an even world size >= 4:
     torchrun --nproc_per_node=8 tests/distributed/a2a_subgroup.py
 (or via pytest: tests/test_multigpu.py::test_multigpu_subgroup)
 
-Both groups issue the same shapes here on purpose: a pool miss calls nvshmem_align, which is
-collective over every PE of the job rather than over one group.
+Both groups issue the same shapes here on purpose, which keeps this worker about ADDRESSING and
+nothing else. a2a_subgroup_divergent.py covers the case where they do not.
 
 NEGATIVE CONTROL (aliasing is the failure this worker exists to catch, so make it alias): in
 fast_ulysses/csrc/symmetric_pool.cu replace ``nvshmem_ptr(p, peer_global_pes_[i])`` with

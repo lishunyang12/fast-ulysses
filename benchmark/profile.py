@@ -1,7 +1,7 @@
 """Minimal profiling driver (for nsys/ncu). Single config, few iterations, easy to capture a timeline.
 
     PROF_MODE=0 nsys profile --trace=cuda -o /tmp/a2a \
-        torchrun --nproc_per_node=8 fast-ulysses/benchmark/profile.py
+        torchrun --nproc_per_node=8 benchmark/profile.py
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ def main() -> None:
     shape = (b, 2048, 8 * ws, d) if mode == 0 else (b, 2048 * ws, 8, d)
     x = torch.randn(shape, dtype=torch.bfloat16, device=dev)
 
-    for _ in range(5):  # warmup (also triggers lazy launch-config tuning)
+    for _ in range(5):  # warmup: no reserve() here, so the first call allocates the tag's window
         g.all_to_all_single_4d(x, mode=mode, tag="prof")
     torch.cuda.synchronize()
     torch.cuda.nvtx.range_push("a2a_timed")  # NVTX range for nsys/ncu capture

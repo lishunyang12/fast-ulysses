@@ -3,7 +3,6 @@
 #include "symmetric_pool.cuh"
 #include "ulysses_common.cuh"
 #include <cstdint>
-#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <map>
 #include <memory>
@@ -14,16 +13,20 @@
 
 namespace ulysses {
 
-// Per-group CE (copy-engine) transfer resources: one stream per peer for the memcpy
-// fan-out. Created lazily by UlyssesGroup::ce_resources(), released in destroy(). Serial
-// use only (same contract as the config caches). Join events are deliberately NOT pooled
-// here -- see the fresh-event note in launch_a2a_ce.
+// Per-group CE (copy-engine) transfer resources: ONE stream, which the remote peer copies are
+// serialised onto, because concurrent copies contend for the same egress. This rank's own share
+// crosses no link and goes on the caller's stream instead, which is where the local/remote
+// overlap comes from. See launch_a2a_ce.
+//
+// Created lazily by UlyssesGroup::ce_resources(), released in destroy(). Serial use only. Join
+// events are deliberately NOT pooled here -- see the fresh-event note in launch_a2a_ce.
 struct CEResources {
-    std::vector<cudaStream_t> streams;
+    cudaStream_t xfer = nullptr;
 };
 
-// CE transfer path: issues `plan.ops` as a per-peer cudaMemcpy2D/3DAsync fan-out over
-// ce.streams, joined back to `stream` with events. The addressing comes from build_plan
+// CE transfer path: issues `plan.ops` as pitched cudaMemcpy2D/3DAsync copies -- remote peers
+// serialised on `ce.xfer` in XOR-shift order, this rank's own share on `stream` -- joined back
+// to `stream` with events. The addressing comes from build_plan
 // (a2a_plan.h); `peer_ptrs[p]` is the base of peer p's symmetric window, which op offsets are
 // relative to. The caller appends the flag barrier (no nvshmem quiet needed: these are not
 // NVSHMEM proxy writes). Rationale: all_to_all_ce.cu file header.
@@ -33,6 +36,9 @@ void launch_a2a_ce(const void*                  src,
                    const CEResources&           ce,
                    int                          rank,
                    cudaStream_t                 stream);
+
+// TESTS ONLY: publish the flag before the payload has landed, on purpose. See all_to_all_ce.cu.
+void set_ce_fault(int64_t delay_us);
 
 class UlyssesGroup: public torch::CustomClassHolder {
 public:
@@ -57,13 +63,9 @@ public:
     {
         return *pool_;
     }
-    nvshmem_team_t team() const
-    {
-        return team_;
-    }
 
-    // Custom single-node NVLink flag barrier: replaces the slow nvshmem sync (~280us) that falls back on
-    // hardware without NVLS fabric. No nvshmem quiet is needed (or would help) before it: the transport
+    // Custom single-node flag barrier over P2P-mapped memory, in place of NVSHMEM's own sync, which
+    // is far slower where it has to fall back. No nvshmem quiet is needed (or would help): the transport
     // issues raw cudaMemcpy2DAsync into nvshmem_ptr addresses, and quiet orders NVSHMEM operations, which
     // those are not -- their completion is joined onto `stream` inside launch_a2a_ce and the flag store is
     // stream-ordered after that. See the closing-barrier comment in bindings.cpp. No-op when world_size==1.
@@ -72,7 +74,23 @@ public:
     // caller's tag, i.e. the same one that names the output buffer.
     void fast_barrier(cudaStream_t stream, const std::string& tag);
 
-    // Lazily create (world_size streams + events) and return the CE transfer resources.
+    // TESTS: the tag's device-side epoch counter, read back to the host. 0 if the tag has no
+    // barrier state yet. Lets a test assert that a handshake ADVANCED, rather than infer it from
+    // whether the data came out torn -- which is what a graph replay silently stops doing when
+    // the epoch is computed on the host and baked into the capture.
+    int64_t barrier_epoch(const std::string& tag);
+
+    // Create a tag's barrier state now, so a later fast_barrier on it allocates nothing.
+    //
+    // The flags live in the same pool as the data windows (key "__ulysses_sync__" + tag), so
+    // sealing the pool without this makes the tag's FIRST handshake fail rather than its first
+    // undeclared window. Collective, like everything else that touches the symmetric heap.
+    void reserve_barrier(const std::string& tag, cudaStream_t stream)
+    {
+        barrier_state_(tag, stream);
+    }
+
+    // Lazily create the transfer stream and return the CE transfer resources.
     const CEResources& ce_resources();
 
 private:
@@ -96,10 +114,9 @@ private:
     // unordered streams; with one counter for the whole group their barrier kernels interleave
     // differently on different ranks, so a rank ends up waiting on an epoch its peer published for the
     // OTHER collective -- which says nothing about the transfer it actually cares about, and the
-    // window is read before it is written. Measured in the NCCL reference build of this operator (4
-    // ranks): a non-atomic per-group increment HUNG at 2000 iterations; making it atomic fixed the
-    // hang and NOT the race (torn results at iteration 47 / 87 / 126). Per tag there is nothing to
-    // interleave.
+    // window is read before it is written. Making that counter atomic is not enough: it fixes the
+    // lost increment, not the ordering. Per tag there is nothing to interleave.
+    // tests/distributed/a2a_overlapping_barriers.py is the test.
     //
     // The flags are a symmetric-heap buffer like the data (the tag goes in the pool name); the epoch
     // is this rank's own device memory, never addressed by a peer, and device-side so that a captured

@@ -2,7 +2,7 @@
 
 # fast-ulysses
 
-**Ulysses sequence-parallel all-to-all as a torch custom op — NVSHMEM symmetric heap + NVLink P2P, no NCCL on the hot path.**
+**Ulysses sequence-parallel all-to-all as a torch custom op — NVSHMEM symmetric heap + GPU-to-GPU P2P, no NCCL on the hot path.**
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
@@ -12,16 +12,22 @@
 
 Ulysses sequence parallelism (DeepSpeed-Ulysses) shards long sequences across GPUs: one all-to-all before attention trades the sequence shard for a head shard, a second one trades back. For long-sequence / video DiT workloads (Wan, HunyuanVideo, ...) these two all-to-alls are the critical communication.
 
-`fast_ulysses` ships this 4D all-to-all as a standalone **torch custom op** (`torch.ops.fast_ulysses.all_to_all_single_4d`) that bypasses NCCL inside the node: the transfer stages through the NVSHMEM symmetric heap, data goes straight into peer memory over NVLink P2P, and a custom flag barrier synchronizes ranks — no host round-trip, no NCCL collective on the hot path.
+`fast_ulysses` ships this 4D all-to-all as a standalone **torch custom op** (`torch.ops.fast_ulysses.all_to_all_single_4d`) that bypasses NCCL inside the node: the transfer stages through the NVSHMEM symmetric heap, data goes straight into peer memory over P2P, and a custom flag barrier synchronizes ranks — no host round-trip, no NCCL collective on the hot path.
 
 ## Features
 
-- **One transfer path, on the copy engines**: pitched `cudaMemcpy2D/3DAsync` straight into peers' symmetric-heap addresses — **zero SM usage**, so the transfer runs at full link bandwidth while compute kernels hold every SM slot. The peer copies are serialised onto one stream and this rank's own share goes on the caller's stream; the SM-resident and TMA kernels and the runtime autotune that chose between them were removed.
-- **No autotune, no launch config**: the addressing is a host-side plan, so first calls are collective-safe by construction.
+- **One transfer path, on the copy engines**: pitched `cudaMemcpy2D/3DAsync` straight into peers' symmetric-heap addresses — **zero SM usage**, so the transfer runs at full link bandwidth while compute kernels hold every SM slot. The peer copies are serialised onto one stream and this rank's own share goes on the caller's stream.
+- **No launch config, no autotune**: the addressing is a host-side plan, so first calls are collective-safe by construction ([docs/API.md](docs/API.md)).
 - **Copy by default, borrow explicitly**: `all_to_all_single_4d` hands back a tensor the caller owns and has no lifetime rules; `all_to_all_single_4d_borrowed` hands back the symmetric window itself, which is faster by one copy of the output and valid only until the next call with that tag. The borrow is a separate function so it is visible at the call site ([docs/API.md](docs/API.md)).
 - **Grouped handshakes**: `barrier=False` lets several async borrowed a2as (e.g. one layer's q/k/v) share one CLOSING handshake — each call still opens with its own ([docs/API.md](docs/API.md)).
 - **Fusion examples** (QK RMSNorm + RoPE in the scatter kernel, standalone `rms_norm` / `rope` / `norm_rope`) live on the `examples/qk-norm-rope-fusion` branch.
-- Single node, NVLink P2P, `world_size ∈ [1, 8]` (odd sizes included).
+- Single node, `world_size ∈ [1, 8]` (odd sizes included). **NVLink or PCIe** — the requirement is
+  that every pair of GPUs in a group is P2P-mappable, not that they share an NVSwitch fabric. On a
+  two-socket PCIe box that includes pairs on different root complexes. `fast-ulysses doctor` prints
+  the pairwise matrix; a group spanning an unreachable pair is refused at construction.
+- **Reserve, then seal**: `reserve()` pre-sizes every window the process will use, after which an
+  undeclared call is an error rather than a symmetric allocation in the middle of a collective
+  ([docs/API.md](docs/API.md)).
 - Even splits by default (`s` and `n` divisible by `world_size`), or per-rank `seq_splits` / `head_splits` for uneven shards — which is what lets a caller drop sequence padding ([docs/API.md](docs/API.md)). `mode=0` enters attention, `mode=1` leaves it.
 - `float16` / `bfloat16`; `d * elem_size` 16-byte aligned.
 
@@ -30,13 +36,12 @@ Ulysses sequence parallelism (DeepSpeed-Ulysses) shards long sequences across GP
 Requirements: **PyTorch 2.13+**, **CUDA 12 or 13**, and a GPU from sm80 (A100) / sm90 (H100/H200) / sm100 (B200) / sm120. **NVSHMEM 3.4.5+** is used, and torch already depends on it (`nvidia-nvshmem-cu13`), so no separate install is needed — the build finds torch's copy automatically; `NVSHMEM_HOME` overrides it.
 
 ```bash
-NVSHMEM_HOME=<nvshmem install root> \
-FAST_ULYSSES_CUDA_ARCH=90 \
-pip install -e . --no-build-isolation
+pip install -e . --no-build-isolation                    # torch's NVSHMEM, all four arches
+FAST_ULYSSES_CUDA_ARCH=90 pip install -e . --no-build-isolation   # one arch, much faster
 ```
 
-- `NVSHMEM_HOME` (required): install root containing `include/nvshmem.h` and `lib/cmake/nvshmem`.
-- `FAST_ULYSSES_CUDA_ARCH`: target compute capabilities, `;`-separated (default `80;90;100;120`).
+- `NVSHMEM_HOME` (optional): install root containing `include/nvshmem.h`. Omit it to use torch's own copy.
+- `FAST_ULYSSES_CUDA_ARCH` (optional): target compute capabilities, `;`-separated (default `80;90;100;120`).
 - `--no-build-isolation`: link the already-installed PyTorch.
 
 Docker setup, fabric-less nodes, and troubleshooting: [docs/INSTALL.md](docs/INSTALL.md).
@@ -75,18 +80,6 @@ def main() -> None:
     if rank == 0:
         print(f"ws={ws} in={tuple(x.shape)} out={tuple(out.shape)}", flush=True)
 
-    # A tag names one symmetric-heap buffer. Distinct tags for q/k/v are what the borrowed
-    # form below needs; the copying form above is fine either way.
-    q = torch.randn(b, s_local, n_global, d, dtype=torch.bfloat16, device=dev)
-    k = torch.randn(b, s_local, n_global, d, dtype=torch.bfloat16, device=dev)
-    oq = group.all_to_all_single_4d(q, mode=0, tag="q")
-    ok = group.all_to_all_single_4d(k, mode=0, tag="k")
-
-    # Same call without the copy-out: the result IS tag "q"'s window, so it must be consumed
-    # on this stream before the next call carrying tag "q". Nothing checks that.
-    oq_borrowed = group.all_to_all_single_4d_borrowed(q, mode=0, tag="q")
-    assert oq_borrowed.shape == oq.shape
-
     group.destroy()
     dist.destroy_process_group()
 
@@ -100,11 +93,13 @@ if __name__ == "__main__":
 | API | Summary |
 | --- | --- |
 | `UlyssesGroup(process_group=None, device=None, initial_pool_bytes=2<<30)` | Collective construction: NVSHMEM init + symmetric-heap pool. |
+| `group.reserve(calls, *, allow_growth=False)` | Pre-size every window the process will use, then seal: an undeclared call raises instead of allocating mid-collective. |
 | `group.all_to_all_single_4d(x, *, mode=0, tag="", out=None)` | **The default.** Uniform 4D all-to-all on the copy engines, returning a tensor the caller owns. |
 | `group.all_to_all_single_4d_borrowed(x, *, mode=0, tag="")` | Same op without the copy-out: the result IS the symmetric window, valid only until the next call with that tag, and nothing enforces that. |
-| `group.all_to_all_single_4d_async(...) -> AsyncA2AHandle` | The default op on a high-priority comm stream. |
-| `group.all_to_all_single_4d_borrowed_async(..., barrier=True) -> AsyncA2AHandle` | The borrowed op on that stream; `barrier=False` groups calls under one closing handshake. |
+| `group.all_to_all_single_4d_async(...) -> AsyncCollectiveTensor` | The default op on a high-priority comm stream. `.wait()` returns the plain tensor, and so does the first aten op on it — which waits by itself, so forgetting is not a data race. |
+| `group.all_to_all_single_4d_borrowed_async(..., barrier=True) -> AsyncCollectiveTensor` | The borrowed op on that stream; `barrier=False` groups calls under one closing handshake. |
 | `group.destroy()` | Release symmetric-heap resources (collective). |
+| `fast-ulysses doctor` | Report the build, the devices, and pairwise P2P reachability. Run it before blaming the operator. |
 
 Shapes, tag semantics, the per-tag barrier ordering contract, and the **collective hard constraints** (violating the rank-uniform call sequence hangs the whole group): [docs/API.md](docs/API.md).
 

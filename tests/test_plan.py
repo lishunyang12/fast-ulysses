@@ -136,7 +136,7 @@ def check(b, d, seq_splits, head_splits, mode, dtype=np.float32):
         assert got.shape == expected[r].shape, f"rank {r}: {got.shape} != {expected[r].shape}"
         np.testing.assert_array_equal(got, expected[r], err_msg=f"rank {r} mode {mode}")
 
-    # Window sizing. The allocation is collective (nvshmem_align), so every rank must ask for the
+    # Window sizing. Every rank carves the same offset, so every rank must ask for the
     # SAME capacity, and it must hold the largest rank's output -- under uneven splits that is not
     # this rank's own. (run_plan above gives each simulated rank a window of exactly its own
     # output size, so it would already have failed if an op wrote past that rank's result.)
@@ -200,21 +200,14 @@ def test_batch_fusion_rule():
     [([5, 5, 5, 5], [2, 2, 2, 2]), ([7, 5, 5, 4], [3, 2, 2, 1]), ([9, 4, 6, 1], [4, 1, 3, 2])],
 )
 def test_fused_ops_survive_cuda_memcpy_3d(mode, seq_splits, head_splits):
-    """Tripwire for a FUTURE plan change. It cannot fail on the plan as it stands.
+    """Every fused op must be expressible as a cudaMemcpy3D -- see push_batched in a2a_plan.cpp.
 
-    cudaMemcpy3DParms takes no slice stride and derives one as pitch * ysize (issue_copy
-    passes ysize = slice / pitch), so a fused op only copies the right bytes on the device
-    when the slice stride is an exact multiple of the pitch with room for the rows. The
-    replay above would not notice a violation: ``apply_ops`` steps the batch with
-    ``src_slice`` directly.
+    The per-op assertions are a tripwire for a future plan change: today's plan satisfies them by
+    construction, and the numpy replay above would not catch a violation because ``apply_ops``
+    steps the batch with ``src_slice`` directly rather than deriving it.
 
-    Every op build_plan emits today satisfies that BY CONSTRUCTION -- scatter has
-    src_slice/src_pitch == s_me == rows and dst_slice/dst_pitch == seq_total >= rows, gather
-    is the mirror -- so the ratio assertions below have no reachable failing input. A mutant
-    with push_batched's whole expressibility guard replaced by ``depth > 1 && rows > 1``
-    produced bit-identical plans (a reviewer's check, not re-run here). Only ``rows > 1``
-    can fire, and that restates test_batch_fusion_rule. Kept only so that a plan emitting
-    some other stride trips here.
+    ``fused > 0`` is the live check. It is what says fusion actually happens in gather mode and
+    under uneven splits, which no other test covers.
     """
     fused = 0
     for rank in range(len(seq_splits)):
@@ -310,3 +303,24 @@ def test_invalid_splits_rejected(seq_splits, head_splits, message):
 def test_invalid_mode_rejected():
     with pytest.raises(Exception, match="mode must be"):
         build_plan(1, 2, 0, 2, [1, 1], [1, 1], 7, 4)
+
+
+# The entry point cross-checks only the CALLER'S OWN shard against the tensor handed in
+# (bindings.cpp make_dims_from_shape); a peer's entry in seq_splits/head_splits is bounded by
+# nothing. Before the checked arithmetic these wrapped to a negative window_numel, which then
+# passed SymmetricHeapPool::acquire's capacity check -- it compares against a positive reserve --
+# and was then carved out of the pool as an enormous unsigned request.
+#
+# NEGATIVE CONTROL: drop the checked_mul/checked_sum wrappers in a2a_plan.cpp
+# (build_plan's peer_numel loop, and A2ADims::seq_total/head_total) and rebuild. Both cases then
+# return a plan with a negative window_numel instead of raising.
+@pytest.mark.parametrize(
+    "seq_splits, head_splits, message",
+    [
+        ([1, 2**62], [1, 1], "overflows int64"),  # product overflows
+        ([2**62, 2**62], [1, 1], "overflows int64"),  # the sum itself overflows
+    ],
+)
+def test_split_arithmetic_overflow_rejected(seq_splits, head_splits, message):
+    with pytest.raises(Exception, match=message):
+        build_plan(1, 8, 0, 2, seq_splits, head_splits, SCATTER_HEAD, 2)

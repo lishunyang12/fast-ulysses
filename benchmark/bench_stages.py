@@ -28,8 +28,6 @@ Also reported per call:
                   fusion changes: it folds b copies per peer into one, removing (b-1)*P
                   launches that the device timing cannot see. It also carries the default
                   entry point's output allocation, which the borrowed form does not make.
-  * `contig`   -- what `input.contiguous()` costs when the caller's tensor is already
-                  contiguous (it should be nothing) and when it is not.
 
 Run under scripts/exclusive.sh; the numbers are meaningless on a shared GPU.
 """

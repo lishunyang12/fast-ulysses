@@ -45,7 +45,7 @@ NVSHMEM_HOME=/opt/nvshmem FAST_ULYSSES_CUDA_ARCH=90 pip install -e . --no-build-
 
 ## Nodes without an NVSwitch fabric
 
-On nodes without an NVSwitch fabric (or with IB NICs), NVSHMEM's default init may attempt the NVLS multicast mapping or the IB remote transport and **segfault**. This op is single-node NVLink P2P only, so `UlyssesGroup` applies safe defaults at construction (`os.environ.setdefault` — override them **before** constructing the group if needed):
+On nodes without an NVSwitch fabric (or with IB NICs), NVSHMEM's default init may attempt the NVLS multicast mapping or the IB remote transport and **segfault**. This op is single-node P2P only and uses neither, so `UlyssesGroup` applies safe defaults at construction (`os.environ.setdefault` — override them **before** constructing the group if needed):
 
 ```text
 NVSHMEM_DISABLE_NVLS=1

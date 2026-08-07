@@ -7,12 +7,8 @@
 # just a wrong one. Worse, partial contention (2 of 4 ranks slowed) skews a collective
 # benchmark in a way that is invisible in the output.
 #
-# So: wait for the GPUs to be genuinely free, sample throughout, and refuse to present the
-# numbers if anyone else showed up. A run that says CONTENDED is not a slow result, it is
-# not a result.
-#
 # Usage:
-#   ./scripts/exclusive.sh 4,5,6,7 -- torchrun --nproc-per-node=4 benchmark/bench_a2a.py
+#   ./scripts/exclusive.sh 4,5,6,7 -- torchrun --nproc_per_node=4 benchmark/bench_stages.py
 #   WAIT_SECS=1800 ./scripts/exclusive.sh 4,5,6,7 -- <cmd>     # wait up to 30 min for idle
 set -uo pipefail
 
@@ -113,5 +109,5 @@ if [[ "${max_seen}" -gt "${expected}" ]]; then
     exit 4
 fi
 echo "# VERDICT: EXCLUSIVE (${samples} samples, max ${max_seen}/${expected} procs," \
-     "min SM clock ${min_clock} MHz)"
+     "min SM clock $([[ ${min_clock} -eq 99999 ]] && echo n/a || echo "${min_clock} MHz"))"
 exit "${status}"

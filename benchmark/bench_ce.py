@@ -1,10 +1,10 @@
-"""Three-path a2a bench (base/tma/ce) + GEMM-overlap comparison.
+"""a2a + GEMM-overlap bench.
 
-Times each path's sync collective, then measures how much of the async a2a hides
-under a concurrent 3-GEMM chain (to_q/k/v-shaped): hidden% = (serial - concurrent)
-/ a2a_alone. CE should approach 100%; the kernel paths sit near 0% under nvjet.
+Times the sync collective, then how much of the async a2a hides under a concurrent 3-GEMM
+chain (to_q/k/v-shaped): hidden% = (serial - concurrent) / a2a_alone, which the copy engines
+should drive toward 100%.
 
-    torchrun --nproc_per_node=4 benchmark/bench_ce.py
+    ./scripts/exclusive.sh <gpus> -- torchrun --nproc_per_node=4 benchmark/bench_ce.py
 
 The DEFAULT copying entry point, so the copy-out is part of both the a2a being timed and the
 work that has to hide under the GEMMs -- which is the question a caller actually has.
@@ -58,48 +58,46 @@ def main() -> None:
         for _ in range(GEMMS):
             _ = a @ w
 
-    # One transport now. The kernel and TMA paths this used to rank it against are gone --
-    # they could not overlap a dependent GEMM chain, which is what this benchmark measures.
-    paths = {
-        "ce": (
-            lambda tag: group.all_to_all_single_4d(x, mode=0, tag=tag),
-            lambda tag: group.all_to_all_single_4d_async(x, mode=0, tag=tag),
-        ),
-    }
     t_gemm = bench(gemms)
     if rank == 0:
         print(f"gemm_only({GEMMS}x): {t_gemm:.3f} ms", flush=True)
-    for name, (sync_fn, async_fn) in paths.items():
-        tag = f"b_{name}"
-        t_a2a = bench(lambda: sync_fn(tag))
 
-        def serial():
-            sync_fn(tag)
-            gemms()
+    def sync_fn(tag):
+        return group.all_to_all_single_4d(x, mode=0, tag=tag)
 
-        def concurrent():
-            h = async_fn(tag)
-            gemms()
-            h.wait()
+    def async_fn(tag):
+        return group.all_to_all_single_4d_async(x, mode=0, tag=tag)
 
-        # The GEMM window drifts a few percent run to run (shared machine, clocks), which
-        # is the same magnitude as the a2a itself -- so serial and concurrent are measured
-        # ALTERNATELY and compared by median, cancelling slow drift.
-        ts, tc = [], []
-        for _ in range(8):
-            ts.append(bench(serial, iters=8, warmup=1))
-            tc.append(bench(concurrent, iters=8, warmup=1))
-        ts.sort()
-        tc.sort()
-        t_serial, t_conc = ts[len(ts) // 2], tc[len(tc) // 2]
-        hidden = (t_serial - t_conc) / t_a2a * 100 if t_a2a > 0 else 0.0
-        if rank == 0:
-            print(
-                f"[{name:4s}] a2a={t_a2a:.3f}ms serial={t_serial:.3f}ms "
-                f"(spread {ts[0]:.3f}-{ts[-1]:.3f}) concurrent={t_conc:.3f}ms "
-                f"(spread {tc[0]:.3f}-{tc[-1]:.3f}) -> hidden {hidden:.0f}%",
-                flush=True,
-            )
+    tag = "b_ce"
+    t_a2a = bench(lambda: sync_fn(tag))
+
+    def serial():
+        sync_fn(tag)
+        gemms()
+
+    def concurrent():
+        h = async_fn(tag)
+        gemms()
+        h.wait()
+
+    # The GEMM window drifts a few percent run to run (shared machine, clocks), which
+    # is the same magnitude as the a2a itself -- so serial and concurrent are measured
+    # ALTERNATELY and compared by median, cancelling slow drift.
+    ts, tc = [], []
+    for _ in range(8):
+        ts.append(bench(serial, iters=8, warmup=1))
+        tc.append(bench(concurrent, iters=8, warmup=1))
+    ts.sort()
+    tc.sort()
+    t_serial, t_conc = ts[len(ts) // 2], tc[len(tc) // 2]
+    hidden = (t_serial - t_conc) / t_a2a * 100 if t_a2a > 0 else 0.0
+    if rank == 0:
+        print(
+            f"a2a={t_a2a:.3f}ms serial={t_serial:.3f}ms "
+            f"(spread {ts[0]:.3f}-{ts[-1]:.3f}) concurrent={t_conc:.3f}ms "
+            f"(spread {tc[0]:.3f}-{tc[-1]:.3f}) -> hidden {hidden:.0f}%",
+            flush=True,
+        )
 
     group.destroy()
     dist.destroy_process_group()

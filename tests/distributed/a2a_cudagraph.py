@@ -42,6 +42,12 @@ back with elements from a neighbouring iteration. Deleting ``group->fast_barrier
 bindings.cpp is the blunter version of the same control. In the OTHER direction, delete the
 ``if rank == 0:`` ballast loop below: the replays re-align, and the worker then passes even with a
 dead barrier -- that is the blindness the skew exists to prevent.
+
+Two checks per replay, and they are not redundant. Torn data is a SUFFICIENT signal that the
+handshake died, not a necessary one: it needs a peer to actually be late, so a run where the skew
+happens not to bite comes back clean. The epoch counter is the necessary one -- if it does not
+advance, the handshake is dead whether or not anything tore this time. The ballast is still what
+makes the data check meaningful; the counter is what makes a quiet run trustworthy.
 """
 
 from __future__ import annotations
@@ -50,21 +56,13 @@ import os
 
 import torch
 import torch.distributed as dist
+from a2a_correctness import torch_a2a  # sibling worker; torchrun puts this dir on sys.path
 
 from fast_ulysses import UlyssesGroup
 
 
 def log(msg: str) -> None:
     print(f"[rank {dist.get_rank()}] {msg}", flush=True)
-
-
-def torch_a2a_mode0(x: torch.Tensor, ws: int, pg) -> torch.Tensor:
-    """Reference mode-0 Ulysses all-to-all (permute -> all_to_all_single -> permute)."""
-    b, s_local, n_global, d = x.shape
-    xt = x.view(b, s_local, ws, n_global // ws, d).permute(2, 0, 1, 3, 4).contiguous()
-    out = torch.empty_like(xt)
-    dist.all_to_all_single(out, xt, group=pg)
-    return out.permute(1, 0, 2, 3, 4).contiguous().view(b, ws * s_local, n_global // ws, d)
 
 
 def main() -> None:
@@ -106,8 +104,10 @@ def main() -> None:
         log(f"capture failed: {type(exc).__name__}: {str(exc)[:160]}")
 
     bad_replays = 0
+    stale_epochs = 0
     if captured:
         dist.barrier()
+        prev_epoch = group.barrier_epoch("cg")
         for i in range(8):
             # Fresh values every replay -- same layout, different data, so a stale read shows up
             # as a mismatch instead of as a coincidentally equal buffer.
@@ -118,7 +118,7 @@ def main() -> None:
                 generator=torch.Generator(device=dev).manual_seed(1000 * i + rank),
             )
             static_in.copy_(fresh)
-            want = torch_a2a_mode0(static_in, ws, pg)  # collective: re-aligns, so it goes first
+            want = torch_a2a(static_in, 0, ws, pg)  # collective: re-aligns, so it goes first
 
             if rank == 0:  # skew: rank 0 arrives late, everyone else early
                 for _ in range(30):
@@ -127,14 +127,24 @@ def main() -> None:
             graph.replay()
             torch.cuda.synchronize()
 
+            # The epoch directly, not inferred from whether the data tore. A dead handshake only
+            # SOMETIMES produces a mismatch -- it needs a peer to actually be late -- so torn data
+            # is a sufficient signal and not a necessary one. A frozen counter is necessary.
+            epoch = group.barrier_epoch("cg")
+            if epoch <= prev_epoch:
+                stale_epochs += 1
+                if stale_epochs == 1:
+                    log(f"replay {i}: epoch did not advance ({prev_epoch} -> {epoch})")
+            prev_epoch = epoch
+
             if not torch.equal(static_out, want):
                 bad_replays += 1
                 if bad_replays == 1:
                     log(f"replay {i}: {int((static_out != want).sum().item())} elements differ")
-        if not bad_replays:
-            log("8 skewed replays matched the reference")
+        if not bad_replays and not stale_epochs:
+            log(f"8 skewed replays matched the reference; epoch advanced to {prev_epoch}")
 
-    verdict = torch.tensor([int(bad_replays > 0)], device=dev)
+    verdict = torch.tensor([int(bad_replays > 0 or stale_epochs > 0)], device=dev)
     dist.all_reduce(verdict)
     if rank == 0:
         status = "PASS" if verdict.item() == 0 else "FAIL"

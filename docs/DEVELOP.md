@@ -71,7 +71,7 @@ last line: a green run with `captured=False` checked nothing.
 ## Layout
 
 ```
-fast_ulysses/          Python package (comm.py: UlyssesGroup + async handles)
+fast_ulysses/          Python package (comm.py: UlyssesGroup + async results)
 fast_ulysses/csrc/     C++/CUDA sources (bindings.cpp registers the torch library)
 tests/                 pytest suites; tests/distributed/ holds the torchrun workers
 benchmark/             throughput / overlap benchmarks and a minimal nsys/ncu driver
