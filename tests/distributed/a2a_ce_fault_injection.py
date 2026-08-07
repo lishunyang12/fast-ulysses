@@ -97,9 +97,14 @@ def main() -> None:
                 flush=True,
             )
         elif clean_total:
-            print(f"CE_FAULT FAIL: {clean_total}/{ITERS * ws} clean iterations read stale bytes", flush=True)
+            print(
+                f"CE_FAULT FAIL: {clean_total}/{ITERS * ws} clean iterations read stale bytes",
+                flush=True,
+            )
         else:
-            print(f"CE_FAULT PASS (control tore {armed_total}/{ITERS * ws}, clean tore 0)", flush=True)
+            print(
+                f"CE_FAULT PASS (control tore {armed_total}/{ITERS * ws}, clean tore 0)", flush=True
+            )
 
     group.destroy()
     dist.destroy_process_group()

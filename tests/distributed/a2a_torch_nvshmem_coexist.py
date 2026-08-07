@@ -60,8 +60,10 @@ def main() -> int:
             log("torch symmetric memory: up")
     except Exception as exc:  # noqa: BLE001 -- we are classifying, not handling
         if rank == 0:
-            log(f"torch symmetric memory unavailable ({type(exc).__name__}: {exc}); "
-                "the coexistence question is moot on this build")
+            log(
+                f"torch symmetric memory unavailable ({type(exc).__name__}: {exc}); "
+                "the coexistence question is moot on this build"
+            )
         dist.destroy_process_group()
         print("TORCH_NVSHMEM_COEXIST SKIP", flush=True) if rank == 0 else None
         return 0
@@ -124,8 +126,9 @@ def main() -> int:
                 log("torch's symmetric memory still usable after our destroy()")
         except Exception:  # noqa: BLE001
             if rank == 0:
-                log("torch's symmetric memory BROKE after our destroy():\n"
-                    + traceback.format_exc())
+                log(
+                    "torch's symmetric memory BROKE after our destroy():\n" + traceback.format_exc()
+                )
             failures.append("torch's symmetric memory broke after our destroy()")
 
     verdict = torch.tensor(len(failures), dtype=torch.int32, device=dev)

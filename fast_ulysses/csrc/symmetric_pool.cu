@@ -18,14 +18,10 @@ SymmetricHeapPool::SymmetricHeapPool(int64_t reserved_bytes, int world_size, std
                 reserved_,
                 " B symmetric pool. Lower initial_pool_bytes, or raise NVSHMEM_SYMMETRIC_SIZE.");
 
-    // Every peer must be load/store reachable: the transport writes peer windows with plain
-    // cudaMemcpy*Async, so a null here would otherwise become a copy to address 0.
-    //
-    // nvshmem_ptr returns non-null exactly when the pair is P2P-mappable, which covers NVLink and
-    // PCIe alike -- unlike NCCL, whose symmetric-window team on a two-socket PCIe box stops at one
-    // root complex. What still makes it null on PCIe: P2P disabled by the driver, IOMMU or ACS
-    // blocking peer traffic, or the GPUs sitting behind different root complexes with no path
-    // between them. `fast-ulysses doctor` prints the pairwise matrix.
+    // Every peer must be load/store reachable, because the transport writes peer windows with plain
+    // cudaMemcpy*Async: a null here would become a copy to address 0. nvshmem_ptr is non-null
+    // exactly when the pair is P2P-mappable, and when it is not the cause is outside this process,
+    // so refuse by name and let `fast-ulysses doctor` print the pairwise matrix.
     slab_peer_.resize(world_size_);
     for (int i = 0; i < world_size_; ++i) {
         slab_peer_[i] = reinterpret_cast<uint64_t>(nvshmem_ptr(slab_, peer_global_pes_[i]));
@@ -78,15 +74,13 @@ SymmetricHeapPool::acquire(int64_t numel, c10::ScalarType dtype, const std::stri
     buf.sym_base = static_cast<char*>(slab_) + used_;
     buf.numel    = numel;
     // The peer's copy of this window sits at the same offset in the peer's slab, because every
-    // rank hands out offsets in the same order -- which is what the SPMD call contract already
-    // requires. seal() is what turns a violation into an error rather than wrong addressing.
+    // rank hands out offsets in the same order (see the class comment).
     buf.peer_ptrs.resize(world_size_);
     for (int i = 0; i < world_size_; ++i)
         buf.peer_ptrs[i] = slab_peer_[i] + static_cast<uint64_t>(used_);
     used_ += nbytes;
 
-    // Growing replaces the entry; the outgrown offset is not reclaimed, which is why a shape that
-    // drifts upward costs one window per growth.
+    // Growing replaces the entry; the outgrown offset is not reclaimed.
     return registry_.insert_or_assign(std::move(key), std::move(buf)).first->second;
 }
 

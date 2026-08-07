@@ -42,6 +42,7 @@ def _nprocs() -> list[int]:
     "worker",
     [
         "a2a_correctness.py",
+        "a2a_fallback.py",
         "a2a_async.py",
         "a2a_uneven.py",
         "a2a_copy_out.py",
@@ -63,6 +64,18 @@ def test_multigpu_worker(worker, nproc):
     if ngpu < max(nproc, 2):
         pytest.skip(f"needs >={max(nproc, 2)} GPUs, found {ngpu}")
     _run_worker(worker, nproc)
+
+
+def test_multigpu_torch_nvshmem_coexist():
+    """NVSHMEM is a process-global singleton and torch ships its own.
+
+    Runs at 4 ranks regardless of how many GPUs are present: the question is whether the two
+    initialisations coexist, which two pairs already answer. Skips itself when torch's symmetric
+    memory is unavailable, so it is inert on a build where the question does not arise.
+    """
+    if torch.cuda.device_count() < 4:
+        pytest.skip(f"needs >=4 GPUs, found {torch.cuda.device_count()}")
+    _run_worker("a2a_torch_nvshmem_coexist.py", 4)
 
 
 @pytest.mark.parametrize("worker", ["a2a_subgroup.py", "a2a_subgroup_divergent.py"])

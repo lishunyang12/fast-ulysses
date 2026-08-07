@@ -87,7 +87,9 @@ def main() -> None:
             ok = torch.equal(ours, ref)
             fails += not ok
             if not ok:
-                print(f"FAIL rank={rank} sp_group={my_tp} it={it} tag={tag} mode={mode}", flush=True)
+                print(
+                    f"FAIL rank={rank} sp_group={my_tp} it={it} tag={tag} mode={mode}", flush=True
+                )
 
     # The seal itself: a tag nobody reserved must be refused, not allocated. Rank-local, so no
     # peer is left waiting -- acquire() raises before anything reaches the stream.
@@ -106,7 +108,8 @@ def main() -> None:
     dist.all_reduce(nfail)
     if rank == 0:
         print(
-            "divergent subgroups: " + ("ALL PASS" if nfail.item() == 0 else f"FAILED {int(nfail.item())}"),
+            "divergent subgroups: "
+            + ("ALL PASS" if nfail.item() == 0 else f"FAILED {int(nfail.item())}"),
             flush=True,
         )
     group.destroy()

@@ -149,9 +149,11 @@ def main() -> int:
         print("# copy_out = the default entry point's window -> caller's tensor; borrowed skips it")
         print("# raw  = all_to_all_single alone, no relayout: the transport floor")
         print()
-        hdr = (f"{'shape':<12} {'MB':>6} | {'perm_in':>8} {'a2a':>8} {'perm_out':>8} {'BASE':>8} | "
-               f"{'barr_in':>8} {'transfer':>8} {'barr_out':>8} {'copy_out':>8} {'OURS':>8} | "
-               f"{'raw':>7} {'CE/raw':>7} {'relayout%':>9} {'copyout%':>8} {'submit us':>9}")
+        hdr = (
+            f"{'shape':<12} {'MB':>6} | {'perm_in':>8} {'a2a':>8} {'perm_out':>8} {'BASE':>8} | "
+            f"{'barr_in':>8} {'transfer':>8} {'barr_out':>8} {'copy_out':>8} {'OURS':>8} | "
+            f"{'raw':>7} {'CE/raw':>7} {'relayout%':>9} {'copyout%':>8} {'submit us':>9}"
+        )
         print(hdr)
         print("-" * len(hdr))
 
@@ -168,17 +170,23 @@ def main() -> int:
         raw = repeat(lambda: [raw_only(x.flatten(), flat, pg)], args.iters, args.warmup)[0]
         ours = repeat(
             lambda: list(group.all_to_all_single_4d_timed(x, mode=0, tag="st")[1].values()),
-            args.iters, args.warmup)
-        sub = submit_us(lambda: group.all_to_all_single_4d(x, mode=0, tag="st"),
-                        args.iters, args.warmup)
+            args.iters,
+            args.warmup,
+        )
+        sub = submit_us(
+            lambda: group.all_to_all_single_4d(x, mode=0, tag="st"), args.iters, args.warmup
+        )
 
         if rank == 0:
             bp, op = sum(base), sum(ours)
-            print(f"{label:<12} {mb:>6.0f} | {base[0]:>8.3f} {base[1]:>8.3f} {base[2]:>8.3f} "
-                  f"{bp:>8.3f} | {ours[0]:>8.3f} {ours[1]:>8.3f} {ours[2]:>8.3f} {ours[3]:>8.3f} "
-                  f"{op:>8.3f} | {raw:>7.3f} {raw / ours[1]:>6.2f}x "
-                  f"{(base[0] + base[2]) / bp * 100:>8.1f}% {ours[3] / op * 100:>7.1f}% "
-                  f"{sub:>9.1f}", flush=True)
+            print(
+                f"{label:<12} {mb:>6.0f} | {base[0]:>8.3f} {base[1]:>8.3f} {base[2]:>8.3f} "
+                f"{bp:>8.3f} | {ours[0]:>8.3f} {ours[1]:>8.3f} {ours[2]:>8.3f} {ours[3]:>8.3f} "
+                f"{op:>8.3f} | {raw:>7.3f} {raw / ours[1]:>6.2f}x "
+                f"{(base[0] + base[2]) / bp * 100:>8.1f}% {ours[3] / op * 100:>7.1f}% "
+                f"{sub:>9.1f}",
+                flush=True,
+            )
 
         x = flat = None
         torch.cuda.empty_cache()

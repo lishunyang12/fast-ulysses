@@ -110,8 +110,7 @@ def main() -> None:
                 raise AssertionError(f"MISMATCH rank={rank} ws={ws} {name} mode={mode}")
             if rank == 0:
                 print(
-                    f"OK {name} ws={ws} mode={mode} splits={seq_splits} "
-                    f"shape={tuple(ours.shape)}",
+                    f"OK {name} ws={ws} mode={mode} splits={seq_splits} shape={tuple(ours.shape)}",
                     flush=True,
                 )
             dist.barrier()

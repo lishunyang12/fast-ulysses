@@ -14,22 +14,16 @@
 namespace ulysses {
 
 // Per-group CE (copy-engine) transfer resources: ONE stream, which the remote peer copies are
-// serialised onto, because concurrent copies contend for the same egress. This rank's own share
-// crosses no link and goes on the caller's stream instead, which is where the local/remote
-// overlap comes from. See launch_a2a_ce.
-//
-// Created lazily by UlyssesGroup::ce_resources(), released in destroy(). Serial use only. Join
-// events are deliberately NOT pooled here -- see the fresh-event note in launch_a2a_ce.
+// serialised onto because concurrent copies contend for the same egress. Created lazily by
+// ce_resources(), released in destroy(). Join events are deliberately NOT pooled here -- see the
+// fresh-event note in launch_a2a_ce.
 struct CEResources {
     cudaStream_t xfer = nullptr;
 };
 
 // CE transfer path: issues `plan.ops` as pitched cudaMemcpy2D/3DAsync copies -- remote peers
-// serialised on `ce.xfer` in XOR-shift order, this rank's own share on `stream` -- joined back
-// to `stream` with events. The addressing comes from build_plan
-// (a2a_plan.h); `peer_ptrs[p]` is the base of peer p's symmetric window, which op offsets are
-// relative to. The caller appends the flag barrier (no nvshmem quiet needed: these are not
-// NVSHMEM proxy writes). Rationale: all_to_all_ce.cu file header.
+// serialised on `ce.xfer`, this rank's own share on `stream` -- joined back to `stream` with
+// events. `peer_ptrs[p]` is the base of peer p's window, which the op offsets are relative to.
 void launch_a2a_ce(const void*                  src,
                    const std::vector<uint64_t>& peer_ptrs,
                    const A2APlan&               plan,
@@ -64,34 +58,25 @@ public:
         return *pool_;
     }
 
-    // Custom single-node flag barrier over P2P-mapped memory, in place of NVSHMEM's own sync, which
-    // is far slower where it has to fall back. No nvshmem quiet is needed (or would help): the transport
-    // issues raw cudaMemcpy2DAsync into nvshmem_ptr addresses, and quiet orders NVSHMEM operations, which
-    // those are not -- their completion is joined onto `stream` inside launch_a2a_ce and the flag store is
-    // stream-ordered after that. See the closing-barrier comment in bindings.cpp. No-op when world_size==1.
-    //
-    // `tag` picks the barrier state, of which there is ONE SET PER TAG -- see BarrierState. It is the
-    // caller's tag, i.e. the same one that names the output buffer.
+    // Custom single-node flag barrier over P2P-mapped memory, in place of NVSHMEM's own sync. No
+    // nvshmem quiet is needed (or would help): the transport issues raw cudaMemcpy2DAsync into
+    // nvshmem_ptr addresses, which are not NVSHMEM operations for quiet to order. No-op at
+    // world_size == 1. `tag` picks the barrier state, of which there is ONE SET PER TAG.
     void fast_barrier(cudaStream_t stream, const std::string& tag);
 
-    // TESTS: the tag's device-side epoch counter, read back to the host. 0 if the tag has no
-    // barrier state yet. Lets a test assert that a handshake ADVANCED, rather than infer it from
-    // whether the data came out torn -- which is what a graph replay silently stops doing when
-    // the epoch is computed on the host and baked into the capture.
+    // TESTS: the tag's device-side epoch counter, read back to the host; 0 if the tag has no
+    // barrier state yet. Lets a test assert that a handshake ADVANCED.
     int64_t barrier_epoch(const std::string& tag);
 
-    // Create a tag's barrier state now, so a later fast_barrier on it allocates nothing.
-    //
-    // The flags live in the same pool as the data windows (key "__ulysses_sync__" + tag), so
-    // sealing the pool without this makes the tag's FIRST handshake fail rather than its first
-    // undeclared window. Collective, like everything else that touches the symmetric heap.
+    // Create a tag's barrier state now, so a later fast_barrier on it allocates nothing. Its flags
+    // live in the same pool as the data windows, so sealing without this makes the tag's FIRST
+    // handshake fail rather than its first undeclared window.
     void reserve_barrier(const std::string& tag, cudaStream_t stream)
     {
         barrier_state_(tag, stream);
     }
 
-    // Lazily create the transfer stream and return the CE transfer resources.
-    const CEResources& ce_resources();
+    const CEResources& ce_resources();  // creates the transfer stream on first use
 
 private:
     int                                my_rank_, world_size_, device_id_;
@@ -101,26 +86,19 @@ private:
     bool                               destroyed_ = false;
     std::unique_ptr<SymmetricHeapPool> pool_;
 
-    // CE transfer resources (lazy; see ce_resources()).
     CEResources ce_;
     bool        ce_ready_ = false;
 
     // fast_barrier state: symmetric flag buffer (uint64[ws]) + monotonic epoch. ONE SET PER TAG.
     //
-    // The epoch protocol needs every rank to assign epochs to the same handshakes in the same order,
-    // and program order gives that only WITHIN a tag: the contract says an outstanding async result
-    // must be waited on before the next call with THAT tag, and says nothing about other tags. An
-    // async call on the comm stream and a sync call on the caller's stream, on different tags, run on
-    // unordered streams; with one counter for the whole group their barrier kernels interleave
-    // differently on different ranks, so a rank ends up waiting on an epoch its peer published for the
-    // OTHER collective -- which says nothing about the transfer it actually cares about, and the
-    // window is read before it is written. Making that counter atomic is not enough: it fixes the
-    // lost increment, not the ordering. Per tag there is nothing to interleave.
-    // tests/distributed/a2a_overlapping_barriers.py is the test.
-    //
-    // The flags are a symmetric-heap buffer like the data (the tag goes in the pool name); the epoch
-    // is this rank's own device memory, never addressed by a peer, and device-side so that a captured
-    // graph advances it on replay -- see ulysses_barrier_kernel.
+    // The epoch protocol needs every rank to assign epochs to the same handshakes in the same
+    // order, and program order gives that only WITHIN a tag. With one counter for the whole group,
+    // two collectives on unordered streams interleave differently on different ranks, so a rank
+    // waits on an epoch its peer published for the OTHER collective and reads the window before it
+    // is written; making the counter atomic fixes the lost increment, not the ordering. Per tag
+    // there is nothing to interleave (a2a_overlapping_barriers.py). The flags are a symmetric-heap
+    // buffer like the data; the epoch is this rank's own device memory, device-side so a captured
+    // graph advances it on replay (ulysses_barrier_kernel).
     struct BarrierState {
         void*                 my_flags = nullptr;  // this rank's flag base
         std::vector<uint64_t> peer_flags;          // per-peer flag base (including self)

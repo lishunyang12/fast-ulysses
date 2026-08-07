@@ -56,8 +56,10 @@ def main() -> int:
     pg_b = dist.new_group(ranks=b_ranks)
 
     if rank == 0:
-        log(f"building overlapping groups {a_ranks} and {b_ranks} -- "
-            "if this is the last line, the constructor HANGS")
+        log(
+            f"building overlapping groups {a_ranks} and {b_ranks} -- "
+            "if this is the last line, the constructor HANGS"
+        )
 
     made, err = [], None
     try:
@@ -75,7 +77,9 @@ def main() -> int:
             log(f"construction RAISED (an error is the ACCEPTABLE outcome):\n{err}")
         outcome = "raised"
     else:
-        log(f"constructed {[n for n, _ in made]} -- overlap is ACCEPTED, so it must also be correct")
+        log(
+            f"constructed {[n for n, _ in made]} -- overlap is ACCEPTED, so it must also be correct"
+        )
         outcome = "accepted"
 
     # If they built, do they produce right answers? An accepted-but-wrong overlap is worse than
@@ -97,7 +101,9 @@ def main() -> int:
         want = {float(10 + r) for r in (a_ranks if name == "A" else b_ranks)}
         saw = set(torch.unique(out.float()).tolist())
         if not saw <= want:
-            log(f"group {name}: result carries {sorted(saw - want)}, outside its own members {sorted(want)}")
+            log(
+                f"group {name}: result carries {sorted(saw - want)}, outside its own members {sorted(want)}"
+            )
             bad += 1
 
     for _, g in made:
