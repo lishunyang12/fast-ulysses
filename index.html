@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>fast-ulysses wheel index</title></head><body>
+<h1>fast-ulysses wheel index</h1>
+
+<p>PEP 503 indexes of the fast-ulysses release wheels, published by the <code>index</code> job in
+<code>.github/workflows/release.yml</code>. <strong>Nothing is published here yet:</strong> the
+first release to run that job populates this page with one index per (torch, CUDA) row.</p>
+
+<p>Until then, take a wheel from the
+<a href="https://github.com/triple-mu/fast-ulysses/releases">releases page</a>, or run
+<code>fast-ulysses wheel-url</code> in the environment you are installing into, which prints the
+exact version to ask for. Installation:
+<a href="https://github.com/triple-mu/fast-ulysses/blob/master/docs/install.md">docs/install.md</a>.</p>
+
+<p>0.1.0 is deliberately absent. Its wheels depend on <code>nvidia-nvshmem-cu13</code>, which these
+indexes do not carry, so an <code>--index-url</code> install of it could not resolve.</p>
+</body></html>
