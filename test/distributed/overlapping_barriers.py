@@ -121,8 +121,8 @@ also how the reference implementation HUNG. If none of the three happens, this l
 pass here means nothing.
 
 DEADLOCK IS THE OTHER FAILURE MODE. A spin kernel has no timeout, ``cudaStreamSynchronize`` never
-returns an error, and nothing in the stack raises (CLAUDE.md: "Violating it hangs; nothing raises
-and nothing times out"), so the worker bounds its own wall clock. A TIMEOUT line is a failure, not
+returns an error, and nothing in the stack raises (docs/api.md: "Violating these hangs the
+group. Nothing raises and nothing times out"), so the worker bounds its own wall clock. A TIMEOUT line is a failure, not
 an infrastructure hiccup.
 
 DEVIATION from the house rhythm, deliberately: no ``dist.barrier()`` inside the loop, because it

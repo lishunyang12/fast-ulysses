@@ -37,7 +37,7 @@ echo "fast-ulysses measurement: ${LABEL}"
 echo "================================================================================"
 echo "date          $(date -Is)"
 echo "host          $(hostname)"
-echo "slurm job     ${REDACTED_ENV:-<none>}  node=${REDACTED_ENV:-<none>}"
+echo "host          $(hostname -s)"
 echo "gpus          ${GPUS}  (nproc=${NPROC})"
 echo "repo          ${REPO}"
 # On a cluster the tree is usually rsync'd without .git, so fall back to the COMMIT file the

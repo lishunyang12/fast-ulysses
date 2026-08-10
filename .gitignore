@@ -25,3 +25,6 @@ COMMIT
 # Measurement logs and working notes: kept locally, never committed. Source comments state the
 # problem; the numbers behind a decision live here.
 notes/
+
+# Local agent instructions: names test machines, cluster paths and accounts. Never committed.
+CLAUDE.md

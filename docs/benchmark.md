@@ -1,6 +1,6 @@
 # Benchmarks
 
-Measured 2026-08-08 on a the cluster the scheduler cluster, H100 on 2026-08-09. All five GPU models are in.
+Measured 2026-08-08, H100 on 2026-08-09. All five GPU models are in.
 Read the H100 caveat in "Machines": its two samples are the same node, so its spread is run-to-run
 variance and not the node-to-node agreement the other four report.
 
@@ -10,7 +10,7 @@ Every number is taken under `tools/exclusive.sh`, which refuses to start until t
 are free, samples throughout, and prints `EXCLUSIVE` or `CONTENDED`. Every run below reported
 `EXCLUSIVE`. Numbers from different machines are not compared except where the table says so.
 
-- **Whole node, 8 GPUs**, allocated exclusively through the scheduler with a GPU health gate.
+- **Whole node, 8 GPUs**, allocated exclusively, behind a GPU health gate.
 - **One binary.** A single wheel built for `80;90;100;120` was installed on every machine
   (`sha256 5e4e3747…`), so nothing was recompiled between generations.
 - **One image**, `nvcr.io/nvidia/pytorch:26.07-py3` — torch `2.13.0a0+9186a08b2c.nv26.07`,
@@ -37,9 +37,9 @@ benchmark/collect.sh <label>          # everything, with the environment recorde
     benchmark/bench_a2a.py --mode {stages|zerocopy|sweep|link|zerosm|overlap|padding}
 ```
 
-Raw logs, one per (model, node), are archived outside this repo at
-`<cluster scratch>/nvidia/REDACTED-DIR/results/`. Each carries its own fingerprint header: node,
-driver, torch, CUDA, `nvidia-smi topo -m`, SM clocks before and after, and the commit.
+Raw logs, one per (model, node), are archived outside this repo. Each carries its own
+fingerprint header: driver, torch, CUDA, `nvidia-smi topo -m`, SM clocks before and after, and the
+commit.
 
 ## Machines
 
@@ -49,7 +49,7 @@ driver, torch, CUDA, `nvidia-smi topo -m`, SM clocks before and after, and the c
 | 8×B200 | NVLink | measured, two nodes agree within 7.9% |
 | 8×B300 SXM6 | NVLink | measured, two nodes agree within 2.6% |
 | 8×RTX PRO 6000 | PCIe, 2 sockets | measured, **two nodes disagree by 5×** — see "Why not PCIe" |
-| 8×H100 | NVLink | measured, but **both samples are the same node** (`REDACTED-NODE`), up to 15.0% apart |
+| 8×H100 | NVLink | measured, but **both samples are the same node**, up to 15.0% apart |
 
 8×A100 appears in the v0.1 section and is not re-measured: this cluster has none.
 
@@ -265,17 +265,16 @@ is the topology the constructor refuses. Three things came out of it.
 `pytest test/` passed 51/51 on the same machine, since the tests construct their groups with the
 check off. This is the first machine with no NVLink at all that the guard has been run on.
 
-That evidence is in `pro6000-refusal-REDACTED-NODE.log`, the run that was *stopped* by the
-refusal. The two tables below come from separate runs with `--allow-non-nvlink`, whose logs
-therefore contain no refusal at all.
+That evidence is in the log of the run that was *stopped* by the refusal. The two tables below
+come from separate runs with `--allow-non-nvlink`, whose logs therefore contain no refusal at all.
 
 **The cost of ignoring it, with `--allow-non-nvlink`** — and here the two nodes disagree by 5×, so
 nothing is averaged:
 
 | node | PCIe layout, socket 0 | BASE | transfer | OURS | vs BASE | raw |
 |---|---|---|---|---|---|---|
-| REDACTED-NODE | 2+2 | 14.933 | 22.848 | 24.090 | 0.62× | 14.026 |
-| REDACTED-NODE | 3+1 | 17.525 | 122.250 | 122.750 | 0.14× | 16.540 |
+| A | 2+2 | 14.933 | 22.848 | 24.090 | 0.62× | 14.026 |
+| B | 3+1 | 17.525 | 122.250 | 122.750 | 0.14× | 16.540 |
 
 **The fabric is not what differs.** Flat 64 MiB peer copies give 54.6 and 55.9 GB/s single-flow,
 and 52.1 GB/s per flow with all eight running, on *both* nodes. What differs is what the collective
@@ -326,5 +325,5 @@ ones on the machines both saw (B200 wan-720p: v0.1 BASE 1.193 / OURS 0.554, v0.2
   bandwidth. Removing the padding saves attention work and memory this cannot see.
 - **Beyond `world_size = 8`,** or across nodes. ws=4 is above; ws=2 is not measured.
 - **A second H100 NODE.** H100 was measured after the rest, and both of its samples came from
-  `REDACTED-NODE`. Its 15.0% spread on wan-480p is therefore run-to-run, and says nothing about
-  how two H100 nodes would agree.
+  the same node. Its 15.0% spread on wan-480p is therefore run-to-run, and says nothing about how
+  two H100 nodes would agree.
