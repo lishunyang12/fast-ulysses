@@ -1,18 +1,49 @@
 <!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<title>fast-ulysses wheel index</title></head><body>
-<h1>fast-ulysses wheel index</h1>
-
-<p>PEP 503 indexes of the fast-ulysses release wheels, published by the <code>index</code> job in
-<code>.github/workflows/release.yml</code>. <strong>Nothing is published here yet:</strong> the
-first release to run that job populates this page with one index per (torch, CUDA) row.</p>
-
-<p>Until then, take a wheel from the
-<a href="https://github.com/triple-mu/fast-ulysses/releases">releases page</a>, or run
-<code>fast-ulysses wheel-url</code> in the environment you are installing into, which prints the
-exact version to ask for. Installation:
-<a href="https://github.com/triple-mu/fast-ulysses/blob/master/docs/install.md">docs/install.md</a>.</p>
-
-<p>0.1.0 is deliberately absent. Its wheels depend on <code>nvidia-nvshmem-cu13</code>, which these
-indexes do not carry, so an <code>--index-url</code> install of it could not resolve.</p>
-</body></html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="pypi:repository-version" content="1.0">
+    <title>fast-ulysses wheel index</title>
+  </head>
+  <body>
+    <h1>fast-ulysses wheel index</h1>
+    <p>
+      PEP 503 indexes of the fast-ulysses release wheels. Pick by the CUDA your torch was built
+      against (<code>python -c "import torch; print(torch.version.cuda)"</code>); the torch pin
+      inside each wheel then selects the build for the torch you have.
+    </p>
+    <pre>pip install fast-ulysses --index-url https://triple-mu.github.io/fast-ulysses/whl/cu12/    # torch built against CUDA 12
+pip install fast-ulysses --index-url https://triple-mu.github.io/fast-ulysses/whl/cu13/    # torch built against CUDA 13</pre>
+    <p>
+      <code>--index-url</code> and nothing else. pip merges every index it is given and takes the
+      highest version across all of them, and the newest local version here is always the newest
+      torch &mdash; so adding <code>--extra-index-url https://pypi.org/simple</code> makes pip
+      install that wheel and <em>upgrade your torch to match it</em>. These indexes carry no torch
+      of their own, which is what leaves pip no choice but to fall back to the wheel pinned to the
+      torch you already have. Install torch first, from wherever you normally do.
+    </p>
+    <p>
+      If something else in the environment must come from PyPI anyway, use a per-row index below
+      &mdash; only one row is in it, so nothing else can be selected &mdash; or write the version
+      out in full: <code>pip install "fast-ulysses==0.2.0+torch213cu130"</code> resolves to exactly one file,
+      under pip and under uv alike. That has to be <em>your</em> row's tag, not this one: any
+      other row pins a torch you do not have, and in a command that can reach PyPI pip satisfies
+      that pin by moving your torch, not by failing. The tag for each row is in the list below.
+    </p>
+    <ul>
+      <li><a href="whl/cu12/">https://triple-mu.github.io/fast-ulysses/whl/cu12/</a> &mdash; every wheel built against CUDA 12; the torch minor is left to the pin</li>
+      <li><a href="whl/cu128/">https://triple-mu.github.io/fast-ulysses/whl/cu128/</a> &mdash; alias of cu12, same wheels</li>
+      <li><a href="whl/cu129/">https://triple-mu.github.io/fast-ulysses/whl/cu129/</a> &mdash; alias of cu12, same wheels</li>
+      <li><a href="whl/cu13/">https://triple-mu.github.io/fast-ulysses/whl/cu13/</a> &mdash; every wheel built against CUDA 13; the torch minor is left to the pin</li>
+      <li><a href="whl/cu130/">https://triple-mu.github.io/fast-ulysses/whl/cu130/</a> &mdash; alias of cu13, same wheels</li>
+      <li><a href="whl/torch210cu128/">https://triple-mu.github.io/fast-ulysses/whl/torch210cu128/</a> &mdash; torch 2.10, CUDA 12 only: one row, four wheels per release, one per CPython</li>
+      <li><a href="whl/torch210cu130/">https://triple-mu.github.io/fast-ulysses/whl/torch210cu130/</a> &mdash; torch 2.10, CUDA 13 only: one row, four wheels per release, one per CPython</li>
+      <li><a href="whl/torch211cu128/">https://triple-mu.github.io/fast-ulysses/whl/torch211cu128/</a> &mdash; torch 2.11, CUDA 12 only: one row, four wheels per release, one per CPython</li>
+      <li><a href="whl/torch211cu130/">https://triple-mu.github.io/fast-ulysses/whl/torch211cu130/</a> &mdash; torch 2.11, CUDA 13 only: one row, four wheels per release, one per CPython</li>
+      <li><a href="whl/torch212cu129/">https://triple-mu.github.io/fast-ulysses/whl/torch212cu129/</a> &mdash; torch 2.12, CUDA 12 only: one row, four wheels per release, one per CPython</li>
+      <li><a href="whl/torch212cu130/">https://triple-mu.github.io/fast-ulysses/whl/torch212cu130/</a> &mdash; torch 2.12, CUDA 13 only: one row, four wheels per release, one per CPython</li>
+      <li><a href="whl/torch213cu129/">https://triple-mu.github.io/fast-ulysses/whl/torch213cu129/</a> &mdash; torch 2.13, CUDA 12 only: one row, four wheels per release, one per CPython</li>
+      <li><a href="whl/torch213cu130/">https://triple-mu.github.io/fast-ulysses/whl/torch213cu130/</a> &mdash; torch 2.13, CUDA 13 only: one row, four wheels per release, one per CPython</li>
+    </ul>
+  </body>
+</html>
