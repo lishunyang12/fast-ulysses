@@ -167,12 +167,15 @@ Call prepare(const c10::intrusive_ptr<UlyssesGroup>&    group,
 // that shape overwrites the staging buffer while the comm stream is still reading it -- silently,
 // because waiting on an unrecorded event succeeds and does nothing.
 struct StagingRelease {
-    UlyssesGroup* group;
-    cudaStream_t  comm;
+    UlyssesGroup*          group;
+    UlyssesGroup::Staging* slot;
+    cudaStream_t           comm;
 
     ~StagingRelease()
     {
-        group->release_staging(comm);  // noexcept; see the header
+        // The slot this call used, not "the last one staged": several calls of one shape can be in
+        // flight, and each has to release its own.
+        group->release_staging(slot, comm);  // noexcept; see the header
     }
 };
 
@@ -359,9 +362,9 @@ at::Tensor run_staged(const c10::intrusive_ptr<UlyssesGroup>&    group,
     // record_stream would instead pin every freed input until the comm stream caught up. The
     // staging copy also absorbs a strided input, which is why nothing calls contiguous() here:
     // doing so would launch that copy on the comm stream, which is exactly what this avoids.
-    const at::Tensor&    staged = group->stage(input, caller, comm);
-    const StagingRelease release{group.get(), comm};
-    return run(group, staged, mode, seq_splits, head_splits, out, kAsyncWindow, comm);
+    UlyssesGroup::Staging* slot = group->stage(input, caller, comm);
+    const StagingRelease   release{group.get(), slot, comm};
+    return run(group, slot->tensor, mode, seq_splits, head_splits, out, kAsyncWindow, comm);
 }
 
 }  // namespace
@@ -654,7 +657,14 @@ TORCH_LIBRARY(fast_ulysses, m)
         .def("epoch_debug",
              [](const c10::intrusive_ptr<ulysses::UlyssesGroup>& self, const at::Tensor& probe, int64_t role) {
                  return self->epoch(probe, static_cast<ulysses::WindowRole>(role));
-             });
+             })
+        // TESTS ONLY, same reason. test/distributed/correctness.py needs it: several same-shaped
+        // async calls in flight at once is what the staging pool exists for, and the results
+        // cannot show it -- sharing one slot is CORRECT, it only serialises the calls on the
+        // caller's stream. The slot count separates the two. `like` carries the (shape, dtype).
+        .def("staging_slots_debug", [](const c10::intrusive_ptr<ulysses::UlyssesGroup>& self, const at::Tensor& like) {
+            return self->staging_slots(like);
+        });
 
     // BOTH batching keys, for every op below.
     //

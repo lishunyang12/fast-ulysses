@@ -4,8 +4,9 @@
 
 Pure data movement, so "close enough" is not a passing result anywhere in this file. Covers both
 modes, every supported dtype, even and uneven shards, the three things ``out=`` can be, the async
-form including a non-contiguous input, window reuse across repeated calls, the autograd backward,
-the meta kernel's shape propagation, and the benchmark-only timed variant.
+form including a non-contiguous input and several same-shaped calls in flight at once, window reuse
+across repeated calls, the autograd backward, the meta kernel's shape propagation, and the
+benchmark-only timed variant.
 """
 
 from __future__ import annotations
@@ -180,6 +181,42 @@ def main() -> None:
         group.all_to_all_4d_async(x, mode=0, out=async_window).wait(),
         want,
     )
+
+    # --- several same-shaped async calls in flight at once -----------------------------------
+    # What the staging pool exists for, and the results cannot show it: sharing one slot is
+    # CORRECT, it only makes the next call's staging copy wait, ON THE CALLER'S STREAM, for the
+    # previous exchange to retire -- serialising the compute the async form was issued to overlap.
+    # The slot count is the one thing that separates the two, hence staging_slots_debug.
+    #
+    # Its own shape, so the count starts at zero rather than at whatever the calls above left.
+    #
+    # The sleep is what makes the overlap real: it holds the caller's stream, the comm stream waits
+    # on it, and so no exchange can retire while these five are being issued. Growth that repeats a
+    # number early -- [1, 1, ...] -- means the calls were NOT overlapping and this checked nothing,
+    # which is a blind run and not a passing one. It stops at 4 because that is the pool's bound:
+    # the fifth call waits for a slot instead, the one branch that waits on a release event rather
+    # than querying it.
+    packed = [torch.randn(B, 8, 4 * ws, 64, dtype=torch.bfloat16, device=dev) for _ in range(5)]
+    packed_want = [reference_even(t, 0, ws, pg) for t in packed]
+    torch.cuda.synchronize()
+    torch.cuda._sleep(100_000_000)
+    handles, growth = [], []
+    for t in packed:
+        handles.append(group.all_to_all_4d_async(t, mode=0))
+        growth.append(group._handle.staging_slots_debug(t))
+    for i, (h, w) in enumerate(zip(handles, packed_want, strict=True)):
+        check.equal(f"5 same-shaped async in flight, #{i}", h.wait(), w)
+    if growth != [1, 2, 3, 4, 4]:
+        check.failed += 1
+        print(
+            f"FAIL rank={rank} same-shaped async in flight: the staging pool grew {growth}, "
+            "expected [1, 2, 3, 4, 4] -- either the calls shared slots they should not have, or "
+            "nothing was overlapping and this saw one call at a time",
+            flush=True,
+        )
+    elif rank == 0:
+        print(f"OK ws={ws} 5 same-shaped async in flight, staging pool grew {growth}", flush=True)
+    dist.barrier()
 
     # --- steady state: the window is allocated once and reused ------------------------------
     # Correct results do not show this: a window reallocated every round would produce them too.

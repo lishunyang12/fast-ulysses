@@ -282,30 +282,53 @@ const Window* UlyssesGroup::window_of(const at::Tensor& out) const
     return it == owned_.end() ? nullptr : &it->second;
 }
 
-const at::Tensor& UlyssesGroup::stage(const at::Tensor& x, c10::cuda::CUDAStream caller, cudaStream_t comm)
+UlyssesGroup::Staging* UlyssesGroup::stage(const at::Tensor& x, c10::cuda::CUDAStream caller, cudaStream_t comm)
 {
     auto key = std::make_pair(x.sizes().vec(), x.scalar_type());
-    // Unlike plans_, every entry here pins a full input's worth of device memory, so the bound
-    // matters more. Dropping them all costs one extra copy per live shape on the next call, and
-    // release_staging() has already been called for every entry by the time we get here.
+    // Unlike plans_, every entry here pins up to kMaxStagingPerShape inputs' worth of device
+    // memory, so the bound matters more -- 16 shapes is 16 * kMaxStagingPerShape buffers. Dropping
+    // them all costs one extra copy per live shape on the next call, and release_staging() has
+    // already been called for every slot by the time we get here.
     if (staging_.size() >= 16 && staging_.find(key) == staging_.end()) {
         for (auto& entry : staging_) {
-            if (entry.second.release != nullptr) {
-                ULYSSES_CUDA_CHECK(cudaEventSynchronize(entry.second.release));
-                ULYSSES_CUDA_CHECK(cudaEventDestroy(entry.second.release));
+            for (auto& slot : entry.second) {
+                if (slot->release != nullptr) {
+                    ULYSSES_CUDA_CHECK(cudaEventSynchronize(slot->release));
+                    ULYSSES_CUDA_CHECK(cudaEventDestroy(slot->release));
+                }
             }
         }
         staging_.clear();
-        last_staged_ = nullptr;
     }
-    auto& s = staging_[key];
+    auto& pool = staging_[key];
+
     // Everything below happens on the CALLER's stream, so the caller's tensor is only ever read
     // there and the comm stream sees only the staged copy.
     const c10::cuda::CUDAStreamGuard guard(caller);
-    if (!s.tensor.defined()) {
-        // Both built into locals and committed together, so a throw from either leaves the entry
-        // untouched and the next call retries it. A half-built entry -- tensor defined, release
-        // still null -- would take the else branch below and throw on the null event, for good.
+
+    // Prefer a slot the comm stream has finished with: reusing it costs nothing, while a fresh one
+    // costs an allocation. cudaEventQuery on a never-recorded event reports success, which is the
+    // right answer for a slot that has never been read.
+    Staging* slot = nullptr;
+    for (auto& candidate : pool) {
+        const cudaError_t status = cudaEventQuery(candidate->release);
+        if (status == cudaSuccess) {
+            slot = candidate.get();
+            break;
+        }
+        if (status != cudaErrorNotReady) {
+            ULYSSES_CUDA_CHECK(status);
+        }
+        // cudaErrorNotReady is this call's answer, not a failure -- but it still lands in the
+        // sticky last error, where the next unrelated cudaGetLastError() would report it as its
+        // own. Cleared here for the same reason at::cuda::CUDAEvent::query() clears it.
+        (void)cudaGetLastError();
+    }
+
+    if (slot == nullptr && pool.size() < kMaxStagingPerShape) {
+        // Built into locals and committed together, so a throw from either leaves the pool
+        // untouched and the next call retries. A half-built slot -- tensor defined, release still
+        // null -- would be handed out and then throw on the null event, for good.
         //
         // at::empty, not empty_like: empty_like would copy a strided input's layout, and the
         // transport reads the staged buffer as dense.
@@ -315,17 +338,26 @@ const at::Tensor& UlyssesGroup::stage(const at::Tensor& x, c10::cuda::CUDAStream
         // it from outside inference mode raises, so a single call made there would retire that
         // (shape, dtype) permanently.
         const c10::InferenceMode no_inference(false);
+        auto                     fresh   = std::make_unique<Staging>();
         at::Tensor               staged  = at::empty(x.sizes(), x.options());
         cudaEvent_t              release = nullptr;
         ULYSSES_CUDA_CHECK(cudaEventCreateWithFlags(&release, cudaEventDisableTiming));
-        s.tensor  = std::move(staged);
-        s.release = release;
+        fresh->tensor  = std::move(staged);
+        fresh->release = release;
+        pool.push_back(std::move(fresh));
+        slot = pool.back().get();
     }
-    else {
-        // Wait GPU-side for the comm stream to have finished reading the previous contents.
-        ULYSSES_CUDA_CHECK(cudaStreamWaitEvent(caller, s.release, 0));
+    else if (slot == nullptr) {
+        // Every slot is still in flight and the pool is at its bound, so this call waits for one.
+        // pool.front() is the first slot BUILT, not the first that will retire -- the scan above
+        // starts there, so it tends to be the most recently reused. Any in-flight slot is a
+        // correct answer; a shorter wait would cost keeping the pool in retirement order, on a
+        // path a caller reaches only by exceeding the bound.
+        slot = pool.front().get();
+        ULYSSES_CUDA_CHECK(cudaStreamWaitEvent(caller, slot->release, 0));
     }
-    s.tensor.copy_(x);
+
+    slot->tensor.copy_(x);
     // The comm stream must not read the staged copy before that copy has run, and the ready event
     // trails everything already submitted on the caller's stream -- including any earlier consumer
     // of this same buffer.
@@ -333,18 +365,25 @@ const at::Tensor& UlyssesGroup::stage(const at::Tensor& x, c10::cuda::CUDAStream
     ULYSSES_CUDA_CHECK(cudaEventRecord(ready, caller));
     ULYSSES_CUDA_CHECK(cudaStreamWaitEvent(comm, ready, 0));
 
-    last_staged_ = &s;
-    return s.tensor;
+    return slot;
 }
 
-void UlyssesGroup::release_staging(cudaStream_t comm) noexcept
+void UlyssesGroup::release_staging(Staging* slot, cudaStream_t comm) noexcept
 {
-    if (last_staged_ != nullptr) {
+    if (slot != nullptr) {
+        // The slot is named by the caller rather than remembered here, because several calls can
+        // be in flight at once and each must release the one it actually used.
+        //
         // See the header: unchecked because this also runs while an exception from the transfer is
         // propagating, and because a checked record that failed would leave the same state.
-        cudaEventRecord(last_staged_->release, comm);
-        last_staged_ = nullptr;
+        cudaEventRecord(slot->release, comm);
     }
+}
+
+int64_t UlyssesGroup::staging_slots(const at::Tensor& like) const
+{
+    const auto it = staging_.find(std::make_pair(like.sizes().vec(), like.scalar_type()));
+    return it == staging_.end() ? 0 : static_cast<int64_t>(it->second.size());
 }
 
 int64_t UlyssesGroup::epoch(const at::Tensor& probe, WindowRole role) const
@@ -390,12 +429,13 @@ void UlyssesGroup::destroy()
         xfer_ = nullptr;
     }
     for (auto& entry : staging_) {
-        if (entry.second.release != nullptr) {
-            cudaEventDestroy(entry.second.release);
+        for (auto& slot : entry.second) {
+            if (slot->release != nullptr) {
+                cudaEventDestroy(slot->release);
+            }
         }
     }
     staging_.clear();
-    last_staged_ = nullptr;
     plans_.clear();
     windows_.clear();
     // Buffers the caller still holds stay alive through their own storage reference; dropping our

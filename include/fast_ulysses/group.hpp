@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <torch/custom_class.h>
@@ -88,17 +89,30 @@ public:
     /// @brief The window `out` is, or nullptr when it is an ordinary tensor.
     const Window* window_of(const at::Tensor& out) const;
 
+    // (shape, dtype) -> staging buffer + the event saying the comm stream is done reading it.
+    struct Staging {
+        at::Tensor  tensor;
+        cudaEvent_t release = nullptr;
+    };
+
     /// @brief Staging buffer for the async path, so the caller's tensor is never retained
     /// cross-stream. Copies `x` into it on `caller`, then makes `comm` wait for that copy.
-    /// @return the staging tensor, whose release event is recorded by release_staging().
-    const at::Tensor& stage(const at::Tensor& x, c10::cuda::CUDAStream caller, cudaStream_t comm);
+    ///
+    /// Buffers of a shape form a pool rather than a single slot, so several async calls of the
+    /// SAME shape can be in flight at once -- which is what splitting one packed exchange into
+    /// per-tensor ones does. With one slot the second call's copy waits, ON THE CALLER'S STREAM,
+    /// for the first exchange to retire, serialising the very compute it was issued early to
+    /// overlap. Sharing a slot is still correct, just not concurrent.
+    ///
+    /// @return the slot used; pass it to release_staging() once the transfer has been issued.
+    Staging* stage(const at::Tensor& x, c10::cuda::CUDAStream caller, cudaStream_t comm);
 
-    /// @brief Record, on `comm`, that the last staged buffer may be overwritten again.
+    /// @brief Record, on `comm`, that `slot` may be overwritten again.
     ///
     /// noexcept because it runs from a scope guard that must also fire while an exception from the
     /// transfer is propagating. Unchecked for the same reason, and it costs nothing: a checked
     /// record that failed would leave exactly the state an unchecked one does.
-    void release_staging(cudaStream_t comm) noexcept;
+    void release_staging(Staging* slot, cudaStream_t comm) noexcept;
 
     cudaStream_t xfer_stream();
 
@@ -107,6 +121,12 @@ public:
     /// exists yet. Synchronising, and it reads a counter the barrier kernel owns: it is here so a
     /// CUDA-graph replay can be shown to advance the epoch rather than announce a stale one.
     int64_t epoch(const at::Tensor& probe, WindowRole role) const;
+
+    /// @brief TESTS ONLY. How many staging slots exist for `like`'s (shape, dtype); 0 before the
+    /// first async call of that shape. Whether two same-shaped calls got separate buffers is the
+    /// whole point of the pool and is invisible in the results: sharing one corrupts only when the
+    /// timing lines up, so a bit-exact pair proves nothing on its own and the count does.
+    int64_t staging_slots(const at::Tensor& like) const;
 
     /// @brief Release the windows and the transfer stream. Buffers handed out by make_output are
     /// the caller's and are unaffected.
@@ -136,13 +156,15 @@ private:
     std::map<std::pair<int64_t, at::ScalarType>, Window> windows_;
     std::map<const void*, Window>                        owned_;  // handed to callers, by address
 
-    // (shape, dtype) -> staging buffer + the event saying the comm stream is done reading it.
-    struct Staging {
-        at::Tensor  tensor;
-        cudaEvent_t release = nullptr;
-    };
-    std::map<std::pair<std::vector<int64_t>, at::ScalarType>, Staging> staging_;
-    Staging*                                                           last_staged_ = nullptr;
+    // Concurrent in-flight exchanges of one shape. Four covers a split q/k/v with room to spare;
+    // past the bound a call waits for a slot rather than growing without limit, since every slot
+    // pins a full input's worth of device memory -- and stage()'s own bound of 16 shapes is
+    // therefore 16 * this many buffers.
+    static constexpr size_t kMaxStagingPerShape = 4;
+
+    // (shape, dtype) -> pool of staging buffers. unique_ptr because callers hold a Staging* across
+    // the transfer, and growing the pool must not move the slots already handed out.
+    std::map<std::pair<std::vector<int64_t>, at::ScalarType>, std::vector<std::unique_ptr<Staging>>> staging_;
 };
 
 }  // namespace ulysses
