@@ -4,6 +4,12 @@ Measured 2026-08-08, H100 on 2026-08-09. All five GPU models are in.
 Read the H100 caveat in "Machines": its two samples are the same node, so its spread is run-to-run
 variance and not the node-to-node agreement the other four report.
 
+Every number here is 0.2.0's, and it still describes the transfer path, which 0.2.1 did not touch.
+What 0.2.1 added sits above that path and is **not measured**: the staging pool, which lets
+same-shaped async calls overlap rather than serialise on the caller's stream, and `lend=True`,
+which drops the copy-out without a caller-owned buffer. Both are correctness-tested and neither
+has a number, because the method below needs a whole idle node and none was available.
+
 ## Method
 
 Every number is taken under `tools/exclusive.sh`, which refuses to start until the requested GPUs
