@@ -156,6 +156,7 @@ class UlyssesGroup:
         out: torch.Tensor | None = None,
         seq_splits: list[int] | None = None,
         head_splits: list[int] | None = None,
+        lend: bool = False,
     ) -> torch.Tensor | CompletedHandle:
         """``all_to_all_4d`` on this group's comm stream, returning immediately.
 
@@ -164,11 +165,26 @@ class UlyssesGroup:
         stream's completion event GPU-side, and the host does not block. A view op re-wraps without
         waiting.
 
+        ``lend=True`` gets ``out=``'s saving without a buffer of your own: the peers write a window
+        this group holds, the result IS that window, and there is no copy-out. The group rotates
+        through four windows per dtype, so at most four lent results may be alive at once -- a
+        fifth call raises rather than overwriting one, and the count is per rank, so every rank has
+        to drop its results at the same point in its own program. Mutually exclusive with ``out=``.
+        Like the rest of this method it is not differentiable.
+
         Wait on, or use, every result: a dropped one leaves its entry in torch's work registry, and
         ``out=`` is the hole, since reading your own ``out`` never touches the registry. On a
         libtorch with no ``c10d::register_work`` this returns a ``CompletedHandle`` instead --
         correct, no overlap, and a distinct type so it is visible.
         """
+        # Refused rather than silently ignored: both ask for the zero-copy path, and picking one
+        # for the caller would leave a lend=True that quietly did nothing.
+        if out is not None and lend:
+            raise ValueError(
+                "all_to_all_4d_async takes out= or lend=True, not both: each is a way of getting "
+                "the zero-copy path, one with a buffer you own and one with a window the group "
+                "lends. Drop whichever you did not mean."
+            )
         # Refused rather than silently wrong. AsyncCollectiveTensor is built with
         # _make_wrapper_subclass(..., requires_grad=elem.requires_grad), which makes the wrapper a
         # LEAF: autograd runs above the subclass and never sees the wrapped tensor's history, so
@@ -194,6 +210,7 @@ class UlyssesGroup:
                     head_splits,
                     caller.stream_id,
                     caller.device_index,
+                    lend,
                 )
             else:
                 torch.ops.fast_ulysses.all_to_all_4d_staged_out(

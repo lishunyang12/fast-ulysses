@@ -218,6 +218,36 @@ def main() -> None:
         print(f"OK ws={ws} 5 same-shaped async in flight, staging pool grew {growth}", flush=True)
     dist.barrier()
 
+    # --- lend=True: the group's own window is the result --------------------------------------
+    # The ROTATION is the property worth checking. Which window a call fills has to be the same on
+    # every rank -- the transfer addresses peers through that window's peer_ptrs and the barrier
+    # through its flag_ptrs -- so the slot is picked by a call counter, and four calls that each
+    # release their result before the next must walk four distinct windows and then repeat.
+    #
+    # An ordinary allocation cannot produce that pattern: the caching allocator hands back the block
+    # just freed, so a lend= that never reached the window pool gives five identical addresses
+    # rather than four distinct ones followed by the first again.
+    lent_ptrs = []
+    for i in range(5):
+        y = group.all_to_all_4d_async(x, mode=0, lend=True).wait()
+        check.equal(f"lend=True #{i}", y, want)
+        lent_ptrs.append(y.data_ptr())
+        del y
+    if len(set(lent_ptrs)) != 4 or lent_ptrs[4] != lent_ptrs[0]:
+        check.failed += 1
+        print(
+            f"FAIL rank={rank} lend=True: the calls filled {lent_ptrs}, expected four distinct "
+            "windows and then the first again -- the rotation did not hand out the buffers",
+            flush=True,
+        )
+    elif rank == 0:
+        print(f"OK ws={ws} lend=True rotates through 4 windows", flush=True)
+    dist.barrier()
+
+    # A lent window is grown when a call needs more than it holds, which is a collective keyed on
+    # window_numel -- the same on every rank. mode=1 on this shape is that call.
+    check.equal("lend=True mode=1", group.all_to_all_4d_async(want, mode=1, lend=True).wait(), x)
+
     # --- steady state: the window is allocated once and reused ------------------------------
     # Correct results do not show this: a window reallocated every round would produce them too.
     # The epoch does, because allocating a window zeroes its signal pad. Two barriers per call, so

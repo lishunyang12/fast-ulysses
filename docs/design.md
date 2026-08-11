@@ -68,6 +68,14 @@ Two internal windows exist per dtype, one per stream the collectives run on. A w
 single-buffered, so two calls may share one only when the stream orders them — and the sync call
 runs on the caller's stream while the async one runs on the comm stream.
 
+That ordering argument constrains every later path that allocates on demand: **what triggers the
+allocation has to be a quantity every rank shares.** A shape, a dtype, a count of calls — all of
+those are the same everywhere, because the SPMD contract says the sequence of calls is. A reference
+count is not, and neither is anything derived from one. `lend=True` is where this bites: the group
+lends one of four windows per dtype, and it picks by counting calls rather than by looking for a
+window nobody holds, precisely because the second reads local state. Reference counts still appear
+there, as the check that the rotation landed on a free window, never as the choice of which one.
+
 ## The barrier
 
 A one-block spin kernel, publishing with a release store and waiting with an acquire load, over a

@@ -92,7 +92,8 @@ Call prepare(const c10::intrusive_ptr<UlyssesGroup>&    group,
              const std::optional<std::vector<int64_t>>& seq_splits,
              const std::optional<std::vector<int64_t>>& head_splits,
              const std::optional<at::Tensor>&           out,
-             WindowRole                                 role)
+             WindowRole                                 role,
+             bool                                       lend)
 {
     Call call;
     // Here rather than deeper in: window() and make_output() also check, but the zero-copy path
@@ -135,6 +136,16 @@ Call prepare(const c10::intrusive_ptr<UlyssesGroup>&    group,
             call.win           = owned;
             call.out_is_window = true;
         }
+    }
+    else if (lend) {
+        // No `out`, but the caller accepts a lent window: the peers write it directly and the
+        // result IS that window, so there is no copy-out and the caller owns no buffer. Which
+        // window is a rotation the group drives, not a choice this call makes -- see lend_window().
+        const Window& lent = group->lend_window(call.x.scalar_type(), call.plan->window_numel);
+        call.win           = &lent;
+        call.out_is_window = true;
+        call.output =
+            lent.tensor.narrow(0, 0, c10::multiply_integers(call.plan->output_shape)).view(call.plan->output_shape);
     }
     else {
         call.output = at::empty(call.plan->output_shape, call.x.options());
@@ -218,9 +229,10 @@ at::Tensor run(const c10::intrusive_ptr<UlyssesGroup>&    group,
                const std::optional<std::vector<int64_t>>& head_splits,
                const std::optional<at::Tensor>&           out,
                WindowRole                                 role,
-               cudaStream_t                               stream)
+               cudaStream_t                               stream,
+               bool                                       lend)
 {
-    const Call call = prepare(group, input, mode, seq_splits, head_splits, out, role);
+    const Call call = prepare(group, input, mode, seq_splits, head_splits, out, role, lend);
     transfer_on_stream(group, call, stream);
     if (!call.out_is_window) {
         copy_out(call, stream, static_cast<int>(group->rank()));
@@ -246,8 +258,15 @@ at::Tensor all_to_all_4d(const c10::intrusive_ptr<UlyssesGroup>&    group,
 {
     require_cuda(input);
     const at::cuda::CUDAGuard guard(input.device());
-    return run(
-        group, input, mode, seq_splits, head_splits, std::nullopt, kSyncWindow, at::cuda::getCurrentCUDAStream());
+    return run(group,
+               input,
+               mode,
+               seq_splits,
+               head_splits,
+               std::nullopt,
+               kSyncWindow,
+               at::cuda::getCurrentCUDAStream(),
+               /*lend=*/false);
 }
 
 // Shape propagation for FakeTensor and AOTAutograd. CompositeExplicitAutograd already covers the
@@ -299,7 +318,15 @@ void all_to_all_4d_out(const c10::intrusive_ptr<UlyssesGroup>&    group,
 {
     require_cuda(input);
     const at::cuda::CUDAGuard guard(input.device());
-    run(group, input, mode, seq_splits, head_splits, out, kSyncWindow, at::cuda::getCurrentCUDAStream());
+    run(group,
+        input,
+        mode,
+        seq_splits,
+        head_splits,
+        out,
+        kSyncWindow,
+        at::cuda::getCurrentCUDAStream(),
+        /*lend=*/false);
 }
 
 // The out-variant's share of the shape rule. Without it a fake tensor reaches the real kernel and
@@ -341,7 +368,8 @@ at::Tensor run_staged(const c10::intrusive_ptr<UlyssesGroup>&    group,
                       const std::optional<std::vector<int64_t>>& head_splits,
                       const std::optional<at::Tensor>&           out,
                       int64_t                                    caller_stream_id,
-                      int64_t                                    caller_device_index)
+                      int64_t                                    caller_device_index,
+                      bool                                       lend)
 {
     // Both before stage(), unlike every other check, which prepare() runs. destroy() returns early
     // the second time, so a staging entry created after it is never freed and its event leaks with
@@ -364,7 +392,7 @@ at::Tensor run_staged(const c10::intrusive_ptr<UlyssesGroup>&    group,
     // doing so would launch that copy on the comm stream, which is exactly what this avoids.
     UlyssesGroup::Staging* slot = group->stage(input, caller, comm);
     const StagingRelease   release{group.get(), slot, comm};
-    return run(group, slot->tensor, mode, seq_splits, head_splits, out, kAsyncWindow, comm);
+    return run(group, slot->tensor, mode, seq_splits, head_splits, out, kAsyncWindow, comm, lend);
 }
 
 }  // namespace
@@ -375,9 +403,11 @@ at::Tensor all_to_all_4d_staged(const c10::intrusive_ptr<UlyssesGroup>&    group
                                 const std::optional<std::vector<int64_t>>& seq_splits,
                                 const std::optional<std::vector<int64_t>>& head_splits,
                                 int64_t                                    caller_stream_id,
-                                int64_t                                    caller_device_index)
+                                int64_t                                    caller_device_index,
+                                bool                                       lend)
 {
-    return run_staged(group, input, mode, seq_splits, head_splits, std::nullopt, caller_stream_id, caller_device_index);
+    return run_staged(
+        group, input, mode, seq_splits, head_splits, std::nullopt, caller_stream_id, caller_device_index, lend);
 }
 
 void all_to_all_4d_staged_out(const c10::intrusive_ptr<UlyssesGroup>&    group,
@@ -389,7 +419,7 @@ void all_to_all_4d_staged_out(const c10::intrusive_ptr<UlyssesGroup>&    group,
                               int64_t                                    caller_stream_id,
                               int64_t                                    caller_device_index)
 {
-    run_staged(group, input, mode, seq_splits, head_splits, out, caller_stream_id, caller_device_index);
+    run_staged(group, input, mode, seq_splits, head_splits, out, caller_stream_id, caller_device_index, /*lend=*/false);
 }
 
 // The staged pair REFUSES to be traced, the way empty_output does, rather than propagating a
@@ -411,7 +441,8 @@ at::Tensor all_to_all_4d_staged_meta(const c10::intrusive_ptr<UlyssesGroup>&,
                                      const std::optional<std::vector<int64_t>>&,
                                      const std::optional<std::vector<int64_t>>&,
                                      int64_t,
-                                     int64_t)
+                                     int64_t,
+                                     bool)
 {
     TORCH_CHECK(false,
                 "all_to_all_4d_async cannot be traced: it completes through a CUDA event bound to "
@@ -598,9 +629,9 @@ std::tuple<at::Tensor, std::vector<double>> all_to_all_4d_timed(const c10::intru
 {
     require_cuda(input);
     const at::cuda::CUDAGuard guard(input.device());
-    const Call                call   = prepare(group, input, mode, seq_splits, head_splits, std::nullopt, kSyncWindow);
-    const int                 rank   = static_cast<int>(group->rank());
-    cudaStream_t              stream = at::cuda::getCurrentCUDAStream();
+    const Call   call = prepare(group, input, mode, seq_splits, head_splits, std::nullopt, kSyncWindow, /*lend=*/false);
+    const int    rank = static_cast<int>(group->rank());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     // Default flags, not cudaEventDisableTiming: cudaEventElapsedTime below needs the timestamps.
     const Event marks[5];
@@ -707,7 +738,7 @@ TORCH_LIBRARY(fast_ulysses, m)
 
     m.def("all_to_all_4d_staged(__torch__.torch.classes.fast_ulysses.UlyssesGroup group, "
           "Tensor input, int mode, int[]? seq_splits, int[]? head_splits, "
-          "int caller_stream_id, int caller_device_index) -> Tensor");
+          "int caller_stream_id, int caller_device_index, bool lend=False) -> Tensor");
     m.impl("all_to_all_4d_staged", c10::DispatchKey::CompositeExplicitAutograd, &ulysses::all_to_all_4d_staged);
     m.impl("all_to_all_4d_staged", c10::DispatchKey::Meta, &ulysses::all_to_all_4d_staged_meta);
     refuse_batching("all_to_all_4d_staged");

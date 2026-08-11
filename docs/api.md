@@ -16,7 +16,8 @@ Violating these hangs the group. Nothing raises and nothing times out.
   sequence parallelism it does, because every rank runs the same graph — but it is a new way to
   hang, and the graph holds the group alive, so a graph replayed after `destroy()` raises.
 - **One buffer, one call at a time.** A call overwrites the buffer it writes into, so two
-  concurrent calls need two `empty_output()` buffers.
+  concurrent calls need two `empty_output()` buffers — or `all_to_all_4d_async(lend=True)`, which
+  keeps the buffers itself and rotates through them.
 
 ## `UlyssesGroup(process_group=None, device=None, *, require_nvlink=True)`
 
@@ -101,7 +102,7 @@ shape not the output's; `x` overlapping the window, or `out` partially overlappi
 
 `world_size` outside `[1, 8]` is refused by the constructor, so no call reaches it.
 
-## `all_to_all_4d_async(x, *, mode=0, out=None, seq_splits=None, head_splits=None)`
+## `all_to_all_4d_async(x, *, mode=0, out=None, seq_splits=None, head_splits=None, lend=False)`
 
 The same call on the group's high-priority comm stream, returning immediately.
 
@@ -119,7 +120,27 @@ CUDA event behind; torch prints a count of the survivors at exit. `out=` is the 
 your own `out` never touches the registry — read the returned wrapper.
 
 The input is staged into a persistent per-`(shape, dtype)` buffer on the caller's stream, so `x` is
-never retained cross-stream. That costs one device copy per call.
+never retained cross-stream. That costs one device copy per call. Buffers of one shape form a pool
+of **4**, so that many same-shaped calls can be in flight before one waits for another to retire.
+
+### `lend=True`
+
+`out=`'s saving without a buffer of your own: the peers write a window the group holds, the result
+**is** that window, and there is no copy-out. Mutually exclusive with `out=` — passing both raises.
+Not differentiable, like the rest of this call.
+
+The group keeps **4 windows per dtype and takes them in order**, one per call. Which window a call
+fills has to be the same on every rank, since the transfer addresses the peers through that window
+and the barrier through its signal pad; a rotation driven by the call count is the same everywhere,
+and anything read off local reference counts is not.
+
+So the bound is a rule, not a hint: **at most 4 lent results alive at once, and every rank must drop
+them at the same point in its own program.** A fifth live one raises. A rank that dropped a result
+its peers still hold does not raise — it fills a window they are not reading, which is the hang this
+page opens with.
+
+Use it when a result is consumed and released within the step that issued it, which is what a
+split q/k/v exchange does. Keep a result across steps and `empty_output()` with `out=` is the fit.
 
 On a libtorch with no `c10d::register_work` there is no registry to bind to, and this returns a
 `CompletedHandle` instead: same `.wait()`, correct results, no overlap. A distinct type, so it is

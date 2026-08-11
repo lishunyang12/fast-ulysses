@@ -86,6 +86,26 @@ public:
     /// @brief A window the caller owns, for the zero-copy path. COLLECTIVE.
     at::Tensor make_output(at::IntArrayRef shape, at::ScalarType dtype, int64_t numel);
 
+    /// @brief A window to LEND for this call's output: the peers write it, the result IS it, and
+    /// nothing is copied out. COLLECTIVE when it allocates.
+    ///
+    /// `out=` buys the same saving and hands the caller the lifetime with it -- one buffer per
+    /// concurrent call, and never read a result after reissuing that buffer's call. Here the group
+    /// keeps the buffers and rotates through a fixed set of them.
+    ///
+    /// THE SLOT IS CHOSEN BY A CALL COUNTER, not by looking for one that is free. Every rank has to
+    /// land on the same symmetric allocation -- the transfer addresses the peers through the chosen
+    /// window's peer_ptrs and the barrier through its flag_ptrs, so ranks that disagree write past
+    /// each other and wait on flags nobody sets. A rank's own reference counts are not a quantity
+    /// its peers share; the number of calls it has made is, because every rank issues the same
+    /// sequence. Both conditions below that allocate are keyed on that counter or on `numel`, which
+    /// is likewise the same everywhere.
+    ///
+    /// Reference counts are the CHECK rather than the choice: the slot the rotation lands on must
+    /// be one no live result still refers to, and this throws when it is not. Throwing rather than
+    /// falling back to a copy, since the fallback would be a local decision too.
+    const Window& lend_window(at::ScalarType dtype, int64_t numel);
+
     /// @brief The window `out` is, or nullptr when it is an ordinary tensor.
     const Window* window_of(const at::Tensor& out) const;
 
@@ -155,6 +175,18 @@ private:
     std::map<PlanKey, A2APlan>                           plans_;
     std::map<std::pair<int64_t, at::ScalarType>, Window> windows_;
     std::map<const void*, Window>                        owned_;  // handed to callers, by address
+
+    // Lent output windows, per dtype: a fixed rotation, so the same call picks the same slot on
+    // every rank. Four is a packed exchange split into q/k/v with one still in flight; a caller
+    // holding more lent results than this at once is refused rather than slowed down, because
+    // every way of slowing it down would be a decision this rank makes alone.
+    static constexpr size_t kLentSlots = 4;
+
+    struct LentPool {
+        std::vector<Window> slots;  // grown to kLentSlots, then rotated through
+        size_t              calls = 0;
+    };
+    std::map<at::ScalarType, LentPool> lent_;
 
     // Concurrent in-flight exchanges of one shape. Four covers a split q/k/v with room to spare;
     // past the bound a call waits for a slot rather than growing without limit, since every slot

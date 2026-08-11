@@ -322,6 +322,31 @@ def main() -> None:
         "the same shape after an inference_mode call",
         lambda: group.all_to_all_4d_async(good).wait(),
     )
+    # --- lend=True's bound ----------------------------------------------------------------------
+    # The rotation is fixed at four windows per dtype, so a fifth live result comes back to one a
+    # caller still holds. REFUSED rather than absorbed: every softer answer -- wait for it, copy out
+    # instead, allocate another -- is a decision this rank would make from its own reference counts,
+    # and a rank that took it while its peers did not would fill a different window than they
+    # addressed. Held in a list, since the check is that they are alive at the same time.
+    held = [group.all_to_all_4d_async(good, lend=True).wait() for _ in range(4)]
+    check.raises(
+        "a fifth live lent result",
+        "lent results may be alive at once",
+        lambda: group.all_to_all_4d_async(good, lend=True).wait(),
+    )
+    del held
+    check.accepts(
+        "lend=True again once the earlier results are dropped",
+        lambda: group.all_to_all_4d_async(good, lend=True).wait(),
+    )
+    # Both ask for the zero-copy path. Silently preferring one would leave a lend=True that did
+    # nothing, on the argument whose whole purpose is to avoid owning a buffer.
+    check.raises(
+        "out= together with lend=True",
+        "not both",
+        lambda: group.all_to_all_4d_async(good, out=group.empty_output(good), lend=True),
+    )
+
     check.accepts(
         "out= inside no_grad on a grad-requiring input",
         lambda: torch.no_grad()(

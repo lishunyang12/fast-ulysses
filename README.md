@@ -89,7 +89,7 @@ wrapper, no manual backward.
 | --- | --- |
 | `UlyssesGroup(process_group=None, device=None, *, require_nvlink=True)` | Collective. Refuses a group whose GPUs are not NVLink-joined. |
 | `group.all_to_all_4d(x, *, mode=0, out=None, seq_splits=None, head_splits=None)` | The collective. Returns a tensor the caller owns. |
-| `group.all_to_all_4d_async(x, *, ...)` | The same, on a comm stream, returning an `AsyncCollectiveTensor`. |
+| `group.all_to_all_4d_async(x, *, ...)` | The same, on a comm stream, returning an `AsyncCollectiveTensor`. `lend=True` drops the copy-out without a buffer of your own, bounded at 4 live results. |
 | `group.empty_output(x, *, mode=0, ...)` | A symmetric buffer to pass as `out=`, which removes the copy-out. `out=` gives up the gradient. |
 | `group.destroy()` | Release the windows. Collective. |
 | `fast-ulysses doctor` | Build, devices, NVLink matrix. |

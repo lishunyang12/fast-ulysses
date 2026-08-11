@@ -266,6 +266,41 @@ const Window& UlyssesGroup::window(WindowRole role, at::ScalarType dtype, int64_
     return windows_.emplace(key, allocate(numel, dtype)).first->second;
 }
 
+const Window& UlyssesGroup::lend_window(at::ScalarType dtype, int64_t numel)
+{
+    check_alive();
+    LentPool& pool = lent_[dtype];
+    // The reference this returns outlives the call's own frame, so growth must not move the slots.
+    // A no-op once the capacity is there, which is after the first kLentSlots calls.
+    pool.slots.reserve(kLentSlots);
+
+    // The counter, never a search for a free slot: see the header for why the choice has to be a
+    // quantity every rank shares. The pool fills before it rotates, so this branch runs exactly
+    // kLentSlots times per dtype, at the same calls on every rank.
+    const size_t idx = pool.calls++ % kLentSlots;
+    if (idx == pool.slots.size()) {
+        pool.slots.push_back(allocate(numel, dtype));
+        return pool.slots.back();
+    }
+
+    Window& slot = pool.slots[idx];
+    // The rotation says WHICH slot; the reference count says whether the caller is done with it.
+    // One holder means this pool is the only one left, the same test prune_owned() uses on owned_.
+    TORCH_CHECK(slot.tensor.storage().use_count() == 1,
+                "all_to_all_4d_async(lend=True) has rotated back to a window a live result still "
+                "refers to: at most ",
+                kLentSlots,
+                " lent results may be alive at once. Drop the older ones before issuing more "
+                "calls, or pass out= and own the buffer. Every rank has to drop them at the same "
+                "point in its own program -- a lent window is symmetric memory, and the rotation "
+                "is what keeps every rank on the same one.");
+    if (slot.numel < numel) {
+        slot = Window{};                // free before allocating, so the allocator can reuse the
+        slot = allocate(numel, dtype);  // segment -- the order window() takes, for the same reason
+    }
+    return slot;
+}
+
 at::Tensor UlyssesGroup::make_output(at::IntArrayRef shape, at::ScalarType dtype, int64_t numel)
 {
     check_alive();
@@ -438,6 +473,9 @@ void UlyssesGroup::destroy()
     staging_.clear();
     plans_.clear();
     windows_.clear();
+    // Lent windows behave like owned ones here, and like them a result the caller still holds stays
+    // alive through its own storage reference; dropping the pools releases only the rest.
+    lent_.clear();
     // Buffers the caller still holds stay alive through their own storage reference; dropping our
     // record here only releases the ones nobody kept.
     prune_owned();
