@@ -24,6 +24,13 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=1)
     parser.add_argument("--trials", type=int, default=20)
+    parser.add_argument(
+        "--report",
+        type=str,
+        default="",
+        metavar="PATH",
+        help="also write a Markdown report to PATH",
+    )
     return parser.parse_args()
 
 
@@ -57,6 +64,37 @@ def timed(fn, warmup: int, iters: int, trials: int, device: int) -> float:
             total_ms += elapsed.item()
         samples.append(total_ms / iters)
     return statistics.median(samples)
+
+
+def gbps(byte_count: float, milliseconds: float) -> float:
+    return byte_count / (milliseconds / 1000) / 1e9
+
+
+def write_report(path: str, metadata: list[str], rows: list[dict]) -> None:
+    lines = [
+        "# fast-ulysses benchmark report",
+        "",
+        *[f"- {item}" for item in metadata],
+        "",
+        "All bandwidths are decimal GB/s. `bus` counts only bytes sent to remote "
+        "ranks; `aggregate` is the sum across all ranks.",
+        "",
+        "| Shape | Dir | Raw NCCL ms | NCCL alg GB/s | NCCL bus GB/s | "
+        "NCCL aggregate GB/s | NCCL + layout ms | Layout GB/s | Fast ms | "
+        "Fast GB/s | Raw / fast | Layout / fast |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in rows:
+        lines.append(
+            f"| {row['shape']} | {row['direction']} | {row['raw_ms']:.3f} | "
+            f"{row['raw_alg_gbps']:.2f} | {row['raw_bus_gbps']:.2f} | "
+            f"{row['raw_aggregate_gbps']:.2f} | {row['layout_ms']:.3f} | "
+            f"{row['layout_gbps']:.2f} | {row['fast_ms']:.3f} | "
+            f"{row['fast_gbps']:.2f} | {row['raw_ms'] / row['fast_ms']:.2f}x | "
+            f"{row['layout_ms'] / row['fast_ms']:.2f}x |"
+        )
+    with open(path, "w", encoding="utf-8") as report:
+        report.write("\n".join(lines) + "\n")
 
 
 def nccl_forward(
@@ -109,6 +147,16 @@ def main():
         shapes = [(args.seq_len, args.num_heads, args.head_dim)]
 
     group = UlyssesGroup(device=local_rank)
+    metadata = [
+        f"world_size: {ws}",
+        "dtype: bfloat16",
+        f"backend: {group.backend}",
+        f"NCCL_P2P_LEVEL: {os.getenv('NCCL_P2P_LEVEL', '<unset>')}",
+        f"warmup: {args.warmup} calls/case",
+        f"measurement: {args.iters} call(s)/trial, {args.trials} trials, "
+        "slowest rank then median",
+    ]
+    report_rows = []
     if rank == 0:
         print(f"# world_size={ws} dtype=bfloat16 backend={group.backend}")
         print(f"# NCCL_P2P_LEVEL={os.getenv('NCCL_P2P_LEVEL', '<unset>')}")
@@ -117,9 +165,13 @@ def main():
             f"trials={args.trials} rank_reduce=max summary=median"
         )
         print(
-            f"{'shape':<18} {'dir':<4} {'raw ms':>9} {'layout ms':>10} "
-            f"{'fast ms':>9} {'vs raw':>9} {'vs layout':>11} "
-            f"{'fast GB/s':>11}"
+            "# GB/s = per-rank remote payload (NCCL bus bandwidth); "
+            "raw alg GB/s = GB/s * world_size / (world_size - 1)"
+        )
+        print(
+            f"{'shape':<18} {'dir':<4} {'raw ms':>8} {'raw GB/s':>9} "
+            f"{'layout ms':>9} {'layout GB/s':>11} {'fast ms':>8} "
+            f"{'fast GB/s':>9} {'vs raw':>8} {'vs layout':>10}"
         )
 
     for seq, heads, dim in shapes:
@@ -164,19 +216,41 @@ def main():
             name: timed(fn, args.warmup, args.iters, args.trials, local_rank)
             for name, fn in cases.items()
         }
-        remote_bytes = x.numel() * x.element_size() * (ws - 1) / ws
+        tensor_bytes = x.numel() * x.element_size()
+        remote_bytes = tensor_bytes * (ws - 1) / ws
         if rank == 0:
             label = f"{seq},{heads},{dim}"
             for direction in ("fwd", "rev"):
                 raw = results[f"raw_{direction}"]
                 layout = results[f"layout_{direction}"]
                 fast = results[f"fast_{direction}"]
-                gbps = remote_bytes / (fast / 1000) / 1e9
+                raw_bus_gbps = gbps(remote_bytes, raw)
+                layout_gbps = gbps(remote_bytes, layout)
+                fast_gbps = gbps(remote_bytes, fast)
                 print(
-                    f"{label:<18} {direction:<4} {raw:9.3f} {layout:10.3f} "
-                    f"{fast:9.3f} {raw / fast:8.2f}x "
-                    f"{layout / fast:10.2f}x {gbps:11.2f}"
+                    f"{label:<18} {direction:<4} {raw:8.3f} "
+                    f"{raw_bus_gbps:9.2f} {layout:9.3f} {layout_gbps:11.2f} "
+                    f"{fast:8.3f} {fast_gbps:9.2f} {raw / fast:7.2f}x "
+                    f"{layout / fast:9.2f}x"
                 )
+                report_rows.append(
+                    {
+                        "shape": label,
+                        "direction": direction,
+                        "raw_ms": raw,
+                        "raw_alg_gbps": gbps(tensor_bytes, raw),
+                        "raw_bus_gbps": raw_bus_gbps,
+                        "raw_aggregate_gbps": raw_bus_gbps * ws,
+                        "layout_ms": layout,
+                        "layout_gbps": layout_gbps,
+                        "fast_ms": fast,
+                        "fast_gbps": fast_gbps,
+                    }
+                )
+
+    if rank == 0 and args.report:
+        write_report(args.report, metadata, report_rows)
+        print(f"# wrote Markdown report: {args.report}")
 
     group.destroy()
     dist.destroy_process_group()
