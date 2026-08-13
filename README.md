@@ -42,17 +42,17 @@ synchronization so it never waits in a persistent GPU spin kernel.
 `benchmark.py` checks results against NCCL before timing. It reports:
 
 - `raw ms`: pre-packed NCCL `all_to_all_single`, communication only;
-- `layout ms`: NCCL pack + communication + unpack;
+- `layout ms`: preallocated NCCL pack + communication + unpack;
 - `fast ms`: direct P2P into the final layout;
 - `vs raw` and `vs layout`: baseline latency divided by fast latency.
 
-Every case runs untimed warmup iterations first. Timings use the slowest rank per trial and the
-median across trials.
+Every case runs untimed warmup iterations first. Ranks are aligned outside the timed region before
+each iteration. Each iteration records the slowest rank; the table is the median across trials.
 
 ```bash
 torchrun --standalone --nproc_per_node=8 benchmark.py \
-  --seq-len 37824 --num-heads 56 --head-dim 128 \
-  --warmup 10 --iters 20 --trials 5
+  --seq-len 37824 --num-heads 56 --head-dim 128
 ```
 
-`seq-len` is the global sequence length, not the per-rank length.
+`seq-len` is the global sequence length, not the per-rank length. The defaults are 10 warmup calls,
+one measured call per trial, and the median of 20 trials.

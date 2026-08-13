@@ -21,9 +21,9 @@ def parse_args():
     parser.add_argument("--num-heads", type=int, default=56)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--common-shapes", action="store_true")
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--iters", type=int, default=10)
-    parser.add_argument("--trials", type=int, default=5)
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--iters", type=int, default=1)
+    parser.add_argument("--trials", type=int, default=20)
     return parser.parse_args()
 
 
@@ -35,79 +35,64 @@ def parse_shape(text: str) -> tuple[int, int, int]:
 
 
 def timed(fn, warmup: int, iters: int, trials: int, device: int) -> float:
-    dist.barrier(device_ids=[device])
     for _ in range(warmup):
+        dist.barrier(device_ids=[device])
         fn()
-    torch.cuda.synchronize(device)
+        torch.cuda.synchronize(device)
     samples = []
     for _ in range(trials):
-        dist.barrier(device_ids=[device])
-        torch.cuda.synchronize(device)
-        start = time.perf_counter()
+        total_ms = 0.0
         for _ in range(iters):
+            dist.barrier(device_ids=[device])
+            torch.cuda.synchronize(device)
+            start = time.perf_counter()
             fn()
-        torch.cuda.synchronize(device)
-        elapsed = torch.tensor(
-            [(time.perf_counter() - start) * 1000 / iters],
-            dtype=torch.float64,
-            device=device,
-        )
-        dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
-        samples.append(elapsed.item())
+            torch.cuda.synchronize(device)
+            elapsed = torch.tensor(
+                [(time.perf_counter() - start) * 1000],
+                dtype=torch.float64,
+                device=device,
+            )
+            dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+            total_ms += elapsed.item()
+        samples.append(total_ms / iters)
     return statistics.median(samples)
 
 
-def pack_forward(x: torch.Tensor) -> torch.Tensor:
-    return x.permute(2, 0, 1, 3).contiguous().flatten()
-
-
-def unpack_forward(recv: torch.Tensor, shape: torch.Size, ws: int) -> torch.Tensor:
-    b, s_local, h_global, d = shape
+def nccl_forward(
+    x: torch.Tensor,
+    send: torch.Tensor,
+    recv: torch.Tensor,
+    output: torch.Tensor,
+    ws: int,
+) -> torch.Tensor:
+    b, s_local, h_global, d = x.shape
     h_local = h_global // ws
-    return (
-        recv.view(ws, h_local, b, s_local, d)
-        .permute(2, 0, 3, 1, 4)
-        .contiguous()
-        .view(b, s_local * ws, h_local, d)
-    )
-
-
-def nccl_forward(x: torch.Tensor, recv: torch.Tensor, ws: int) -> torch.Tensor:
-    send = pack_forward(x)
+    send.view(h_global, b, s_local, d).copy_(x.permute(2, 0, 1, 3))
     dist.all_to_all_single(recv, send)
-    return unpack_forward(recv, x.shape, ws)
+    output.view(b, ws, s_local, h_local, d).copy_(
+        recv.view(ws, h_local, b, s_local, d).permute(2, 0, 3, 1, 4)
+    )
+    return output
 
 
-def pack_reverse(x: torch.Tensor, ws: int) -> torch.Tensor:
+def nccl_reverse(
+    x: torch.Tensor,
+    send: torch.Tensor,
+    recv: torch.Tensor,
+    output: torch.Tensor,
+    ws: int,
+) -> torch.Tensor:
     b, s_global, h_local, d = x.shape
     s_local = s_global // ws
-    h_global = h_local * ws
-    return (
-        x.permute(2, 0, 1, 3)
-        .contiguous()
-        .view(h_local, ws, s_local, b, d)
-        .transpose(0, 1)
-        .contiguous()
-        .view(h_global, s_local, b, d)
-        .flatten()
+    send.view(ws, b, s_local, h_local, d).copy_(
+        x.view(b, ws, s_local, h_local, d).permute(1, 0, 2, 3, 4)
     )
-
-
-def unpack_reverse(recv: torch.Tensor, shape: torch.Size, ws: int) -> torch.Tensor:
-    b, s_global, h_local, d = shape
-    s_local = s_global // ws
-    h_global = h_local * ws
-    return recv.view(h_global, s_local, b, d).transpose(0, 2).contiguous()
-
-
-def nccl_reverse(x: torch.Tensor, recv: torch.Tensor, ws: int) -> torch.Tensor:
-    send = pack_reverse(x, ws)
     dist.all_to_all_single(recv, send)
-    return unpack_reverse(recv, x.shape, ws)
-
-
-def keep_result(holder: list[torch.Tensor | None], fn, *args) -> None:
-    holder[0] = fn(*args)
+    output.view(b, s_local, ws, h_local, d).copy_(
+        recv.view(ws, b, s_local, h_local, d).permute(1, 2, 0, 3, 4)
+    )
+    return output
 
 
 def main():
@@ -147,33 +132,32 @@ def main():
             dtype=torch.bfloat16,
             device=local_rank,
         )
-        recv_fwd = torch.empty(x.numel(), dtype=x.dtype, device=x.device)
-        y_ref = nccl_forward(x, recv_fwd, ws)
+        send_fwd = torch.empty(x.numel(), dtype=x.dtype, device=x.device)
+        recv_fwd = torch.empty_like(send_fwd)
+        y_ref = torch.empty((1, seq, heads // ws, dim), dtype=x.dtype, device=x.device)
+        nccl_forward(x, send_fwd, recv_fwd, y_ref, ws)
         out_fwd = group.allocate_output(x, mode=0)
         group.exchange(x, out_fwd, mode=0)
         if not torch.equal(out_fwd, y_ref):
             raise RuntimeError(f"rank {rank}: forward mismatch for {seq, heads, dim}")
 
-        recv_rev = torch.empty_like(recv_fwd)
-        x_ref = nccl_reverse(y_ref, recv_rev, ws)
+        send_rev = torch.empty_like(send_fwd)
+        recv_rev = torch.empty_like(send_fwd)
+        x_ref = torch.empty_like(x)
+        nccl_reverse(y_ref, send_rev, recv_rev, x_ref, ws)
         out_rev = group.allocate_output(out_fwd, mode=1)
         group.exchange(out_fwd, out_rev, mode=1)
         if not torch.equal(out_rev, x) or not torch.equal(x_ref, x):
             raise RuntimeError(f"rank {rank}: reverse mismatch for {seq, heads, dim}")
 
-        raw_send_fwd = pack_forward(x)
         raw_recv_fwd = torch.empty_like(recv_fwd)
-        raw_send_rev = pack_reverse(y_ref, ws)
         raw_recv_rev = torch.empty_like(recv_rev)
-        holder: list[torch.Tensor | None] = [None]
         cases = {
-            "raw_fwd": partial(dist.all_to_all_single, raw_recv_fwd, raw_send_fwd),
-            "layout_fwd": partial(keep_result, holder, nccl_forward, x, recv_fwd, ws),
+            "raw_fwd": partial(dist.all_to_all_single, raw_recv_fwd, send_fwd),
+            "layout_fwd": partial(nccl_forward, x, send_fwd, recv_fwd, y_ref, ws),
             "fast_fwd": partial(group.exchange, x, out_fwd, mode=0),
-            "raw_rev": partial(dist.all_to_all_single, raw_recv_rev, raw_send_rev),
-            "layout_rev": partial(
-                keep_result, holder, nccl_reverse, y_ref, recv_rev, ws
-            ),
+            "raw_rev": partial(dist.all_to_all_single, raw_recv_rev, send_rev),
+            "layout_rev": partial(nccl_reverse, y_ref, send_rev, recv_rev, x_ref, ws),
             "fast_rev": partial(group.exchange, out_fwd, out_rev, mode=1),
         }
         results = {
