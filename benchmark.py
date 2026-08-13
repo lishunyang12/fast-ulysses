@@ -35,6 +35,7 @@ def parse_shape(text: str) -> tuple[int, int, int]:
 
 
 def timed(fn, warmup: int, iters: int, trials: int, device: int) -> float:
+    dist.barrier(device_ids=[device])
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize(device)
@@ -56,11 +57,13 @@ def timed(fn, warmup: int, iters: int, trials: int, device: int) -> float:
     return statistics.median(samples)
 
 
-def nccl_forward(x: torch.Tensor, recv: torch.Tensor, ws: int) -> torch.Tensor:
-    b, s_local, h_global, d = x.shape
+def pack_forward(x: torch.Tensor) -> torch.Tensor:
+    return x.permute(2, 0, 1, 3).contiguous().flatten()
+
+
+def unpack_forward(recv: torch.Tensor, shape: torch.Size, ws: int) -> torch.Tensor:
+    b, s_local, h_global, d = shape
     h_local = h_global // ws
-    send = x.permute(2, 0, 1, 3).contiguous().flatten()
-    dist.all_to_all_single(recv, send)
     return (
         recv.view(ws, h_local, b, s_local, d)
         .permute(2, 0, 3, 1, 4)
@@ -69,11 +72,17 @@ def nccl_forward(x: torch.Tensor, recv: torch.Tensor, ws: int) -> torch.Tensor:
     )
 
 
-def nccl_reverse(x: torch.Tensor, recv: torch.Tensor, ws: int) -> torch.Tensor:
+def nccl_forward(x: torch.Tensor, recv: torch.Tensor, ws: int) -> torch.Tensor:
+    send = pack_forward(x)
+    dist.all_to_all_single(recv, send)
+    return unpack_forward(recv, x.shape, ws)
+
+
+def pack_reverse(x: torch.Tensor, ws: int) -> torch.Tensor:
     b, s_global, h_local, d = x.shape
     s_local = s_global // ws
     h_global = h_local * ws
-    send = (
+    return (
         x.permute(2, 0, 1, 3)
         .contiguous()
         .view(h_local, ws, s_local, b, d)
@@ -82,8 +91,19 @@ def nccl_reverse(x: torch.Tensor, recv: torch.Tensor, ws: int) -> torch.Tensor:
         .view(h_global, s_local, b, d)
         .flatten()
     )
-    dist.all_to_all_single(recv, send)
+
+
+def unpack_reverse(recv: torch.Tensor, shape: torch.Size, ws: int) -> torch.Tensor:
+    b, s_global, h_local, d = shape
+    s_local = s_global // ws
+    h_global = h_local * ws
     return recv.view(h_global, s_local, b, d).transpose(0, 2).contiguous()
+
+
+def nccl_reverse(x: torch.Tensor, recv: torch.Tensor, ws: int) -> torch.Tensor:
+    send = pack_reverse(x, ws)
+    dist.all_to_all_single(recv, send)
+    return unpack_reverse(recv, x.shape, ws)
 
 
 def keep_result(holder: list[torch.Tensor | None], fn, *args) -> None:
@@ -107,7 +127,15 @@ def main():
     if rank == 0:
         print(f"# world_size={ws} dtype=bfloat16 backend={group.backend}")
         print(f"# NCCL_P2P_LEVEL={os.getenv('NCCL_P2P_LEVEL', '<unset>')}")
-        print(f"{'shape':<20} {'case':<12} {'ms':>10} {'remote GB/s':>14} {'vs NCCL':>10}")
+        print(
+            f"# warmup={args.warmup}/case iters={args.iters}/trial "
+            f"trials={args.trials} rank_reduce=max summary=median"
+        )
+        print(
+            f"{'shape':<18} {'dir':<4} {'raw ms':>9} {'layout ms':>10} "
+            f"{'fast ms':>9} {'vs raw':>9} {'vs layout':>11} "
+            f"{'fast GB/s':>11}"
+        )
 
     for seq, heads, dim in shapes:
         if seq % ws or heads % ws:
@@ -133,14 +161,19 @@ def main():
         if not torch.equal(out_rev, x) or not torch.equal(x_ref, x):
             raise RuntimeError(f"rank {rank}: reverse mismatch for {seq, heads, dim}")
 
-        raw_send = torch.empty_like(recv_fwd)
-        raw_recv = torch.empty_like(recv_fwd)
+        raw_send_fwd = pack_forward(x)
+        raw_recv_fwd = torch.empty_like(recv_fwd)
+        raw_send_rev = pack_reverse(y_ref, ws)
+        raw_recv_rev = torch.empty_like(recv_rev)
         holder: list[torch.Tensor | None] = [None]
         cases = {
-            "nccl_raw": partial(dist.all_to_all_single, raw_recv, raw_send),
-            "nccl_fwd": partial(keep_result, holder, nccl_forward, x, recv_fwd, ws),
+            "raw_fwd": partial(dist.all_to_all_single, raw_recv_fwd, raw_send_fwd),
+            "layout_fwd": partial(keep_result, holder, nccl_forward, x, recv_fwd, ws),
             "fast_fwd": partial(group.exchange, x, out_fwd, mode=0),
-            "nccl_rev": partial(keep_result, holder, nccl_reverse, y_ref, recv_rev, ws),
+            "raw_rev": partial(dist.all_to_all_single, raw_recv_rev, raw_send_rev),
+            "layout_rev": partial(
+                keep_result, holder, nccl_reverse, y_ref, recv_rev, ws
+            ),
             "fast_rev": partial(group.exchange, out_fwd, out_rev, mode=1),
         }
         results = {
@@ -150,12 +183,16 @@ def main():
         remote_bytes = x.numel() * x.element_size() * (ws - 1) / ws
         if rank == 0:
             label = f"{seq},{heads},{dim}"
-            for name, ms in results.items():
-                gbps = remote_bytes / (ms / 1000) / 1e9
-                base = results["nccl_fwd" if "fwd" in name else "nccl_rev"]
-                ratio = base / ms if name != "nccl_raw" else float("nan")
-                shown = "-" if name == "nccl_raw" else f"{ratio:.2f}x"
-                print(f"{label:<20} {name:<12} {ms:10.3f} {gbps:14.2f} {shown:>10}")
+            for direction in ("fwd", "rev"):
+                raw = results[f"raw_{direction}"]
+                layout = results[f"layout_{direction}"]
+                fast = results[f"fast_{direction}"]
+                gbps = remote_bytes / (fast / 1000) / 1e9
+                print(
+                    f"{label:<18} {direction:<4} {raw:9.3f} {layout:10.3f} "
+                    f"{fast:9.3f} {raw / fast:8.2f}x "
+                    f"{layout / fast:10.2f}x {gbps:11.2f}"
+                )
 
     group.destroy()
     dist.destroy_process_group()

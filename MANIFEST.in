@@ -1,4 +1,0 @@
-include LICENSE VERSION CMakeLists.txt
-graft include
-graft src
-global-exclude __pycache__ *.so *.o _build_meta.py
