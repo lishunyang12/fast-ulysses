@@ -46,16 +46,17 @@ void barrier(cudaStream_t stream,
     FU_CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_all_to_all(const void* input,
-                       const std::vector<uint64_t>& peers,
-                       int mode,
-                       int64_t batch,
-                       int64_t seq,
-                       int64_t heads,
-                       int64_t dim,
-                       int64_t element_size,
-                       int rank,
-                       cudaStream_t stream)
+static void launch_impl(const void* input,
+                        const std::vector<uint64_t>& peers,
+                        int mode,
+                        int64_t batch,
+                        int64_t seq,
+                        int64_t heads,
+                        int64_t dim,
+                        int64_t element_size,
+                        int rank,
+                        cudaStream_t stream,
+                        bool local_only)
 {
     const int world_size = peers.size();
     const auto* source = static_cast<const uint8_t*>(input);
@@ -89,8 +90,39 @@ void launch_all_to_all(const void* input,
         }
     };
 
-    for (int step = 1; step < world_size; ++step) copy(rank ^ step);
+    const int end = local_only ? 4 : world_size;
+    for (int step = 1; step < end; ++step) copy(rank ^ step);
     copy(rank);
+}
+
+void launch_all_to_all(const void* input,
+                       const std::vector<uint64_t>& peers,
+                       int mode,
+                       int64_t batch,
+                       int64_t seq,
+                       int64_t heads,
+                       int64_t dim,
+                       int64_t element_size,
+                       int rank,
+                       cudaStream_t stream)
+{
+    launch_impl(input, peers, mode, batch, seq, heads, dim, element_size, rank, stream,
+                false);
+}
+
+void launch_local_all_to_all(const void* input,
+                             const std::vector<uint64_t>& peers,
+                             int mode,
+                             int64_t batch,
+                             int64_t seq,
+                             int64_t heads,
+                             int64_t dim,
+                             int64_t element_size,
+                             int rank,
+                             cudaStream_t stream)
+{
+    launch_impl(input, peers, mode, batch, seq, heads, dim, element_size, rank, stream,
+                true);
 }
 
 }  // namespace ulysses

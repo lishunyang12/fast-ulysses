@@ -1,5 +1,7 @@
 #pragma once
 
+#include "rdma.h"
+
 #include <ATen/ATen.h>
 #include <c10/util/Exception.h>
 #include <cuda_runtime.h>
@@ -31,6 +33,7 @@ struct Buffer {
     std::vector<int64_t> shape;
     at::ScalarType dtype = at::kBFloat16;
     uint64_t epoch = 0;
+    std::unique_ptr<RdmaBuffer> rdma;
 };
 
 class UlyssesGroup final : public torch::CustomClassHolder {
@@ -47,7 +50,13 @@ public:
                   at::Tensor output,
                   int64_t mode,
                   int64_t stream);
-    std::string backend() const { return device_barrier_ ? "device" : "pcie"; }
+    std::string backend() const;
+    std::vector<int64_t> connection_info() const;
+    void connect(const std::vector<std::vector<int64_t>>& peers);
+    std::vector<int64_t> buffer_info(at::Tensor output) const;
+    void connect_buffer(at::Tensor output,
+                        const std::vector<std::vector<int64_t>>& peers);
+    void flush() const;
     void destroy();
 
 private:
@@ -60,6 +69,7 @@ private:
     int device_;
     bool device_barrier_;
     bool destroyed_ = false;
+    std::unique_ptr<RdmaTransport> rdma_;
     std::vector<std::unique_ptr<Buffer>> buffers_;
     std::map<const void*, Buffer*> outputs_;
 };
@@ -74,6 +84,17 @@ void launch_all_to_all(const void* input,
                        int64_t element_size,
                        int rank,
                        cudaStream_t stream);
+
+void launch_local_all_to_all(const void* input,
+                             const std::vector<uint64_t>& peers,
+                             int mode,
+                             int64_t batch,
+                             int64_t seq,
+                             int64_t heads,
+                             int64_t dim,
+                             int64_t element_size,
+                             int rank,
+                             cudaStream_t stream);
 
 void barrier(cudaStream_t stream,
              const std::vector<uint64_t>& flags,

@@ -1,12 +1,13 @@
 # fast-ulysses
 
-Minimal equal-split Ulysses all-to-all using PyTorch symmetric memory and direct CUDA peer writes.
+Minimal equal-split Ulysses all-to-all with no layout, pack, unpack, or staging tensors.
 
 Supported:
 
 - one rank per GPU, with 1, 2, 4, or 8 GPUs;
 - contiguous `[B, S, H, D]` FP16/BF16 tensors;
 - equal splits and inference only;
+- batch size 1 on the 8-GPU mlx5 path;
 - forward `[B, S_local, H_global, D] -> [B, S_global, H_local, D]`;
 - reverse `[B, S_global, H_local, D] -> [B, S_local, H_global, D]`.
 
@@ -21,6 +22,7 @@ FAST_ULYSSES_CUDA_ARCH=100 pip install -e . --no-build-isolation
 ```
 
 The architecture is detected from the current GPU when `FAST_ULYSSES_CUDA_ARCH` is not set.
+The build also links the system `libibverbs` and `libmlx5` libraries.
 
 ## Use
 
@@ -33,9 +35,16 @@ group.exchange(x, output, mode=0)
 group.destroy()
 ```
 
-On GPUs with native peer atomics, barriers stay on the selected CUDA stream. On PCIe systems the
-payload is still direct P2P, but the wrapper uses blocking process-group barriers and stream
-synchronization so it never waits in a persistent GPU spin kernel.
+On the supported 8-GPU PCIe host, same-socket transfers use CUDA IPC pointers. Cross-socket
+transfers use mlx5 interleaved MKeys: the NIC gathers or scatters the strided `[S,H,D]` slices
+directly, so the application tensor layout never changes. The closest NIC is selected from sysfs.
+
+Set `FAST_ULYSSES_DISABLE_RDMA=1` to use CUDA P2P only. To override NIC discovery, set all eight
+rank-local devices explicitly, for example:
+
+```bash
+export FAST_ULYSSES_NICS=mlx5_2,mlx5_3,mlx5_0,mlx5_1,mlx5_6,mlx5_7,mlx5_4,mlx5_5
+```
 
 ## Benchmark
 
