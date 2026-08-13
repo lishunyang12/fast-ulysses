@@ -1,157 +1,71 @@
-// Contracts and layout: include/fast_ulysses/group.hpp.
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
-#include <c10/util/irange.h>
 #include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
 
 #include <fast_ulysses/common.hpp>
 #include <fast_ulysses/group.hpp>
+#include <fast_ulysses/transfer.hpp>
+
+#include <set>
 
 namespace ulysses {
+namespace symm = c10d::symmetric_memory;
 
 namespace {
 
-namespace symm = c10d::symmetric_memory;
-
-// The handshake needs uint64 flags[ws] followed by uint64 epoch. It lives in the LAST slots of the
-// allocation's signal pad, because torch's own SymmetricMemory::barrier() -- which window setup
-// calls -- uses channels counted from the front, and the two must not overlap.
-int64_t flag_slots(int world_size)
+int64_t flag_offset(int world_size)
 {
-    return world_size + 1;
+    const int64_t slots = static_cast<int64_t>(symm::get_signal_pad_size()) / 8;
+    TORCH_CHECK(slots >= world_size + 8,
+                "symmetric-memory signal pad is too small for ", world_size,
+                " flags");
+    return slots - world_size;
 }
 
-int64_t flag_offset_slots(int world_size)
+bool all_pairs_support(const std::vector<int64_t>& devices, bool atomics)
 {
-    const int64_t pad_slots = static_cast<int64_t>(symm::get_signal_pad_size()) / 8;
-    TORCH_CHECK(pad_slots >= flag_slots(world_size) + 8,
-                "the symmetric-memory signal pad holds ",
-                pad_slots,
-                " uint64 slots, too few for a ",
-                world_size,
-                "-rank handshake plus torch's own channels. Raise it with "
-                "torch.distributed._symmetric_memory.set_signal_pad_size() before any allocation.");
-    return pad_slots - flag_slots(world_size);
-}
-
-// Validation and dims for the 4D a2a. Everything checked here is part of the plan cache key, so a
-// cache hit cannot skip a check that would have failed: the same values already passed it. Checks
-// that depend on the tensor rather than its shape (device, contiguity, aliasing) stay per-call.
-//
-// The plan treats uneven as the general case, so the only decision here is what the splits ARE:
-// the caller's, or the even ones the shape implies.
-A2ADims make_dims(at::IntArrayRef                            sizes,
-                  at::ScalarType                             dtype,
-                  int64_t                                    mode,
-                  int                                        ws,
-                  int                                        rank,
-                  const std::optional<std::vector<int64_t>>& seq_splits,
-                  const std::optional<std::vector<int64_t>>& head_splits)
-{
-    TORCH_CHECK(sizes.size() == 4, "input must be 4D, got ", sizes.size(), " dims");
-    // Listed, not opened up. Nothing below this line is dtype-specific -- build_plan takes an
-    // elem_size, the transport copies bytes, the window map and the plan key both carry the dtype,
-    // and empty_strided_p2p takes a plain ScalarType -- so the set is a decision, not a constraint.
-    // Leaving the check off entirely would admit kBool, the complex types and the quantized ones,
-    // which nothing here has reasoned about.
-    TORCH_CHECK(dtype == at::kHalf || dtype == at::kBFloat16 || dtype == at::kFloat || dtype == at::kFloat8_e4m3fn
-                    || dtype == at::kFloat8_e5m2 || dtype == at::kChar || dtype == at::kByte,
-                "dtype must be float16, bfloat16, float32, float8_e4m3fn, float8_e5m2, int8 or uint8, got ",
-                dtype);
-    const int64_t x1   = sizes[1];
-    const int64_t x2   = sizes[2];
-    const int64_t d    = sizes[3];
-    const int64_t elem = static_cast<int64_t>(c10::elementSize(dtype));
-    // One check covers the whole plan: every byte quantity build_plan emits -- src_offset,
-    // dst_offset, width, both pitches, the batch strides -- is a multiple of d * elem. Note the
-    // rule TIGHTENS as the element shrinks: d % 8 at fp16, d % 4 at fp32, d % 16 at fp8 and int8.
-    TORCH_CHECK(
-        (d * elem) % 16 == 0, "the head dim must be 16-byte aligned: d=", d, " x ", elem, " B is ", d * elem, " B");
-    TORCH_CHECK(mode == 0 || mode == 1, "mode must be 0 or 1, got ", mode);
-
-    A2ADims dims;
-    dims.b          = sizes[0];
-    dims.d          = d;
-    dims.rank       = rank;
-    dims.world_size = ws;
-
-    if (seq_splits.has_value() || head_splits.has_value()) {
-        // One without the other has no meaning: the plan needs the WHOLE group's geometry, and the
-        // missing half cannot be inferred from a shape that is itself already sharded.
-        TORCH_CHECK(seq_splits.has_value() && head_splits.has_value(),
-                    "pass both seq_splits and head_splits, or neither");
-        dims.seq_splits  = *seq_splits;
-        dims.head_splits = *head_splits;
-        dims.validate();  // length and sign, before indexing by rank below
-        // Cross-check against the tensor handed in, so a caller that mis-shards gets an error here
-        // instead of a silently corrupt result.
-        const int64_t expect_x1 = (mode == 0) ? dims.seq_splits[rank] : dims.seq_total();
-        const int64_t expect_x2 = (mode == 0) ? dims.head_total() : dims.head_splits[rank];
-        TORCH_CHECK(x1 == expect_x1 && x2 == expect_x2,
-                    "input is [",
-                    dims.b,
-                    ", ",
-                    x1,
-                    ", ",
-                    x2,
-                    ", ",
-                    d,
-                    "] but the splits imply [",
-                    dims.b,
-                    ", ",
-                    expect_x1,
-                    ", ",
-                    expect_x2,
-                    ", ",
-                    d,
-                    "]");
-        return dims;
+    for (int64_t src : devices) {
+        for (int64_t dst : devices) {
+            if (src == dst) continue;
+            int value = 0;
+            if (atomics) {
+                ULYSSES_CUDA_CHECK(cudaDeviceGetP2PAttribute(
+                    &value, cudaDevP2PAttrNativeAtomicSupported,
+                    static_cast<int>(src), static_cast<int>(dst)));
+            } else {
+                ULYSSES_CUDA_CHECK(cudaDeviceCanAccessPeer(
+                    &value, static_cast<int>(src), static_cast<int>(dst)));
+            }
+            if (!value) return false;
+        }
     }
-
-    // No splits: the even special case, which the shape alone determines only if the scattered
-    // axis divides. The other axis is already sharded on entry, so it never has to.
-    if (mode == 0) {
-        TORCH_CHECK(x2 % ws == 0,
-                    "mode 0 scatters the head axis, so n_global (",
-                    x2,
-                    ") must divide world_size (",
-                    ws,
-                    ") -- or pass seq_splits and head_splits");
-        dims.seq_splits.assign(ws, x1);
-        dims.head_splits.assign(ws, x2 / ws);
-    }
-    else {
-        TORCH_CHECK(x1 % ws == 0,
-                    "mode 1 scatters the sequence axis, so s_global (",
-                    x1,
-                    ") must divide world_size (",
-                    ws,
-                    ") -- or pass seq_splits and head_splits");
-        dims.seq_splits.assign(ws, x1 / ws);
-        dims.head_splits.assign(ws, x2);
-    }
-    return dims;
+    return true;
 }
 
 }  // namespace
 
-bool UlyssesGroup::PlanKey::operator<(const PlanKey& o) const
-{
-    return std::tie(sizes, seq, head, mode, dtype) < std::tie(o.sizes, o.seq, o.head, o.mode, o.dtype);
-}
-
-UlyssesGroup::UlyssesGroup(std::string group_name, int64_t rank, int64_t world_size, int64_t device_index):
-    group_name_(std::move(group_name)),
-    rank_(static_cast<int>(rank)),
-    world_size_(static_cast<int>(world_size)),
-    device_index_(static_cast<int>(device_index))
+UlyssesGroup::UlyssesGroup(std::string group_name,
+                           int64_t rank,
+                           int64_t world_size,
+                           int64_t device_index,
+                           std::vector<int64_t> devices)
+    : group_name_(std::move(group_name)),
+      rank_(static_cast<int>(rank)),
+      world_size_(static_cast<int>(world_size)),
+      device_index_(static_cast<int>(device_index))
 {
     TORCH_CHECK(world_size_ >= 1 && world_size_ <= 8,
-                "world_size must be in [1, 8] -- fast-ulysses is single-node -- got ",
-                world_size_);
-    TORCH_CHECK(rank_ >= 0 && rank_ < world_size_, "rank ", rank_, " out of range for world_size ", world_size_);
+                "world_size must be in [1, 8]");
+    TORCH_CHECK(rank_ >= 0 && rank_ < world_size_, "rank is out of range");
+    TORCH_CHECK(static_cast<int>(devices.size()) == world_size_,
+                "device list must contain one entry per rank");
+    TORCH_CHECK(static_cast<int>(std::set<int64_t>(devices.begin(), devices.end()).size()) ==
+                    world_size_,
+                "one rank per GPU is required");
+    TORCH_CHECK(devices[rank_] == device_index_,
+                "rank device does not match the gathered device list");
+    TORCH_CHECK(all_pairs_support(devices, false),
+                "every GPU pair must support CUDA peer access");
+    device_barrier_ = all_pairs_support(devices, true);
 }
 
 UlyssesGroup::~UlyssesGroup()
@@ -159,326 +73,111 @@ UlyssesGroup::~UlyssesGroup()
     destroy();
 }
 
-void UlyssesGroup::check_alive() const
+void UlyssesGroup::validate_input(const at::Tensor& input, int64_t mode) const
 {
-    TORCH_CHECK(!destroyed_, "this UlyssesGroup has been destroyed");
+    TORCH_CHECK(!destroyed_, "UlyssesGroup has been destroyed");
+    TORCH_CHECK(mode == 0 || mode == 1, "mode must be 0 or 1");
+    TORCH_CHECK(input.is_cuda(), "input must be CUDA");
+    TORCH_CHECK(input.get_device() == device_index_, "input is on the wrong GPU");
+    TORCH_CHECK(input.dim() == 4, "input must be [B, S, H, D]");
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(input.scalar_type() == at::kHalf ||
+                    input.scalar_type() == at::kBFloat16,
+                "input dtype must be float16 or bfloat16");
+    TORCH_CHECK(!input.requires_grad(), "fast-ulysses minimal is inference-only");
+    for (int64_t size : input.sizes()) {
+        TORCH_CHECK(size > 0, "all input dimensions must be positive");
+    }
+    const int64_t split_axis = mode == 0 ? input.size(2) : input.size(1);
+    TORCH_CHECK(split_axis % world_size_ == 0,
+                "the scattered axis must divide world_size");
 }
 
-const A2APlan& UlyssesGroup::plan(at::IntArrayRef                            sizes,
-                                  int64_t                                    mode,
-                                  at::ScalarType                             dtype,
-                                  const std::optional<std::vector<int64_t>>& seq_splits,
-                                  const std::optional<std::vector<int64_t>>& head_splits)
+std::vector<int64_t> UlyssesGroup::output_shape(const at::Tensor& input,
+                                                 int64_t mode) const
 {
-    PlanKey key;
-    key.sizes = sizes.vec();
-    key.mode  = mode;
-    key.dtype = dtype;
-    // Kept optional, so "no splits" and "empty splits" are distinct keys. Collapsing them would
-    // let an even-split call warm the cache for a later empty-split one, which make_dims rejects.
-    key.seq  = seq_splits;
-    key.head = head_splits;
-
-    auto it = plans_.find(key);
-    if (it != plans_.end()) {
-        return it->second;
-    }
-    // A caller whose shapes are data-dependent would otherwise grow this without bound. Dropping
-    // everything costs one rebuild per live shape, which is microseconds.
-    if (plans_.size() >= 512) {
-        plans_.clear();
-    }
-    const A2ADims dims = make_dims(sizes, dtype, mode, world_size_, rank_, seq_splits, head_splits);
-    return plans_
-        .emplace(std::move(key),
-                 build_plan(dims, static_cast<int>(mode), static_cast<int64_t>(c10::elementSize(dtype))))
-        .first->second;
+    validate_input(input, mode);
+    const int64_t b = input.size(0);
+    const int64_t s = input.size(1);
+    const int64_t h = input.size(2);
+    const int64_t d = input.size(3);
+    if (mode == 0) return {b, s * world_size_, h / world_size_, d};
+    return {b, s / world_size_, h * world_size_, d};
 }
 
-void UlyssesGroup::prune_owned()
+at::Tensor UlyssesGroup::allocate_output(const at::Tensor& input, int64_t mode)
 {
-    // The caller's buffer is a view over the window's storage, so a use count of one means we are
-    // the only holder left and the allocation can go back to the symmetric allocator.
-    for (auto it = owned_.begin(); it != owned_.end();) {
-        it = (it->second.tensor.storage().use_count() == 1) ? owned_.erase(it) : std::next(it);
-    }
-}
-
-Window UlyssesGroup::allocate(int64_t numel, at::ScalarType dtype)
-{
-    // Every rank computes the same window size (it is the max over all ranks), so this throws on
-    // all of them together and cannot leave anyone waiting. A zero-sized symmetric allocation has
-    // a null data_ptr, which rendezvous refuses with a null handle.
-    TORCH_CHECK(numel > 0,
-                "this call moves no data: every rank's shard is empty. Check the shape and the "
-                "splits -- a sequence or head axis of 0 on ALL ranks has nothing to exchange");
+    const std::vector<int64_t> shape = output_shape(input, mode);
+    const int64_t numel = input.numel();
     const at::cuda::CUDAGuard guard(device_index_);
-    // empty_strided_p2p rather than a MemPool: it is the allocator entry point directly, so no
-    // unrelated allocation can interleave with ours and desync the rendezvous order across ranks.
-    at::Tensor t = symm::empty_strided_p2p(
-        {numel}, {1}, dtype, c10::Device(c10::DeviceType::CUDA, device_index_), group_name_, std::nullopt);
-    auto sym = symm::rendezvous(t, group_name_);
-    TORCH_CHECK(sym,
-                "torch symmetric memory did not establish a rendezvous for a ",
-                numel,
-                "-element window on group '",
-                group_name_,
-                "'. The allocation is not a symmetric one, or the group is not registered with "
-                "torch's symmetric-memory bootstrap.");
+    at::Tensor tensor = symm::empty_strided_p2p(
+        {numel}, {1}, input.scalar_type(),
+        c10::Device(c10::DeviceType::CUDA, device_index_), group_name_, std::nullopt);
+    auto memory = symm::rendezvous(tensor, group_name_);
+    TORCH_CHECK(memory, "symmetric-memory rendezvous failed for group '",
+                group_name_, "'");
 
-    Window win;
-    win.tensor = t;
-    win.numel  = numel;
-    for (void* p : sym->get_buffer_ptrs()) {
-        win.peer_ptrs.push_back(reinterpret_cast<uint64_t>(p));
-    }
-    const int64_t off = flag_offset_slots(world_size_);
-    for (void* p : sym->get_signal_pad_ptrs()) {
-        win.flag_ptrs.push_back(reinterpret_cast<uint64_t>(p) + static_cast<uint64_t>(off * 8));
-    }
-    TORCH_CHECK(static_cast<int>(win.peer_ptrs.size()) == world_size_,
-                "rendezvous returned ",
-                win.peer_ptrs.size(),
-                " peers for a group of ",
-                world_size_,
-                "; the process group and this group disagree about their membership");
+    auto buffer = std::make_unique<Buffer>();
+    buffer->tensor = tensor;
+    buffer->shape = shape;
+    buffer->dtype = input.scalar_type();
+    for (void* ptr : memory->get_buffer_ptrs())
+        buffer->peer_ptrs.push_back(reinterpret_cast<uint64_t>(ptr));
+    const int64_t offset = flag_offset(world_size_);
+    for (void* ptr : memory->get_signal_pad_ptrs())
+        buffer->flag_ptrs.push_back(
+            reinterpret_cast<uint64_t>(ptr) + static_cast<uint64_t>(offset * 8));
+    TORCH_CHECK(static_cast<int>(buffer->peer_ptrs.size()) == world_size_,
+                "symmetric-memory group size mismatch");
 
-    // This allocation may be reusing memory an earlier window freed, and the epoch has to start at
-    // zero. Clear only our own region -- torch's channels are its business -- then hold every rank
-    // until all have cleared, or one rank's first publish lands in a pad another has yet to clear,
-    // is erased, and that rank waits forever for a write that already happened.
-    sym->get_signal_pad(rank_, {flag_slots(world_size_)}, at::kLong, off).zero_();
-    sym->barrier(0, 0);
-    return win;
-}
+    memory->get_signal_pad(rank_, {world_size_}, at::kLong, offset).zero_();
 
-const Window& UlyssesGroup::window(WindowRole role, at::ScalarType dtype, int64_t numel)
-{
-    check_alive();
-    const auto key = std::make_pair(static_cast<int64_t>(role), dtype);
-    auto       it  = windows_.find(key);
-    if (it != windows_.end() && it->second.numel >= numel) {
-        return it->second;
-    }
-    if (it != windows_.end()) {
-        windows_.erase(it);  // free before allocating, so the allocator can reuse the segment
-    }
-    return windows_.emplace(key, allocate(numel, dtype)).first->second;
-}
-
-const Window& UlyssesGroup::lend_window(at::ScalarType dtype, int64_t numel)
-{
-    check_alive();
-    LentPool& pool = lent_[dtype];
-    // The reference this returns outlives the call's own frame, so growth must not move the slots.
-    // A no-op once the capacity is there, which is after the first kLentSlots calls.
-    pool.slots.reserve(kLentSlots);
-
-    // The counter, never a search for a free slot: see the header for why the choice has to be a
-    // quantity every rank shares. The pool fills before it rotates, so this branch runs exactly
-    // kLentSlots times per dtype, at the same calls on every rank.
-    const size_t idx = pool.calls++ % kLentSlots;
-    if (idx == pool.slots.size()) {
-        pool.slots.push_back(allocate(numel, dtype));
-        return pool.slots.back();
-    }
-
-    Window& slot = pool.slots[idx];
-    // The rotation says WHICH slot; the reference count says whether the caller is done with it.
-    // One holder means this pool is the only one left, the same test prune_owned() uses on owned_.
-    TORCH_CHECK(slot.tensor.storage().use_count() == 1,
-                "all_to_all_4d_async(lend=True) has rotated back to a window a live result still "
-                "refers to: at most ",
-                kLentSlots,
-                " lent results may be alive at once. Drop the older ones before issuing more "
-                "calls, or pass out= and own the buffer. Every rank has to drop them at the same "
-                "point in its own program -- a lent window is symmetric memory, and the rotation "
-                "is what keeps every rank on the same one.");
-    if (slot.numel < numel) {
-        slot = Window{};                // free before allocating, so the allocator can reuse the
-        slot = allocate(numel, dtype);  // segment -- the order window() takes, for the same reason
-    }
-    return slot;
-}
-
-at::Tensor UlyssesGroup::make_output(at::IntArrayRef shape, at::ScalarType dtype, int64_t numel)
-{
-    check_alive();
-    prune_owned();  // before allocating, so a released buffer's memory can be reused right here
-    Window     win = allocate(numel, dtype);
-    at::Tensor out = win.tensor.narrow(0, 0, c10::multiply_integers(shape)).view(shape);
-    owned_.emplace(win.tensor.data_ptr(), std::move(win));
+    at::Tensor out = tensor.view(shape);
+    Buffer* raw = buffer.get();
+    buffers_.push_back(std::move(buffer));
+    by_address_[out.data_ptr()] = raw;
     return out;
 }
 
-const Window* UlyssesGroup::window_of(const at::Tensor& out) const
+Buffer& UlyssesGroup::find_buffer(const at::Tensor& out)
 {
-    auto it = owned_.find(out.data_ptr());
-    return it == owned_.end() ? nullptr : &it->second;
+    const auto it = by_address_.find(out.data_ptr());
+    TORCH_CHECK(it != by_address_.end(),
+                "out must come from this group's allocate_output()");
+    return *it->second;
 }
 
-UlyssesGroup::Staging* UlyssesGroup::stage(const at::Tensor& x, c10::cuda::CUDAStream caller, cudaStream_t comm)
+void UlyssesGroup::exchange(const at::Tensor& input,
+                            at::Tensor out,
+                            int64_t mode,
+                            int64_t stream_ptr)
 {
-    auto key = std::make_pair(x.sizes().vec(), x.scalar_type());
-    // Unlike plans_, every entry here pins up to kMaxStagingPerShape inputs' worth of device
-    // memory, so the bound matters more -- 16 shapes is 16 * kMaxStagingPerShape buffers. Dropping
-    // them all costs one extra copy per live shape on the next call, and release_staging() has
-    // already been called for every slot by the time we get here.
-    if (staging_.size() >= 16 && staging_.find(key) == staging_.end()) {
-        for (auto& entry : staging_) {
-            for (auto& slot : entry.second) {
-                if (slot->release != nullptr) {
-                    ULYSSES_CUDA_CHECK(cudaEventSynchronize(slot->release));
-                    ULYSSES_CUDA_CHECK(cudaEventDestroy(slot->release));
-                }
-            }
-        }
-        staging_.clear();
-    }
-    auto& pool = staging_[key];
+    const std::vector<int64_t> expected = output_shape(input, mode);
+    Buffer& buffer = find_buffer(out);
+    TORCH_CHECK(out.is_cuda() && out.get_device() == device_index_,
+                "out is on the wrong GPU");
+    TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+    TORCH_CHECK(out.scalar_type() == input.scalar_type(), "dtype mismatch");
+    TORCH_CHECK(out.sizes().vec() == expected, "out has the wrong shape");
+    TORCH_CHECK(buffer.shape == expected && buffer.dtype == input.scalar_type(),
+                "out was allocated for a different exchange");
+    TORCH_CHECK(input.data_ptr() != out.data_ptr(), "input and out must not alias");
 
-    // Everything below happens on the CALLER's stream, so the caller's tensor is only ever read
-    // there and the comm stream sees only the staged copy.
-    const c10::cuda::CUDAStreamGuard guard(caller);
-
-    // Prefer a slot the comm stream has finished with: reusing it costs nothing, while a fresh one
-    // costs an allocation. cudaEventQuery on a never-recorded event reports success, which is the
-    // right answer for a slot that has never been read.
-    Staging* slot = nullptr;
-    for (auto& candidate : pool) {
-        const cudaError_t status = cudaEventQuery(candidate->release);
-        if (status == cudaSuccess) {
-            slot = candidate.get();
-            break;
-        }
-        if (status != cudaErrorNotReady) {
-            ULYSSES_CUDA_CHECK(status);
-        }
-        // cudaErrorNotReady is this call's answer, not a failure -- but it still lands in the
-        // sticky last error, where the next unrelated cudaGetLastError() would report it as its
-        // own. Cleared here for the same reason at::cuda::CUDAEvent::query() clears it.
-        (void)cudaGetLastError();
-    }
-
-    if (slot == nullptr && pool.size() < kMaxStagingPerShape) {
-        // Built into locals and committed together, so a throw from either leaves the pool
-        // untouched and the next call retries. A half-built slot -- tensor defined, release still
-        // null -- would be handed out and then throw on the null event, for good.
-        //
-        // at::empty, not empty_like: empty_like would copy a strided input's layout, and the
-        // transport reads the staged buffer as dense.
-        //
-        // InferenceMode(false) around it: this buffer outlives the call that created it, and one
-        // allocated under inference mode is an inference tensor for good -- every later copy_ into
-        // it from outside inference mode raises, so a single call made there would retire that
-        // (shape, dtype) permanently.
-        const c10::InferenceMode no_inference(false);
-        auto                     fresh   = std::make_unique<Staging>();
-        at::Tensor               staged  = at::empty(x.sizes(), x.options());
-        cudaEvent_t              release = nullptr;
-        ULYSSES_CUDA_CHECK(cudaEventCreateWithFlags(&release, cudaEventDisableTiming));
-        fresh->tensor  = std::move(staged);
-        fresh->release = release;
-        pool.push_back(std::move(fresh));
-        slot = pool.back().get();
-    }
-    else if (slot == nullptr) {
-        // Every slot is still in flight and the pool is at its bound, so this call waits for one.
-        // pool.front() is the first slot BUILT, not the first that will retire -- the scan above
-        // starts there, so it tends to be the most recently reused. Any in-flight slot is a
-        // correct answer; a shorter wait would cost keeping the pool in retirement order, on a
-        // path a caller reaches only by exceeding the bound.
-        slot = pool.front().get();
-        ULYSSES_CUDA_CHECK(cudaStreamWaitEvent(caller, slot->release, 0));
-    }
-
-    slot->tensor.copy_(x);
-    // The comm stream must not read the staged copy before that copy has run, and the ready event
-    // trails everything already submitted on the caller's stream -- including any earlier consumer
-    // of this same buffer.
-    const Event ready(cudaEventDisableTiming);
-    ULYSSES_CUDA_CHECK(cudaEventRecord(ready, caller));
-    ULYSSES_CUDA_CHECK(cudaStreamWaitEvent(comm, ready, 0));
-
-    return slot;
-}
-
-void UlyssesGroup::release_staging(Staging* slot, cudaStream_t comm) noexcept
-{
-    if (slot != nullptr) {
-        // The slot is named by the caller rather than remembered here, because several calls can
-        // be in flight at once and each must release the one it actually used.
-        //
-        // See the header: unchecked because this also runs while an exception from the transfer is
-        // propagating, and because a checked record that failed would leave the same state.
-        cudaEventRecord(slot->release, comm);
-    }
-}
-
-int64_t UlyssesGroup::staging_slots(const at::Tensor& like) const
-{
-    const auto it = staging_.find(std::make_pair(like.sizes().vec(), like.scalar_type()));
-    return it == staging_.end() ? 0 : static_cast<int64_t>(it->second.size());
-}
-
-int64_t UlyssesGroup::epoch(const at::Tensor& probe, WindowRole role) const
-{
-    // A buffer from empty_output() is its OWN window and lives in owned_, not in windows_ -- the
-    // zero-copy path never touches the role windows at all. Look there first, so a caller that
-    // passes the tensor it handed to `out=` gets that window's epoch rather than -1.
-    const Window* win = window_of(probe);
-    if (win == nullptr) {
-        auto it = windows_.find(std::make_pair(static_cast<int64_t>(role), probe.scalar_type()));
-        if (it == windows_.end()) {
-            return -1;
-        }
-        win = &it->second;
-    }
-    // The epoch sits one slot past the ws flags, which is where barrier_kernel's atomicAdd lands.
-    const auto         addr  = win->flag_ptrs[rank_] + static_cast<uint64_t>(world_size_) * 8;
-    unsigned long long value = 0;
-    ULYSSES_CUDA_CHECK(cudaMemcpy(&value, reinterpret_cast<const void*>(addr), sizeof(value), cudaMemcpyDeviceToHost));
-    return static_cast<int64_t>(value);
-}
-
-cudaStream_t UlyssesGroup::xfer_stream()
-{
-    if (xfer_ == nullptr) {
-        const at::cuda::CUDAGuard guard(device_index_);
-        ULYSSES_CUDA_CHECK(cudaStreamCreateWithFlags(&xfer_, cudaStreamNonBlocking));
-    }
-    return xfer_;
+    const at::cuda::CUDAGuard guard(device_index_);
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (device_barrier_) fast_barrier(stream, buffer.flag_ptrs, rank_, ++buffer.epoch);
+    launch_equal_a2a(input.data_ptr(), buffer.peer_ptrs, static_cast<int>(mode),
+                     input.size(0), input.size(1), input.size(2), input.size(3),
+                     static_cast<int64_t>(input.element_size()), rank_, stream);
+    if (device_barrier_) fast_barrier(stream, buffer.flag_ptrs, rank_, ++buffer.epoch);
 }
 
 void UlyssesGroup::destroy()
 {
-    if (destroyed_) {
-        return;
-    }
+    if (destroyed_) return;
     destroyed_ = true;
-    if (xfer_ != nullptr) {
-        // Unchecked, like the rest of teardown: the caller has already quiesced the group, and a
-        // throw from here would run during interpreter shutdown.
-        cudaStreamSynchronize(xfer_);
-        cudaStreamDestroy(xfer_);
-        xfer_ = nullptr;
-    }
-    for (auto& entry : staging_) {
-        for (auto& slot : entry.second) {
-            if (slot->release != nullptr) {
-                cudaEventDestroy(slot->release);
-            }
-        }
-    }
-    staging_.clear();
-    plans_.clear();
-    windows_.clear();
-    // Lent windows behave like owned ones here, and like them a result the caller still holds stays
-    // alive through its own storage reference; dropping the pools releases only the rest.
-    lent_.clear();
-    // Buffers the caller still holds stay alive through their own storage reference; dropping our
-    // record here only releases the ones nobody kept.
-    prune_owned();
+    by_address_.clear();
+    buffers_.clear();
 }
 
 }  // namespace ulysses

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fast-ulysses"
-description = "Ulysses sequence-parallel all-to-all over NVLink, moved by the GPU copy engines"
+description = "Minimal equal-shape Ulysses all-to-all over direct CUDA peer copies"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -17,35 +17,23 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
-[project.scripts]
-fast-ulysses = "fast_ulysses.cli:main"
-
 [project.urls]
 Repository = "https://github.com/triple-mu/fast-ulysses"
 
 [project.optional-dependencies]
-dev = ["pre-commit", "pytest", "ruff"]
+dev = ["pytest", "ruff"]
 
 [tool.setuptools]
 package-dir = { "" = "python" }
 packages = ["fast_ulysses"]
 
 [tool.setuptools.package-data]
-fast_ulysses = ["py.typed", "wheel_matrix.json"]
-
-[tool.pytest.ini_options]
-testpaths = ["test"]
-addopts = "-ra"
-markers = [
-    "multigpu: multi-GPU tests launched via torchrun (skipped when fewer than 2 GPUs)",
-]
+fast_ulysses = ["py.typed"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py310"
-# The package lives under python/, so isort would otherwise file `fast_ulysses` as third-party.
 src = ["python"]
-extend-exclude = ["3rdparty", "profile", "cmake-build-debug"]
 
 [tool.ruff.lint]
 extend-select = ["I"]

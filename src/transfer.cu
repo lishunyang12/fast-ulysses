@@ -1,128 +1,73 @@
-// CE (copy-engine) transfer path for the 4D all-to-all: pitched cudaMemcpy2D/3DAsync straight into
-// the peers' window addresses. The copies that cross a link run on the DMA engines and take no
-// SMs, so they proceed while compute holds every SM rather than waiting for a block slot. This
-// rank's own share does not cross a link and does compete; see transfer.hpp.
-// It computes no offsets -- the addressing comes from build_plan in a2a_plan.cc.
 #include <fast_ulysses/common.hpp>
 #include <fast_ulysses/transfer.hpp>
 
-#include <chrono>
-#include <thread>
-
 namespace ulysses {
 
-namespace {
-
-// Debug-only, armed from Python. 0 = off, which is the only state a normal build ever sees.
-int64_t g_fault_delay_us = 0;
-
-void CUDART_CB delay_payload(void* arg)
+void launch_equal_a2a(const void* src,
+                      const std::vector<uint64_t>& peer_ptrs,
+                      int mode,
+                      int64_t batch,
+                      int64_t axis1,
+                      int64_t axis2,
+                      int64_t head_dim,
+                      int64_t element_size,
+                      int rank,
+                      cudaStream_t stream)
 {
-    std::this_thread::sleep_for(std::chrono::microseconds(reinterpret_cast<int64_t>(arg)));
-}
+    const int ws = static_cast<int>(peer_ptrs.size());
+    const auto* source = static_cast<const uint8_t*>(src);
+    const int64_t row_bytes = (mode == 0 ? axis2 / ws : axis2) *
+                              head_dim * element_size;
 
-// One CopyOp -> one CUDA call. The slice counts below are derived, not passed, because
-// cudaMemcpy3DParms takes no slice stride (see push_batched).
-void issue_copy(void* dst, const void* src, const CopyOp& op, cudaStream_t stream)
-{
-    if (op.depth <= 1) {
-        ULYSSES_CUDA_CHECK(cudaMemcpy2DAsync(dst,
-                                             static_cast<size_t>(op.dst_pitch),
-                                             src,
-                                             static_cast<size_t>(op.src_pitch),
-                                             static_cast<size_t>(op.width),
-                                             static_cast<size_t>(op.rows),
-                                             cudaMemcpyDefault,
-                                             stream));
-        return;
-    }
-    cudaMemcpy3DParms parms = {};
-    parms.srcPtr            = make_cudaPitchedPtr(const_cast<void*>(src),
-                                       static_cast<size_t>(op.src_pitch),
-                                       static_cast<size_t>(op.width),
-                                       static_cast<size_t>(op.src_slice / op.src_pitch));
-    parms.dstPtr            = make_cudaPitchedPtr(dst,
-                                       static_cast<size_t>(op.dst_pitch),
-                                       static_cast<size_t>(op.width),
-                                       static_cast<size_t>(op.dst_slice / op.dst_pitch));
-    parms.extent =
-        make_cudaExtent(static_cast<size_t>(op.width), static_cast<size_t>(op.rows), static_cast<size_t>(op.depth));
-    parms.kind = cudaMemcpyDefault;
-    ULYSSES_CUDA_CHECK(cudaMemcpy3DAsync(&parms, stream));
-}
-
-}  // namespace
-
-// Arm (delay_us > 0) or disarm (0) the "signal before payload" fault. TESTS ONLY.
-//
-// The operator depends on copy-engine writes being visible at the destination by the time the
-// barrier kernel's release store announcing them arrives, which is undocumented, so the test for it
-// is only worth as much as its negative control. Armed, launch_a2a_ce holds the payload back and
-// skips the join onto the caller's stream, so the closing barrier publishes while the bytes are in
-// flight. See test/distributed/ce_ordering.py.
-void set_ce_fault(int64_t delay_us)
-{
-    g_fault_delay_us = delay_us;
-}
-
-void launch_a2a_ce(const void*                  src,
-                   const std::vector<uint64_t>& peer_ptrs,
-                   const A2APlan&               plan,
-                   cudaStream_t                 xfer,
-                   int                          rank,
-                   cudaStream_t                 stream)
-{
-    const int      ws        = static_cast<int>(peer_ptrs.size());
-    const uint8_t* src_bytes = static_cast<const uint8_t*>(src);
-    // Fresh events every call -- do not hoist them onto the group. A shared event re-recorded
-    // while earlier waits are still pending lets one of those waits resolve against a later record,
-    // which makes the wait depend on the very stream it is blocking: a circular wait. Creating them
-    // here is depth-safe, since a wait captures the dependency at call time and destroy defers.
-    //
-    // ONE STREAM for the remote copies, since they all leave through the same egress and separate
-    // streams would only make them contend. This rank's OWN share crosses no link, so it can run
-    // alongside them on the caller's stream -- hence the separate emit below. Peers are visited in
-    // XOR-shift order, which pairs ranks up without coordination.
-    const Event ready(cudaEventDisableTiming);
-    ULYSSES_CUDA_CHECK(cudaEventRecord(ready, stream));
-
-    auto emit = [&](int p, cudaStream_t on) {
-        for (const CopyOp& op : plan.ops) {
-            if (op.peer == p) {
-                issue_copy(reinterpret_cast<uint8_t*>(peer_ptrs[p]) + op.dst_offset, src_bytes + op.src_offset, op, on);
+    auto copy_peer = [&](int peer) {
+        for (int64_t b = 0; b < batch; ++b) {
+            int64_t src_offset;
+            int64_t dst_offset;
+            int64_t src_pitch;
+            int64_t dst_pitch;
+            int64_t rows;
+            if (mode == 0) {
+                const int64_t s_local = axis1;
+                const int64_t h_global = axis2;
+                const int64_t h_local = h_global / ws;
+                src_offset = ((b * s_local * h_global) + peer * h_local) *
+                             head_dim * element_size;
+                dst_offset = ((b * s_local * ws + rank * s_local) * h_local) *
+                             head_dim * element_size;
+                src_pitch = h_global * head_dim * element_size;
+                dst_pitch = h_local * head_dim * element_size;
+                rows = s_local;
+            } else {
+                const int64_t s_global = axis1;
+                const int64_t s_local = s_global / ws;
+                const int64_t h_local = axis2;
+                const int64_t h_global = h_local * ws;
+                src_offset = ((b * s_global + peer * s_local) * h_local) *
+                             head_dim * element_size;
+                dst_offset = ((b * s_local * h_global) + rank * h_local) *
+                             head_dim * element_size;
+                src_pitch = h_local * head_dim * element_size;
+                dst_pitch = h_global * head_dim * element_size;
+                rows = s_local;
             }
+            auto* destination = reinterpret_cast<uint8_t*>(peer_ptrs[peer]);
+            ULYSSES_CUDA_CHECK(cudaMemcpy2DAsync(
+                destination + dst_offset, static_cast<size_t>(dst_pitch),
+                source + src_offset, static_cast<size_t>(src_pitch),
+                static_cast<size_t>(row_bytes), static_cast<size_t>(rows),
+                cudaMemcpyDefault, stream));
         }
     };
 
-    ULYSSES_CUDA_CHECK(cudaStreamWaitEvent(xfer, ready, 0));
-    // Fault injection (see set_ce_fault): hold the payload back so the flag cannot be behind it.
-    if (g_fault_delay_us > 0) {
-        ULYSSES_CUDA_CHECK(cudaLaunchHostFunc(xfer, delay_payload, reinterpret_cast<void*>(g_fault_delay_us)));
+    for (int step = 1; step < ws; ++step) {
+        const int peer = rank ^ step;
+        if (peer < ws) copy_peer(peer);
     }
-    for (int k = 1; k < ws; ++k) {
-        const int peer = rank ^ k;
-        if (peer < ws) {
-            emit(peer, xfer);
-        }
-    }
-    // XOR only enumerates every peer when ws is a power of two; sweep for any it missed.
     if ((ws & (ws - 1)) != 0) {
-        for (int p = 0; p < ws; ++p) {
-            if (p != rank && (p ^ rank) >= ws) {
-                emit(p, xfer);
-            }
-        }
+        for (int peer = 0; peer < ws; ++peer)
+            if (peer != rank && (peer ^ rank) >= ws) copy_peer(peer);
     }
-    emit(rank, stream);
-
-    const Event done(cudaEventDisableTiming);
-    ULYSSES_CUDA_CHECK(cudaEventRecord(done, xfer));
-    // Skipping this join is the fault: the caller's stream then reaches the closing barrier, and
-    // publishes, without waiting for the remote copies. Nothing else about the call changes.
-    if (g_fault_delay_us == 0) {
-        ULYSSES_CUDA_CHECK(cudaStreamWaitEvent(stream, done, 0));
-    }
-    // done and ready are destroyed here, in reverse declaration order, as they were by hand.
+    copy_peer(rank);
 }
 
 }  // namespace ulysses

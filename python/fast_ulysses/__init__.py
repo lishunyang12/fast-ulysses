@@ -1,18 +1,15 @@
-"""fast_ulysses — Ulysses sequence-parallel all-to-all, moved by the GPU copy engines."""
+"""Minimal symmetric-memory Ulysses all-to-all."""
 
 try:
-    import torch  # noqa: F401  load libtorch before dlopen of _C
+    import torch  # noqa: F401
 
-    from . import _C  # noqa: F401  trigger TORCH_LIBRARY registration
-except ImportError as exc:  # ld.so names a symbol; _diagnose names the cause
-    from ._diagnose import explain  # noqa: E402  imported only on the failure path
+    from . import _C
+except ImportError as exc:
+    from ._diagnose import explain
 
     raise ImportError(explain(exc)) from exc
 
-# Written by setup.py from ./VERSION; present whenever _C is, since the same build emits both.
-from ._build_meta import VERSION as __version__  # noqa: F401,E402
-from .group import CompletedHandle, UlyssesGroup  # noqa: E402
+from .group import UlyssesGroup
 
-nvlink_matrix = _C.nvlink_matrix
-
-__all__ = ["UlyssesGroup", "CompletedHandle", "nvlink_matrix"]
+__version__ = _C.build_info()["version"]
+__all__ = ["UlyssesGroup"]
