@@ -8,8 +8,8 @@ Supported:
 - contiguous `[B, S, H, D]` FP16/BF16 tensors;
 - equal splits and inference only;
 - batch size 1 on the 8-GPU mlx5 path;
-- forward `[B, S_local, H_global, D] -> [B, S_global, H_local, D]`;
-- reverse `[B, S_global, H_local, D] -> [B, S_local, H_global, D]`.
+- mode 0 `[B, S_local, H_global, D] -> [B, S_global, H_local, D]`;
+- mode 1 `[B, S_global, H_local, D] -> [B, S_local, H_global, D]`.
 
 There is no varlen, uneven split, autograd, async work wrapper, plan cache, CUDA Graph,
 or release-wheel machinery.
@@ -59,7 +59,7 @@ group.destroy()
 
 The first call for each `(mode, shape, dtype)` collectively creates a registered output workspace;
 later calls reuse it automatically. The returned workspace is overwritten by the next call with
-the same key. `allocate_output` and an explicit `output` remain available only when two results of
+the same key. `allocate_output` and an explicit `out` remain available only when two results of
 the same geometry must stay live at once. `destroy()` releases all registered workspaces; there is
 no per-output release step.
 

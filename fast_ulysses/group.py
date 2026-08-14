@@ -59,36 +59,38 @@ class UlyssesGroup:
     def exchange(
         self,
         x: torch.Tensor,
-        output: torch.Tensor | None = None,
         mode: int = 0,
+        out: torch.Tensor | None = None,
         stream: torch.cuda.Stream | None = None,
     ) -> torch.Tensor:
-        """Exchange into ``output`` or a reusable internal registered workspace.
+        """Exchange into ``out`` or a reusable internal registered workspace.
 
         The automatic workspace is overwritten by the next call with the same
-        mode, shape, and dtype. Pass an explicit output when multiple results
+        mode, shape, and dtype. Pass an explicit ``out`` when multiple results
         with the same geometry must remain live simultaneously.
         """
         self._check_alive()
-        if output is None:
+        if mode not in (0, 1):
+            raise ValueError(f"mode must be 0 or 1, got {mode!r}")
+        if out is None:
             key = (mode, tuple(x.shape), x.dtype)
-            output = self._output_pool.get(key)
-            if output is None:
-                output = self.allocate_output(x, mode)
-                self._output_pool[key] = output
+            out = self._output_pool.get(key)
+            if out is None:
+                out = self.allocate_output(x, mode)
+                self._output_pool[key] = out
         selected = stream or torch.cuda.current_stream(self.device)
         if torch.device(selected.device) != self.device:
             raise ValueError("stream is on the wrong GPU")
         if self.backend != "device":
             selected.synchronize()
-            self._group.exchange(x, output, mode, selected.cuda_stream)
+            self._group.exchange(x, out, mode, selected.cuda_stream)
             selected.synchronize()
             if self.backend != "mlx5":
                 dist.all_reduce(self._sync, group=self.pg)
                 torch.cuda.synchronize(self.device)
         else:
-            self._group.exchange(x, output, mode, selected.cuda_stream)
-        return output
+            self._group.exchange(x, out, mode, selected.cuda_stream)
+        return out
 
     def destroy(self):
         if self._destroyed:

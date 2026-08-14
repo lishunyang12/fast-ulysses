@@ -79,14 +79,14 @@ def write_report(path: str, metadata: list[str], rows: list[dict]) -> None:
         "All bandwidths are decimal GB/s. `bus` counts only bytes sent to remote "
         "ranks; `aggregate` is the sum across all ranks.",
         "",
-        "| Shape | Dir | Raw NCCL ms | NCCL alg GB/s | NCCL bus GB/s | "
+        "| Shape | Mode | Raw NCCL ms | NCCL alg GB/s | NCCL bus GB/s | "
         "NCCL aggregate GB/s | NCCL + layout ms | Layout GB/s | Fast ms | "
         "Fast GB/s | Raw / fast | Layout / fast |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         lines.append(
-            f"| {row['shape']} | {row['direction']} | {row['raw_ms']:.3f} | "
+            f"| {row['shape']} | {row['mode']} | {row['raw_ms']:.3f} | "
             f"{row['raw_alg_gbps']:.2f} | {row['raw_bus_gbps']:.2f} | "
             f"{row['raw_aggregate_gbps']:.2f} | {row['layout_ms']:.3f} | "
             f"{row['layout_gbps']:.2f} | {row['fast_ms']:.3f} | "
@@ -97,7 +97,7 @@ def write_report(path: str, metadata: list[str], rows: list[dict]) -> None:
         report.write("\n".join(lines) + "\n")
 
 
-def nccl_forward(
+def nccl_mode0(
     x: torch.Tensor,
     send: torch.Tensor,
     recv: torch.Tensor,
@@ -114,7 +114,7 @@ def nccl_forward(
     return output
 
 
-def nccl_reverse(
+def nccl_mode1(
     x: torch.Tensor,
     send: torch.Tensor,
     recv: torch.Tensor,
@@ -169,7 +169,7 @@ def main():
             "raw alg GB/s = GB/s * world_size / (world_size - 1)"
         )
         print(
-            f"{'shape':<18} {'dir':<4} {'raw ms':>8} {'raw GB/s':>9} "
+            f"{'shape':<18} {'mode':<6} {'raw ms':>8} {'raw GB/s':>9} "
             f"{'layout ms':>9} {'layout GB/s':>11} {'fast ms':>8} "
             f"{'fast GB/s':>9} {'vs raw':>8} {'vs layout':>10}"
         )
@@ -184,31 +184,41 @@ def main():
             dtype=torch.bfloat16,
             device=local_rank,
         )
-        send_fwd = torch.empty(x.numel(), dtype=x.dtype, device=x.device)
-        recv_fwd = torch.empty_like(send_fwd)
-        y_ref = torch.empty((1, seq, heads // ws, dim), dtype=x.dtype, device=x.device)
-        nccl_forward(x, send_fwd, recv_fwd, y_ref, ws)
-        out_fwd = group.exchange(x, mode=0)
-        if not torch.equal(out_fwd, y_ref):
-            raise RuntimeError(f"rank {rank}: forward mismatch for {seq, heads, dim}")
+        send_mode0 = torch.empty(x.numel(), dtype=x.dtype, device=x.device)
+        recv_mode0 = torch.empty_like(send_mode0)
+        mode0_ref = torch.empty(
+            (1, seq, heads // ws, dim), dtype=x.dtype, device=x.device
+        )
+        nccl_mode0(x, send_mode0, recv_mode0, mode0_ref, ws)
+        out_mode0 = group.exchange(x, mode=0)
+        if not torch.equal(out_mode0, mode0_ref):
+            raise RuntimeError(f"rank {rank}: mode=0 mismatch for {seq, heads, dim}")
 
-        send_rev = torch.empty_like(send_fwd)
-        recv_rev = torch.empty_like(send_fwd)
-        x_ref = torch.empty_like(x)
-        nccl_reverse(y_ref, send_rev, recv_rev, x_ref, ws)
-        out_rev = group.exchange(out_fwd, mode=1)
-        if not torch.equal(out_rev, x) or not torch.equal(x_ref, x):
-            raise RuntimeError(f"rank {rank}: reverse mismatch for {seq, heads, dim}")
+        send_mode1 = torch.empty_like(send_mode0)
+        recv_mode1 = torch.empty_like(send_mode0)
+        mode1_ref = torch.empty_like(x)
+        nccl_mode1(mode0_ref, send_mode1, recv_mode1, mode1_ref, ws)
+        out_mode1 = group.exchange(out_mode0, mode=1)
+        if not torch.equal(out_mode1, x) or not torch.equal(mode1_ref, x):
+            raise RuntimeError(f"rank {rank}: mode=1 mismatch for {seq, heads, dim}")
 
-        raw_recv_fwd = torch.empty_like(recv_fwd)
-        raw_recv_rev = torch.empty_like(recv_rev)
+        raw_recv_mode0 = torch.empty_like(recv_mode0)
+        raw_recv_mode1 = torch.empty_like(recv_mode1)
         cases = {
-            "raw_fwd": partial(dist.all_to_all_single, raw_recv_fwd, send_fwd),
-            "layout_fwd": partial(nccl_forward, x, send_fwd, recv_fwd, y_ref, ws),
-            "fast_fwd": partial(group.exchange, x, mode=0),
-            "raw_rev": partial(dist.all_to_all_single, raw_recv_rev, send_rev),
-            "layout_rev": partial(nccl_reverse, y_ref, send_rev, recv_rev, x_ref, ws),
-            "fast_rev": partial(group.exchange, out_fwd, mode=1),
+            "raw_mode0": partial(
+                dist.all_to_all_single, raw_recv_mode0, send_mode0
+            ),
+            "layout_mode0": partial(
+                nccl_mode0, x, send_mode0, recv_mode0, mode0_ref, ws
+            ),
+            "fast_mode0": partial(group.exchange, x, mode=0),
+            "raw_mode1": partial(
+                dist.all_to_all_single, raw_recv_mode1, send_mode1
+            ),
+            "layout_mode1": partial(
+                nccl_mode1, mode0_ref, send_mode1, recv_mode1, mode1_ref, ws
+            ),
+            "fast_mode1": partial(group.exchange, out_mode0, mode=1),
         }
         results = {
             name: timed(fn, args.warmup, args.iters, args.trials, local_rank)
@@ -218,15 +228,15 @@ def main():
         remote_bytes = tensor_bytes * (ws - 1) / ws
         if rank == 0:
             label = f"{seq},{heads},{dim}"
-            for direction in ("fwd", "rev"):
-                raw = results[f"raw_{direction}"]
-                layout = results[f"layout_{direction}"]
-                fast = results[f"fast_{direction}"]
+            for mode in (0, 1):
+                raw = results[f"raw_mode{mode}"]
+                layout = results[f"layout_mode{mode}"]
+                fast = results[f"fast_mode{mode}"]
                 raw_bus_gbps = gbps(remote_bytes, raw)
                 layout_gbps = gbps(remote_bytes, layout)
                 fast_gbps = gbps(remote_bytes, fast)
                 print(
-                    f"{label:<18} {direction:<4} {raw:8.3f} "
+                    f"{label:<18} {mode:<6} {raw:8.3f} "
                     f"{raw_bus_gbps:9.2f} {layout:9.3f} {layout_gbps:11.2f} "
                     f"{fast:8.3f} {fast_gbps:9.2f} {raw / fast:7.2f}x "
                     f"{layout / fast:9.2f}x"
@@ -234,7 +244,7 @@ def main():
                 report_rows.append(
                     {
                         "shape": label,
-                        "direction": direction,
+                        "mode": mode,
                         "raw_ms": raw,
                         "raw_alg_gbps": gbps(tensor_bytes, raw),
                         "raw_bus_gbps": raw_bus_gbps,

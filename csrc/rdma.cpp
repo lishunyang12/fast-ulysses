@@ -486,7 +486,7 @@ std::unique_ptr<RdmaBuffer> RdmaTransport::register_buffer(void* pointer,
         const int64_t width64 = heads * dim * element_size;
         const int64_t pitch64 = heads * kWorld * dim * element_size;
         TORCH_CHECK(rows64 <= UINT32_MAX && width64 <= UINT32_MAX && pitch64 <= UINT32_MAX,
-                    "reverse shape exceeds mlx5 UMR limits");
+                    "mode=1 shape exceeds mlx5 UMR limits");
         for (int peer = 0; peer < kWorld; ++peer) {
             if (!impl_->cross(peer)) continue;
             state->destination_mkeys[peer] = impl_->create_mkey();
@@ -590,7 +590,7 @@ void RdmaTransport::start_exchange(const void* input,
             const int64_t pitch64 = heads * dim * element_size;
             TORCH_CHECK(rows64 <= UINT32_MAX && width64 <= UINT32_MAX &&
                             pitch64 <= UINT32_MAX,
-                        "forward shape exceeds mlx5 UMR limits");
+                        "mode=0 shape exceeds mlx5 UMR limits");
             for (int peer = 0; peer < kWorld; ++peer) {
                 if (!impl_->cross(peer)) continue;
                 state.source_mkeys[peer] = impl_->create_mkey();
@@ -621,7 +621,7 @@ void RdmaTransport::start_exchange(const void* input,
         } else {
             const uint32_t remote_key =
                 state.peers[peer].destination_rkey[impl_->rank];
-            TORCH_CHECK(remote_key, "missing reverse destination MKey for peer ", peer);
+            TORCH_CHECK(remote_key, "missing mode=1 destination MKey for peer ", peer);
             impl_->post_write(peer, state.input_mr->lkey,
                               reinterpret_cast<uint64_t>(input) + peer * payload64,
                               payload, remote_key, 0);
