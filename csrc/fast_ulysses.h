@@ -47,10 +47,10 @@ public:
     ~UlyssesGroup() override;
 
     at::Tensor allocate_output(const at::Tensor& input, int64_t mode);
-    void exchange(const at::Tensor& input,
-                  at::Tensor output,
-                  int64_t mode,
-                  int64_t stream);
+    void all_to_all_4d(const at::Tensor& input,
+                       at::Tensor output,
+                       int64_t mode,
+                       int64_t stream);
     std::string backend() const;
     std::vector<int64_t> connection_info() const;
     void connect(const std::vector<std::vector<int64_t>>& peers);

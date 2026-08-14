@@ -140,10 +140,10 @@ at::Tensor UlyssesGroup::allocate_output(const at::Tensor& input, int64_t mode)
     return output;
 }
 
-void UlyssesGroup::exchange(const at::Tensor& input,
-                            at::Tensor output,
-                            int64_t mode,
-                            int64_t stream_ptr)
+void UlyssesGroup::all_to_all_4d(const at::Tensor& input,
+                                 at::Tensor output,
+                                 int64_t mode,
+                                 int64_t stream_ptr)
 {
     const auto shape = output_shape(input, mode);
     const auto it = outputs_.find(output.data_ptr());
@@ -154,7 +154,7 @@ void UlyssesGroup::exchange(const at::Tensor& input,
     TORCH_CHECK(output.scalar_type() == input.scalar_type() && output.sizes().vec() == shape,
                 "output shape or dtype mismatch");
     TORCH_CHECK(buffer.shape == shape && buffer.dtype == input.scalar_type(),
-                "output was allocated for another exchange");
+                "output was allocated for another mode or shape");
     TORCH_CHECK(input.data_ptr() != output.data_ptr(), "input and output alias");
 
     const at::cuda::CUDAGuard guard(device_);
@@ -244,7 +244,7 @@ TORCH_LIBRARY(fast_ulysses, m)
         .def(torch::init<std::string, int64_t, int64_t, int64_t,
                          std::vector<int64_t>>())
         .def("allocate_output", &ulysses::UlyssesGroup::allocate_output)
-        .def("exchange", &ulysses::UlyssesGroup::exchange)
+        .def("all_to_all_4d", &ulysses::UlyssesGroup::all_to_all_4d)
         .def("backend", &ulysses::UlyssesGroup::backend)
         .def("connection_info", &ulysses::UlyssesGroup::connection_info)
         .def("connect", &ulysses::UlyssesGroup::connect)

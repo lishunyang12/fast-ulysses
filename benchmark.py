@@ -190,7 +190,7 @@ def main():
             (1, seq, heads // ws, dim), dtype=x.dtype, device=x.device
         )
         nccl_mode0(x, send_mode0, recv_mode0, mode0_ref, ws)
-        out_mode0 = group.exchange(x, mode=0)
+        out_mode0 = group.all_to_all_4d(x, mode=0)
         if not torch.equal(out_mode0, mode0_ref):
             raise RuntimeError(f"rank {rank}: mode=0 mismatch for {seq, heads, dim}")
 
@@ -198,7 +198,7 @@ def main():
         recv_mode1 = torch.empty_like(send_mode0)
         mode1_ref = torch.empty_like(x)
         nccl_mode1(mode0_ref, send_mode1, recv_mode1, mode1_ref, ws)
-        out_mode1 = group.exchange(out_mode0, mode=1)
+        out_mode1 = group.all_to_all_4d(out_mode0, mode=1)
         if not torch.equal(out_mode1, x) or not torch.equal(mode1_ref, x):
             raise RuntimeError(f"rank {rank}: mode=1 mismatch for {seq, heads, dim}")
 
@@ -211,14 +211,14 @@ def main():
             "layout_mode0": partial(
                 nccl_mode0, x, send_mode0, recv_mode0, mode0_ref, ws
             ),
-            "fast_mode0": partial(group.exchange, x, mode=0),
+            "fast_mode0": partial(group.all_to_all_4d, x, mode=0),
             "raw_mode1": partial(
                 dist.all_to_all_single, raw_recv_mode1, send_mode1
             ),
             "layout_mode1": partial(
                 nccl_mode1, mode0_ref, send_mode1, recv_mode1, mode1_ref, ws
             ),
-            "fast_mode1": partial(group.exchange, out_mode0, mode=1),
+            "fast_mode1": partial(group.all_to_all_4d, out_mode0, mode=1),
         }
         results = {
             name: timed(fn, args.warmup, args.iters, args.trials, local_rank)

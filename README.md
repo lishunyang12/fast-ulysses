@@ -53,7 +53,7 @@ ccache -s
 from fast_ulysses import UlyssesGroup
 
 group = UlyssesGroup()
-output = group.exchange(x, mode=0)
+output = group.all_to_all_4d(x, mode=0)
 group.destroy()
 ```
 

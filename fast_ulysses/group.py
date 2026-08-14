@@ -56,14 +56,14 @@ class UlyssesGroup:
         dist.barrier(group=self.pg, device_ids=[self.device.index])
         return output
 
-    def exchange(
+    def all_to_all_4d(
         self,
         x: torch.Tensor,
         mode: int = 0,
         out: torch.Tensor | None = None,
         stream: torch.cuda.Stream | None = None,
     ) -> torch.Tensor:
-        """Exchange into ``out`` or a reusable internal registered workspace.
+        """Run a 4-D all-to-all into ``out`` or an internal workspace.
 
         The automatic workspace is overwritten by the next call with the same
         mode, shape, and dtype. Pass an explicit ``out`` when multiple results
@@ -83,13 +83,13 @@ class UlyssesGroup:
             raise ValueError("stream is on the wrong GPU")
         if self.backend != "device":
             selected.synchronize()
-            self._group.exchange(x, out, mode, selected.cuda_stream)
+            self._group.all_to_all_4d(x, out, mode, selected.cuda_stream)
             selected.synchronize()
             if self.backend != "mlx5":
                 dist.all_reduce(self._sync, group=self.pg)
                 torch.cuda.synchronize(self.device)
         else:
-            self._group.exchange(x, out, mode, selected.cuda_stream)
+            self._group.all_to_all_4d(x, out, mode, selected.cuda_stream)
         return out
 
     def destroy(self):
