@@ -18,11 +18,34 @@ or release-wheel machinery.
 
 ```bash
 source /workspace/sgl-env/bin/activate
-FAST_ULYSSES_CUDA_ARCH=100 pip install -e . --no-build-isolation
+FAST_ULYSSES_CUDA_ARCH=100 python -m pip install -e .
 ```
 
-The architecture is detected from the current GPU when `FAST_ULYSSES_CUDA_ARCH` is not set.
+Both editable entry points are supported in the active environment:
+
+```bash
+python -m pip install -e .
+python setup.py develop
+```
+
+The architecture is detected with `nvidia-smi` when `FAST_ULYSSES_CUDA_ARCH` is not set. The build
+locates Torch CMake files directly in the active virtual environment, so PEP 517 build isolation
+does not install or import a second copy of PyTorch.
+It uses up to 32 parallel jobs by default; override that with `CMAKE_BUILD_PARALLEL_LEVEL` or
+`FAST_ULYSSES_BUILD_JOBS`. If `ccache` is on `PATH`, it is enabled automatically for both C++ and
+CUDA. `FAST_ULYSSES_CCACHE=/path/to/ccache` selects it explicitly, while
+`FAST_ULYSSES_CCACHE=0` disables it.
 The build also links the system `libibverbs` and `libmlx5` libraries.
+
+For example:
+
+```bash
+apt-get update && apt-get install -y ccache
+source /workspace/sgl-env/bin/activate
+CCACHE_DIR=/workspace/.ccache CMAKE_BUILD_PARALLEL_LEVEL=32 \
+  FAST_ULYSSES_CUDA_ARCH=100 python -m pip install -e .
+ccache -s
+```
 
 ## Use
 
