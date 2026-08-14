@@ -41,6 +41,7 @@ public:
     void connect_buffer(RdmaBuffer& buffer,
                         const std::vector<std::vector<int64_t>>& peers) const;
     std::vector<uint64_t> peer_pointers(const RdmaBuffer& buffer) const;
+    std::vector<uint64_t> peer_flags(const RdmaBuffer& buffer) const;
     void start_exchange(const void* input,
                         int64_t input_bytes,
                         RdmaBuffer& output,

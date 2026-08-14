@@ -167,7 +167,9 @@ void UlyssesGroup::exchange(const at::Tensor& input,
         launch_local_all_to_all(input.data_ptr(), buffer.peers, mode, input.size(0),
                                 input.size(1), input.size(2), input.size(3),
                                 input.element_size(), rank_, stream);
+        barrier(stream, buffer.flags, rank_ % 4, ++buffer.epoch);
         rdma_->finish_exchange();
+        rdma_->flush();
         return;
     }
     if (device_barrier_) barrier(stream, buffer.flags, rank_, ++buffer.epoch);
@@ -211,6 +213,7 @@ void UlyssesGroup::connect_buffer(
                 "output must be an RDMA allocate_output() result");
     rdma_->connect_buffer(*it->second->rdma, peers);
     it->second->peers = rdma_->peer_pointers(*it->second->rdma);
+    it->second->flags = rdma_->peer_flags(*it->second->rdma);
 }
 
 void UlyssesGroup::flush() const

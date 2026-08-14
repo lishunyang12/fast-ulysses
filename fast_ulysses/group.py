@@ -70,10 +70,9 @@ class UlyssesGroup:
             selected.synchronize()
             self._group.exchange(x, output, mode, selected.cuda_stream)
             selected.synchronize()
-            dist.all_reduce(self._sync, group=self.pg)
-            torch.cuda.synchronize(self.device)
-            if self.backend == "mlx5":
-                self._group.flush()
+            if self.backend != "mlx5":
+                dist.all_reduce(self._sync, group=self.pg)
+                torch.cuda.synchronize(self.device)
         else:
             self._group.exchange(x, output, mode, selected.cuda_stream)
         return output

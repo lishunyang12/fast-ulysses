@@ -35,6 +35,7 @@ struct BufferWire {
     uint32_t rkey = 0;
     uint32_t destination_rkey[kWorld]{};
     cudaIpcMemHandle_t ipc{};
+    cudaIpcMemHandle_t flag_ipc{};
 };
 
 template <typename T>
@@ -186,7 +187,7 @@ struct RdmaTransport::Impl {
     GroupWire local{};
     std::array<GroupWire, kWorld> peers{};
     uint64_t next_wr_id = 1;
-    int pending_writes = 0;
+    int pending_completions = 0;
 
     bool cross(int peer) const { return peer / 4 != rank / 4; }
 
@@ -257,10 +258,19 @@ struct RdmaTransport::Impl {
         ibv_wr_start(qp);
         qp->wr_id = next_wr_id++;
         qp->wr_flags = IBV_SEND_SIGNALED;
-        ibv_wr_rdma_write(qp, remote_key, remote_address);
+        ibv_wr_rdma_write_imm(qp, remote_key, remote_address, 0);
         ibv_wr_set_sge(qp, local_key, local_address, bytes);
         const int result = ibv_wr_complete(qp);
         TORCH_CHECK(result == 0, "post RDMA write failed: ", std::strerror(result));
+    }
+
+    void post_receive(int peer)
+    {
+        ibv_recv_wr request{};
+        request.wr_id = next_wr_id++;
+        ibv_recv_wr* bad = nullptr;
+        const int result = ibv_post_recv(qps[peer], &request, &bad);
+        TORCH_CHECK(result == 0, "post RDMA receive failed: ", std::strerror(result));
     }
 
     ~Impl()
@@ -284,6 +294,8 @@ struct RdmaBuffer::Impl {
     int mode = 0;
     std::array<BufferWire, kWorld> peers{};
     std::array<void*, kWorld> peer_pointers{};
+    void* flags = nullptr;
+    std::array<void*, kWorld> peer_flags{};
     bool connected = false;
 
     ~Impl()
@@ -296,6 +308,9 @@ struct RdmaBuffer::Impl {
         for (auto* mkey : destination_mkeys)
             if (mkey) mlx5dv_destroy_mkey(mkey);
         if (output_mr) ibv_dereg_mr(output_mr);
+        for (auto* pointer : peer_flags)
+            if (pointer && pointer != flags) cudaIpcCloseMemHandle(pointer);
+        if (flags) cudaFree(flags);
     }
 };
 
@@ -352,7 +367,7 @@ RdmaTransport::RdmaTransport(int rank,
         qp_attr.qp_type = IBV_QPT_RC;
         qp_attr.comp_mask = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_SEND_OPS_FLAGS;
         qp_attr.pd = impl_->pd;
-        qp_attr.send_ops_flags = IBV_QP_EX_WITH_RDMA_WRITE;
+        qp_attr.send_ops_flags = IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM;
         mlx5dv_qp_init_attr dv_attr{};
         dv_attr.comp_mask = MLX5DV_QP_INIT_ATTR_MASK_SEND_OPS_FLAGS;
         dv_attr.send_ops_flags = MLX5DV_QP_EX_WITH_MKEY_CONFIGURE;
@@ -457,6 +472,9 @@ std::unique_ptr<RdmaBuffer> RdmaTransport::register_buffer(void* pointer,
     state->mode = mode;
     state->output_pointer = pointer;
     state->peer_pointers[impl_->rank] = pointer;
+    cuda_check(cudaMalloc(&state->flags, 4 * sizeof(uint64_t)), "cudaMalloc RDMA flags");
+    cuda_check(cudaMemset(state->flags, 0, 4 * sizeof(uint64_t)), "cudaMemset RDMA flags");
+    state->peer_flags[impl_->rank] = state->flags;
     state->output_mr = register_gpu_mr(
         impl_->pd, pointer, bytes,
         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
@@ -492,6 +510,8 @@ std::vector<int64_t> RdmaTransport::buffer_info(const RdmaBuffer& buffer) const
     wire.rkey = buffer.impl_->output_mr->rkey;
     cuda_check(cudaIpcGetMemHandle(&wire.ipc, buffer.impl_->output_pointer),
                "cudaIpcGetMemHandle");
+    cuda_check(cudaIpcGetMemHandle(&wire.flag_ipc, buffer.impl_->flags),
+               "cudaIpcGetMemHandle flags");
     for (int peer = 0; peer < kWorld; ++peer)
         if (buffer.impl_->destination_mkeys[peer])
             wire.destination_rkey[peer] = buffer.impl_->destination_mkeys[peer]->rkey;
@@ -511,6 +531,10 @@ void RdmaTransport::connect_buffer(
                                         buffer.impl_->peers[peer].ipc,
                                         cudaIpcMemLazyEnablePeerAccess),
                    "cudaIpcOpenMemHandle");
+        cuda_check(cudaIpcOpenMemHandle(&buffer.impl_->peer_flags[peer],
+                                        buffer.impl_->peers[peer].flag_ipc,
+                                        cudaIpcMemLazyEnablePeerAccess),
+                   "cudaIpcOpenMemHandle flags");
     }
     buffer.impl_->connected = true;
 }
@@ -520,6 +544,15 @@ std::vector<uint64_t> RdmaTransport::peer_pointers(const RdmaBuffer& buffer) con
     std::vector<uint64_t> result(kWorld);
     for (int peer = 0; peer < kWorld; ++peer)
         result[peer] = reinterpret_cast<uint64_t>(buffer.impl_->peer_pointers[peer]);
+    return result;
+}
+
+std::vector<uint64_t> RdmaTransport::peer_flags(const RdmaBuffer& buffer) const
+{
+    std::vector<uint64_t> result(4);
+    const int first = impl_->rank / 4 * 4;
+    for (int index = 0; index < 4; ++index)
+        result[index] = reinterpret_cast<uint64_t>(buffer.impl_->peer_flags[first + index]);
     return result;
 }
 
@@ -533,7 +566,8 @@ void RdmaTransport::start_exchange(const void* input,
                                    int64_t dim,
                                    int64_t element_size)
 {
-    TORCH_CHECK(impl_->pending_writes == 0, "previous RDMA exchange is unfinished");
+    TORCH_CHECK(impl_->pending_completions == 0,
+                "previous RDMA exchange is unfinished");
     TORCH_CHECK(output.impl_->connected, "RDMA output metadata is not connected");
     TORCH_CHECK(output.impl_->mode == mode, "RDMA output mode mismatch");
     auto& state = *output.impl_;
@@ -575,6 +609,10 @@ void RdmaTransport::start_exchange(const void* input,
     TORCH_CHECK(payload64 <= UINT32_MAX, "per-peer payload exceeds mlx5 WR limit");
     const uint32_t payload = static_cast<uint32_t>(payload64);
     for (int step = 4; step < kWorld; ++step) {
+        impl_->post_receive(impl_->rank ^ step);
+        ++impl_->pending_completions;
+    }
+    for (int step = 4; step < kWorld; ++step) {
         const int peer = impl_->rank ^ step;
         if (mode == 0) {
             impl_->post_write(peer, state.source_mkeys[peer]->lkey, 0, payload,
@@ -588,16 +626,16 @@ void RdmaTransport::start_exchange(const void* input,
                               reinterpret_cast<uint64_t>(input) + peer * payload64,
                               payload, remote_key, 0);
         }
-        ++impl_->pending_writes;
+        ++impl_->pending_completions;
     }
 }
 
 void RdmaTransport::finish_exchange()
 {
-    const int pending = impl_->pending_writes;
+    const int pending = impl_->pending_completions;
     TORCH_CHECK(pending > 0, "no RDMA exchange is pending");
     impl_->poll(pending);
-    impl_->pending_writes = 0;
+    impl_->pending_completions = 0;
 }
 
 void RdmaTransport::flush() const
