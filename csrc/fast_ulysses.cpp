@@ -11,18 +11,13 @@ namespace symm = c10d::symmetric_memory;
 
 namespace {
 
-bool supports(const std::vector<int64_t>& devices, bool atomics)
+bool supports_p2p(const std::vector<int64_t>& devices)
 {
     for (int64_t src : devices) {
         for (int64_t dst : devices) {
             if (src == dst) continue;
             int ok = 0;
-            if (atomics) {
-                FU_CUDA_CHECK(cudaDeviceGetP2PAttribute(
-                    &ok, cudaDevP2PAttrNativeAtomicSupported, src, dst));
-            } else {
-                FU_CUDA_CHECK(cudaDeviceCanAccessPeer(&ok, src, dst));
-            }
+            FU_CUDA_CHECK(cudaDeviceCanAccessPeer(&ok, src, dst));
             if (!ok) return false;
         }
     }
@@ -39,8 +34,7 @@ UlyssesGroup::UlyssesGroup(std::string name,
     : name_(std::move(name)),
       rank_(rank),
       world_size_(world_size),
-      device_(device),
-      device_barrier_(supports(devices, true))
+      device_(device)
 {
     TORCH_CHECK(world_size_ >= 1 && world_size_ <= 8 &&
                     (world_size_ & (world_size_ - 1)) == 0,
@@ -51,7 +45,7 @@ UlyssesGroup::UlyssesGroup(std::string name,
                     world_size_,
                 "one rank per GPU is required");
     TORCH_CHECK(devices[rank_] == device_, "rank is using the wrong GPU");
-    TORCH_CHECK(supports(devices, false), "CUDA P2P is required between every GPU");
+    TORCH_CHECK(supports_p2p(devices), "CUDA P2P is required between every GPU");
     const at::cuda::CUDAGuard guard(device_);
     rdma_ = std::make_unique<RdmaTransport>(rank_, world_size_, device_, devices);
 }
@@ -123,11 +117,12 @@ at::Tensor UlyssesGroup::allocate_output(const at::Tensor& input, int64_t mode)
                     "symmetric-memory group size mismatch");
         memory->get_signal_pad(rank_, {world_size_}, at::kLong, offset).zero_();
     }
-    buffer->tensor = tensor;
     buffer->shape = shape;
     buffer->dtype = input.scalar_type();
 
     auto output = tensor.view(shape);
+    // Keep this exact TensorImpl alive so registry identity cannot be reused.
+    buffer->tensor = output;
     if (rdma_ && rdma_->enabled()) {
         buffer->rdma = rdma_->register_buffer(
             output.data_ptr(), output.numel() * output.element_size(), mode,
@@ -136,7 +131,7 @@ at::Tensor UlyssesGroup::allocate_output(const at::Tensor& input, int64_t mode)
     }
     Buffer* raw = buffer.get();
     buffers_.push_back(std::move(buffer));
-    outputs_[output.data_ptr()] = raw;
+    outputs_[output.unsafeGetTensorImpl()] = raw;
     return output;
 }
 
@@ -146,7 +141,7 @@ void UlyssesGroup::all_to_all_4d(const at::Tensor& input,
                                  int64_t stream_ptr)
 {
     const auto shape = output_shape(input, mode);
-    const auto it = outputs_.find(output.data_ptr());
+    const auto it = outputs_.find(output.unsafeGetTensorImpl());
     TORCH_CHECK(it != outputs_.end(), "output must come from allocate_output()");
     Buffer& buffer = *it->second;
     TORCH_CHECK(output.is_cuda() && output.get_device() == device_ && output.is_contiguous(),
@@ -178,16 +173,16 @@ void UlyssesGroup::all_to_all_4d(const at::Tensor& input,
         rdma_->flush();
         return;
     }
-    if (device_barrier_) barrier(stream, buffer.flags, rank_, ++buffer.epoch);
+    barrier(stream, buffer.flags, rank_, ++buffer.epoch);
     launch_all_to_all(input.data_ptr(), buffer.peers, mode, input.size(0), input.size(1),
                       input.size(2), input.size(3), input.element_size(), rank_, stream);
-    if (device_barrier_) barrier(stream, buffer.flags, rank_, ++buffer.epoch);
+    barrier(stream, buffer.flags, rank_, ++buffer.epoch);
 }
 
 std::string UlyssesGroup::backend() const
 {
     if (rdma_ && rdma_->enabled()) return "mlx5";
-    return device_barrier_ ? "device" : "pcie";
+    return "p2p";
 }
 
 std::vector<int64_t> UlyssesGroup::connection_info() const
@@ -204,7 +199,7 @@ void UlyssesGroup::connect(const std::vector<std::vector<int64_t>>& peers)
 
 std::vector<int64_t> UlyssesGroup::buffer_info(at::Tensor output) const
 {
-    const auto it = outputs_.find(output.data_ptr());
+    const auto it = outputs_.find(output.unsafeGetTensorImpl());
     TORCH_CHECK(it != outputs_.end() && it->second->rdma,
                 "output must be an RDMA allocate_output() result");
     return rdma_->buffer_info(*it->second->rdma);
@@ -214,7 +209,7 @@ void UlyssesGroup::connect_buffer(
     at::Tensor output,
     const std::vector<std::vector<int64_t>>& peers)
 {
-    const auto it = outputs_.find(output.data_ptr());
+    const auto it = outputs_.find(output.unsafeGetTensorImpl());
     TORCH_CHECK(it != outputs_.end() && it->second->rdma,
                 "output must be an RDMA allocate_output() result");
     rdma_->connect_buffer(*it->second->rdma, peers);

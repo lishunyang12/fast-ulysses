@@ -7,7 +7,7 @@ struct PeerFlags { uint64_t ptr[8]; };
 
 __device__ __forceinline__ void publish(uint64_t* address, uint64_t value)
 {
-    asm volatile("red.release.sys.global.max.u64 [%0], %1;" ::
+    asm volatile("st.release.sys.global.u64 [%0], %1;" ::
                  "l"(address), "l"(value) : "memory");
 }
 

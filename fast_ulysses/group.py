@@ -37,7 +37,6 @@ class UlyssesGroup:
             devices,
         )
         self.backend = self._group.backend()
-        self._sync = torch.zeros(1, dtype=torch.int32, device=self.device)
         if self.backend == "mlx5":
             peers = [None] * self.world_size
             dist.all_gather_object(peers, self._group.connection_info(), group=self.pg)
@@ -81,13 +80,10 @@ class UlyssesGroup:
         selected = stream or torch.cuda.current_stream(self.device)
         if torch.device(selected.device) != self.device:
             raise ValueError("stream is on the wrong GPU")
-        if self.backend != "device":
+        if self.backend == "mlx5":
             selected.synchronize()
             self._group.all_to_all_4d(x, out, mode, selected.cuda_stream)
             selected.synchronize()
-            if self.backend != "mlx5":
-                dist.all_reduce(self._sync, group=self.pg)
-                torch.cuda.synchronize(self.device)
         else:
             self._group.all_to_all_4d(x, out, mode, selected.cuda_stream)
         return out

@@ -3,15 +3,16 @@
 #include "rdma.h"
 
 #include <ATen/ATen.h>
+#include <c10/core/TensorImpl.h>
 #include <c10/util/Exception.h>
 #include <cuda_runtime.h>
 #include <torch/custom_class.h>
 #include <torch/version.h>
 
 #include <cstdint>
-#include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 static_assert(TORCH_VERSION_MAJOR > 2 ||
@@ -68,11 +69,10 @@ private:
     int rank_;
     int world_size_;
     int device_;
-    bool device_barrier_;
     bool destroyed_ = false;
     std::unique_ptr<RdmaTransport> rdma_;
     std::vector<std::unique_ptr<Buffer>> buffers_;
-    std::map<const void*, Buffer*> outputs_;
+    std::unordered_map<const c10::TensorImpl*, Buffer*> outputs_;
 };
 
 void launch_all_to_all(const void* input,
