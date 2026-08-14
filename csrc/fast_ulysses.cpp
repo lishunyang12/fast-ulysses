@@ -161,12 +161,13 @@ void UlyssesGroup::exchange(const at::Tensor& input,
     auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     if (rdma_ && rdma_->enabled()) {
         TORCH_CHECK(buffer.rdma, "RDMA output is not registered");
-        rdma_->exchange(input.data_ptr(), input.numel() * input.element_size(),
-                        *buffer.rdma, mode, input.size(0), input.size(1), input.size(2),
-                        input.size(3), input.element_size());
+        rdma_->start_exchange(input.data_ptr(), input.numel() * input.element_size(),
+                              *buffer.rdma, mode, input.size(0), input.size(1),
+                              input.size(2), input.size(3), input.element_size());
         launch_local_all_to_all(input.data_ptr(), buffer.peers, mode, input.size(0),
                                 input.size(1), input.size(2), input.size(3),
                                 input.element_size(), rank_, stream);
+        rdma_->finish_exchange();
         return;
     }
     if (device_barrier_) barrier(stream, buffer.flags, rank_, ++buffer.epoch);

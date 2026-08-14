@@ -186,6 +186,7 @@ struct RdmaTransport::Impl {
     GroupWire local{};
     std::array<GroupWire, kWorld> peers{};
     uint64_t next_wr_id = 1;
+    int pending_writes = 0;
 
     bool cross(int peer) const { return peer / 4 != rank / 4; }
 
@@ -522,16 +523,17 @@ std::vector<uint64_t> RdmaTransport::peer_pointers(const RdmaBuffer& buffer) con
     return result;
 }
 
-void RdmaTransport::exchange(const void* input,
-                             int64_t input_bytes,
-                             RdmaBuffer& output,
-                             int mode,
-                             int64_t batch,
-                             int64_t seq,
-                             int64_t heads,
-                             int64_t dim,
-                             int64_t element_size)
+void RdmaTransport::start_exchange(const void* input,
+                                   int64_t input_bytes,
+                                   RdmaBuffer& output,
+                                   int mode,
+                                   int64_t batch,
+                                   int64_t seq,
+                                   int64_t heads,
+                                   int64_t dim,
+                                   int64_t element_size)
 {
+    TORCH_CHECK(impl_->pending_writes == 0, "previous RDMA exchange is unfinished");
     TORCH_CHECK(output.impl_->connected, "RDMA output metadata is not connected");
     TORCH_CHECK(output.impl_->mode == mode, "RDMA output mode mismatch");
     auto& state = *output.impl_;
@@ -586,8 +588,16 @@ void RdmaTransport::exchange(const void* input,
                               reinterpret_cast<uint64_t>(input) + peer * payload64,
                               payload, remote_key, 0);
         }
+        ++impl_->pending_writes;
     }
-    impl_->poll(4);
+}
+
+void RdmaTransport::finish_exchange()
+{
+    const int pending = impl_->pending_writes;
+    TORCH_CHECK(pending > 0, "no RDMA exchange is pending");
+    impl_->poll(pending);
+    impl_->pending_writes = 0;
 }
 
 void RdmaTransport::flush() const
