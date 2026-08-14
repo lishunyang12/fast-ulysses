@@ -42,6 +42,7 @@ class UlyssesGroup:
             peers = [None] * self.world_size
             dist.all_gather_object(peers, self._group.connection_info(), group=self.pg)
             self._group.connect(peers)
+        self._output_pool = {}
         self._destroyed = False
 
     def allocate_output(self, x: torch.Tensor, mode: int = 0) -> torch.Tensor:
@@ -58,11 +59,23 @@ class UlyssesGroup:
     def exchange(
         self,
         x: torch.Tensor,
-        output: torch.Tensor,
+        output: torch.Tensor | None = None,
         mode: int = 0,
         stream: torch.cuda.Stream | None = None,
     ) -> torch.Tensor:
+        """Exchange into ``output`` or a reusable internal registered workspace.
+
+        The automatic workspace is overwritten by the next call with the same
+        mode, shape, and dtype. Pass an explicit output when multiple results
+        with the same geometry must remain live simultaneously.
+        """
         self._check_alive()
+        if output is None:
+            key = (mode, tuple(x.shape), x.dtype)
+            output = self._output_pool.get(key)
+            if output is None:
+                output = self.allocate_output(x, mode)
+                self._output_pool[key] = output
         selected = stream or torch.cuda.current_stream(self.device)
         if torch.device(selected.device) != self.device:
             raise ValueError("stream is on the wrong GPU")
@@ -83,6 +96,7 @@ class UlyssesGroup:
         torch.cuda.synchronize(self.device)
         dist.barrier(group=self.pg, device_ids=[self.device.index])
         self._group.destroy()
+        self._output_pool.clear()
         self._destroyed = True
 
     def _check_alive(self):

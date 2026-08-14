@@ -11,7 +11,7 @@ Supported:
 - forward `[B, S_local, H_global, D] -> [B, S_global, H_local, D]`;
 - reverse `[B, S_global, H_local, D] -> [B, S_local, H_global, D]`.
 
-There is no varlen, uneven split, autograd, internal pool, async work wrapper, plan cache, CUDA Graph,
+There is no varlen, uneven split, autograd, async work wrapper, plan cache, CUDA Graph,
 or release-wheel machinery.
 
 ## Install
@@ -53,10 +53,15 @@ ccache -s
 from fast_ulysses import UlyssesGroup
 
 group = UlyssesGroup()
-output = group.allocate_output(x, mode=0)  # collective; allocate once
-group.exchange(x, output, mode=0)
+output = group.exchange(x, mode=0)
 group.destroy()
 ```
+
+The first call for each `(mode, shape, dtype)` collectively creates a registered output workspace;
+later calls reuse it automatically. The returned workspace is overwritten by the next call with
+the same key. `allocate_output` and an explicit `output` remain available only when two results of
+the same geometry must stay live at once. `destroy()` releases all registered workspaces; there is
+no per-output release step.
 
 On the supported 8-GPU PCIe host, same-socket transfers use CUDA IPC pointers. Cross-socket
 transfers use mlx5 interleaved MKeys: the NIC gathers or scatters the strided `[S,H,D]` slices
@@ -75,7 +80,7 @@ export FAST_ULYSSES_NICS=mlx5_2,mlx5_3,mlx5_0,mlx5_1,mlx5_6,mlx5_7,mlx5_4,mlx5_5
 
 - `raw`: pre-packed NCCL `all_to_all_single`, communication only;
 - `layout`: preallocated NCCL pack + communication + unpack;
-- `fast`: direct P2P into the final layout;
+- `fast`: direct P2P into the final layout through the automatic output pool;
 - `GB/s`: per-rank remote-payload throughput, equivalent to NCCL bus bandwidth for all-to-all;
 - `vs raw` and `vs layout`: baseline latency divided by fast latency.
 

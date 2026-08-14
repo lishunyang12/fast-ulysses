@@ -161,6 +161,12 @@ void UlyssesGroup::exchange(const at::Tensor& input,
     auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     if (rdma_ && rdma_->enabled()) {
         TORCH_CHECK(buffer.rdma, "RDMA output is not registered");
+        at::Tensor previous_input;
+        if (!buffer.input_owner.defined() ||
+            buffer.input_owner.data_ptr() != input.data_ptr()) {
+            previous_input = std::move(buffer.input_owner);
+            buffer.input_owner = input;
+        }
         rdma_->start_exchange(input.data_ptr(), input.numel() * input.element_size(),
                               *buffer.rdma, mode, input.size(0), input.size(1),
                               input.size(2), input.size(3), input.element_size());

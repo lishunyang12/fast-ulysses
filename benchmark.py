@@ -188,8 +188,7 @@ def main():
         recv_fwd = torch.empty_like(send_fwd)
         y_ref = torch.empty((1, seq, heads // ws, dim), dtype=x.dtype, device=x.device)
         nccl_forward(x, send_fwd, recv_fwd, y_ref, ws)
-        out_fwd = group.allocate_output(x, mode=0)
-        group.exchange(x, out_fwd, mode=0)
+        out_fwd = group.exchange(x, mode=0)
         if not torch.equal(out_fwd, y_ref):
             raise RuntimeError(f"rank {rank}: forward mismatch for {seq, heads, dim}")
 
@@ -197,8 +196,7 @@ def main():
         recv_rev = torch.empty_like(send_fwd)
         x_ref = torch.empty_like(x)
         nccl_reverse(y_ref, send_rev, recv_rev, x_ref, ws)
-        out_rev = group.allocate_output(out_fwd, mode=1)
-        group.exchange(out_fwd, out_rev, mode=1)
+        out_rev = group.exchange(out_fwd, mode=1)
         if not torch.equal(out_rev, x) or not torch.equal(x_ref, x):
             raise RuntimeError(f"rank {rank}: reverse mismatch for {seq, heads, dim}")
 
@@ -207,10 +205,10 @@ def main():
         cases = {
             "raw_fwd": partial(dist.all_to_all_single, raw_recv_fwd, send_fwd),
             "layout_fwd": partial(nccl_forward, x, send_fwd, recv_fwd, y_ref, ws),
-            "fast_fwd": partial(group.exchange, x, out_fwd, mode=0),
+            "fast_fwd": partial(group.exchange, x, mode=0),
             "raw_rev": partial(dist.all_to_all_single, raw_recv_rev, send_rev),
             "layout_rev": partial(nccl_reverse, y_ref, send_rev, recv_rev, x_ref, ws),
-            "fast_rev": partial(group.exchange, out_fwd, out_rev, mode=1),
+            "fast_rev": partial(group.exchange, out_fwd, mode=1),
         }
         results = {
             name: timed(fn, args.warmup, args.iters, args.trials, local_rank)

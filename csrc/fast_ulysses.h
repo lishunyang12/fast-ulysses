@@ -28,6 +28,7 @@ namespace ulysses {
 
 struct Buffer {
     at::Tensor tensor;
+    at::Tensor input_owner;
     std::vector<uint64_t> peers;
     std::vector<uint64_t> flags;
     std::vector<int64_t> shape;
