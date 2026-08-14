@@ -4,6 +4,7 @@
 #include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
 #include <torch/extension.h>
 
+#include <algorithm>
 #include <set>
 
 namespace ulysses {
@@ -11,22 +12,27 @@ namespace symm = c10d::symmetric_memory;
 
 namespace {
 
-bool supports(const std::vector<int64_t>& devices, bool atomics)
+bool peer_capable(const std::vector<int64_t>& devices)
 {
     for (int64_t src : devices) {
         for (int64_t dst : devices) {
             if (src == dst) continue;
             int ok = 0;
-            if (atomics) {
-                FU_CUDA_CHECK(cudaDeviceGetP2PAttribute(
-                    &ok, cudaDevP2PAttrNativeAtomicSupported, src, dst));
-            } else {
-                FU_CUDA_CHECK(cudaDeviceCanAccessPeer(&ok, src, dst));
-            }
+            FU_CUDA_CHECK(cudaDeviceCanAccessPeer(&ok, src, dst));
             if (!ok) return false;
         }
     }
     return true;
+}
+
+// XOR-shift, so no two ranks aim at the same peer on the same step. `span` is a power of two,
+// so the peers it names are exactly the block of `span` ranks this rank sits in -- which is what
+// the mlx5 backend needs when it asks for its own quad only.
+std::vector<int> peer_order(int rank, int span)
+{
+    std::vector<int> peers;
+    for (int step = 1; step < span; ++step) peers.push_back(rank ^ step);
+    return peers;
 }
 
 }  // namespace
@@ -39,8 +45,7 @@ UlyssesGroup::UlyssesGroup(std::string name,
     : name_(std::move(name)),
       rank_(rank),
       world_size_(world_size),
-      device_(device),
-      device_barrier_(supports(devices, true))
+      device_(device)
 {
     TORCH_CHECK(world_size_ >= 1 && world_size_ <= 8 &&
                     (world_size_ & (world_size_ - 1)) == 0,
@@ -51,8 +56,15 @@ UlyssesGroup::UlyssesGroup(std::string name,
                     world_size_,
                 "one rank per GPU is required");
     TORCH_CHECK(devices[rank_] == device_, "rank is using the wrong GPU");
-    TORCH_CHECK(supports(devices, false), "CUDA P2P is required between every GPU");
+    TORCH_CHECK(peer_capable(devices), "CUDA P2P is required between every GPU");
     const at::cuda::CUDAGuard guard(device_);
+    // One stream stages the relayout, the other drives the links, and they hand slots over
+    // through the per-peer events.
+    pack_stream_ = c10::cuda::getStreamFromPool(false, device_);
+    send_stream_ = c10::cuda::getStreamFromPool(false, device_);
+    events_.resize(world_size_ + 2);
+    for (auto& event : events_)
+        FU_CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
     rdma_ = std::make_unique<RdmaTransport>(rank_, world_size_, device_, devices);
 }
 
@@ -122,6 +134,16 @@ at::Tensor UlyssesGroup::allocate_output(const at::Tensor& input, int64_t mode)
         TORCH_CHECK(static_cast<int>(buffer->peers.size()) == world_size_,
                     "symmetric-memory group size mismatch");
         memory->get_signal_pad(rank_, {world_size_}, at::kLong, offset).zero_();
+
+        // The staging window carries flat runs only. `mode` 0 fills its own; in `mode` 1 the
+        // peers write into it, which is why it is symmetric in both.
+        buffer->stage = symm::empty_strided_p2p(
+            {input.numel()}, {1}, input.scalar_type(),
+            c10::Device(c10::DeviceType::CUDA, device_), name_, std::nullopt);
+        auto staging = symm::rendezvous(buffer->stage, name_);
+        TORCH_CHECK(staging, "symmetric-memory rendezvous failed for the staging window");
+        for (void* ptr : staging->get_buffer_ptrs())
+            buffer->stage_peers.push_back(reinterpret_cast<uint64_t>(ptr));
     }
     buffer->tensor = tensor;
     buffer->shape = shape;
@@ -155,30 +177,58 @@ void UlyssesGroup::exchange(const at::Tensor& input,
                 "output shape or dtype mismatch");
     TORCH_CHECK(buffer.shape == shape && buffer.dtype == input.scalar_type(),
                 "output was allocated for another exchange");
-    TORCH_CHECK(input.data_ptr() != output.data_ptr(), "input and output alias");
+    const auto* first = static_cast<const uint8_t*>(input.data_ptr());
+    const auto* second = static_cast<const uint8_t*>(output.data_ptr());
+    TORCH_CHECK(first + input.numel() * input.element_size() <= second ||
+                    second + output.numel() * output.element_size() <= first,
+                "input and output overlap");
 
     const at::cuda::CUDAGuard guard(device_);
     auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    const Dims dims{static_cast<int>(mode), rank_,        world_size_,
+                    input.size(0),          input.size(1), input.size(2),
+                    input.size(3),          input.element_size()};
+
     if (rdma_ && rdma_->enabled()) {
         TORCH_CHECK(buffer.rdma, "RDMA output is not registered");
+        // The links and the NICs are separate hardware. Queue the copies first -- that call
+        // only submits -- so they run while `RdmaTransport::exchange` posts and polls on the
+        // host.
+        exchange_peers_direct(input.data_ptr(), buffer.peers,
+                              peer_order(rank_, kRdmaBlock), dims, stream);
         rdma_->exchange(input.data_ptr(), input.numel() * input.element_size(),
                         *buffer.rdma, mode, input.size(0), input.size(1), input.size(2),
                         input.size(3), input.element_size());
-        launch_local_all_to_all(input.data_ptr(), buffer.peers, mode, input.size(0),
-                                input.size(1), input.size(2), input.size(3),
-                                input.element_size(), rank_, stream);
         return;
     }
-    if (device_barrier_) barrier(stream, buffer.flags, rank_, ++buffer.epoch);
-    launch_all_to_all(input.data_ptr(), buffer.peers, mode, input.size(0), input.size(1),
-                      input.size(2), input.size(3), input.element_size(), rank_, stream);
-    if (device_barrier_) barrier(stream, buffer.flags, rank_, ++buffer.epoch);
+
+    const auto peers = peer_order(rank_, world_size_);
+    barrier(stream, buffer.flags, rank_, ++buffer.epoch);
+    exchange_peers(input.data_ptr(), output.data_ptr(), buffer.stage.data_ptr(), buffer.peers,
+                   buffer.stage_peers, peers, dims, stream, pack_stream_->stream(),
+                   send_stream_->stream(), events_);
+    barrier(stream, buffer.flags, rank_, ++buffer.epoch);
+    if (mode == 1)
+        unpack_peers(output.data_ptr(), buffer.stage.data_ptr(), peers, dims, stream);
 }
 
 std::string UlyssesGroup::backend() const
 {
     if (rdma_ && rdma_->enabled()) return "mlx5";
-    return device_barrier_ ? "device" : "pcie";
+    return "p2p";
+}
+
+void UlyssesGroup::release_output(at::Tensor output)
+{
+    const auto it = outputs_.find(output.data_ptr());
+    TORCH_CHECK(it != outputs_.end(), "output must come from allocate_output()");
+    Buffer* released = it->second;
+    outputs_.erase(it);
+    buffers_.erase(std::remove_if(buffers_.begin(), buffers_.end(),
+                                  [released](const std::unique_ptr<Buffer>& buffer) {
+                                      return buffer.get() == released;
+                                  }),
+                   buffers_.end());
 }
 
 std::vector<int64_t> UlyssesGroup::connection_info() const
@@ -223,6 +273,9 @@ void UlyssesGroup::destroy()
     destroyed_ = true;
     outputs_.clear();
     buffers_.clear();
+    for (auto& event : events_)
+        if (event) cudaEventDestroy(event);
+    events_.clear();
     rdma_.reset();
 }
 
@@ -234,6 +287,7 @@ TORCH_LIBRARY(fast_ulysses, m)
         .def(torch::init<std::string, int64_t, int64_t, int64_t,
                          std::vector<int64_t>>())
         .def("allocate_output", &ulysses::UlyssesGroup::allocate_output)
+        .def("release_output", &ulysses::UlyssesGroup::release_output)
         .def("exchange", &ulysses::UlyssesGroup::exchange)
         .def("backend", &ulysses::UlyssesGroup::backend)
         .def("connection_info", &ulysses::UlyssesGroup::connection_info)

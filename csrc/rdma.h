@@ -7,6 +7,11 @@
 
 namespace ulysses {
 
+// The mlx5 backend splits the node into two blocks of this many ranks: inside a block the
+// transfer is a CUDA P2P copy, across it an RDMA write. A power of two, so `rank ^ step` for
+// `step` below it never leaves the block.
+constexpr int kRdmaBlock = 4;
+
 class RdmaBuffer {
 public:
     ~RdmaBuffer();

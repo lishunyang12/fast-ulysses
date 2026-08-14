@@ -147,7 +147,7 @@ std::string select_nic(int rank, int device)
               [](const std::string& a, const std::string& b) {
                   return nic_number(a) < nic_number(b);
               });
-    return closest[device % closest.size()];
+    return closest[rank % closest.size()];
 }
 
 int select_gid_index(const std::string& nic, ibv_context* context)
@@ -187,7 +187,7 @@ struct RdmaTransport::Impl {
     std::array<GroupWire, kWorld> peers{};
     uint64_t next_wr_id = 1;
 
-    bool cross(int peer) const { return peer / 4 != rank / 4; }
+    bool cross(int peer) const { return peer / kRdmaBlock != rank / kRdmaBlock; }
 
     void poll(int expected)
     {
@@ -463,6 +463,7 @@ std::unique_ptr<RdmaBuffer> RdmaTransport::register_buffer(void* pointer,
                 ": ", std::strerror(errno));
 
     if (mode == 1) {
+        int posted = 0;
         const int64_t rows64 = batch * seq / kWorld;
         const int64_t width64 = heads * dim * element_size;
         const int64_t pitch64 = heads * kWorld * dim * element_size;
@@ -478,8 +479,9 @@ std::unique_ptr<RdmaBuffer> RdmaTransport::register_buffer(void* pointer,
                 reinterpret_cast<uint64_t>(pointer) + peer * width64,
                 static_cast<uint32_t>(width64), static_cast<uint32_t>(pitch64 - width64),
                 static_cast<uint32_t>(rows64), state->output_mr->lkey);
+            ++posted;
         }
-        impl_->poll(4);
+        impl_->poll(posted);
     }
     return std::unique_ptr<RdmaBuffer>(new RdmaBuffer(std::move(state)));
 }
@@ -549,6 +551,7 @@ void RdmaTransport::exchange(const void* input,
         state.input_bytes = input_bytes;
 
         if (mode == 0) {
+            int posted = 0;
             const int64_t rows64 = batch * seq;
             const int64_t width64 = heads / kWorld * dim * element_size;
             const int64_t pitch64 = heads * dim * element_size;
@@ -564,15 +567,17 @@ void RdmaTransport::exchange(const void* input,
                     static_cast<uint32_t>(width64),
                     static_cast<uint32_t>(pitch64 - width64),
                     static_cast<uint32_t>(rows64), state.input_mr->lkey);
+                ++posted;
             }
-            impl_->poll(4);
+            impl_->poll(posted);
         }
     }
 
     const int64_t payload64 = input_bytes / kWorld;
     TORCH_CHECK(payload64 <= UINT32_MAX, "per-peer payload exceeds mlx5 WR limit");
     const uint32_t payload = static_cast<uint32_t>(payload64);
-    for (int step = 4; step < kWorld; ++step) {
+    int posted = 0;
+    for (int step = kRdmaBlock; step < kWorld; ++step) {
         const int peer = impl_->rank ^ step;
         if (mode == 0) {
             impl_->post_write(peer, state.source_mkeys[peer]->lkey, 0, payload,
@@ -586,8 +591,9 @@ void RdmaTransport::exchange(const void* input,
                               reinterpret_cast<uint64_t>(input) + peer * payload64,
                               payload, remote_key, 0);
         }
+        ++posted;
     }
-    impl_->poll(4);
+    impl_->poll(posted);
 }
 
 void RdmaTransport::flush() const
