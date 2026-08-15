@@ -7,7 +7,9 @@ Supported:
 - one rank per GPU, with 1, 2, 4, or 8 GPUs;
 - contiguous `[B, S, H, D]` FP16/BF16 tensors;
 - equal splits and inference only;
-- batch size 1 on the 8-GPU mlx5 path;
+- batch size 1 on the 8-GPU mlx5 path, where `heads * head_dim * itemsize` summed over all
+  ranks must also fit 65535 bytes -- the MKey stride field. Larger shapes are refused;
+  `FAST_ULYSSES_DISABLE_RDMA=1` runs them on the CUDA P2P backend;
 - mode 0 `[B, S_local, H_global, D] -> [B, S_global, H_local, D]`;
 - mode 1 `[B, S_global, H_local, D] -> [B, S_local, H_global, D]`.
 
@@ -17,7 +19,6 @@ or release-wheel machinery.
 ## Install
 
 ```bash
-source /workspace/sgl-env/bin/activate
 FAST_ULYSSES_CUDA_ARCH=100 python -m pip install -e .
 ```
 
@@ -40,11 +41,7 @@ The build also links the system `libibverbs` and `libmlx5` libraries.
 For example:
 
 ```bash
-apt-get update && apt-get install -y ccache
-source /workspace/sgl-env/bin/activate
-CCACHE_DIR=/workspace/.ccache CMAKE_BUILD_PARALLEL_LEVEL=32 \
-  FAST_ULYSSES_CUDA_ARCH=100 python -m pip install -e .
-ccache -s
+CMAKE_BUILD_PARALLEL_LEVEL=32 FAST_ULYSSES_CUDA_ARCH=100 python -m pip install -e .
 ```
 
 ## Use
@@ -73,6 +70,21 @@ rank-local devices explicitly, for example:
 ```bash
 export FAST_ULYSSES_NICS=mlx5_2,mlx5_3,mlx5_0,mlx5_1,mlx5_6,mlx5_7,mlx5_4,mlx5_5
 ```
+
+## Test
+
+`test_correctness.py` runs under torchrun. It covers every supported shape and dtype against the
+NCCL reference, the rejection paths, and back-to-back calls with one rank per quad deliberately
+skewed. That last check is armed: the same pattern runs once over raw peer copies with no barrier
+at all, and must tear. A run whose control stays clean prints `BLIND` and fails, because it proved
+nothing.
+
+```bash
+torchrun --standalone --nproc_per_node=8 test_correctness.py
+FAST_ULYSSES_DISABLE_RDMA=1 torchrun --standalone --nproc_per_node=8 test_correctness.py
+```
+
+Run both: the two backends synchronise differently, and only the second one exercises batch > 1.
 
 ## Benchmark
 
