@@ -7,10 +7,14 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <memory>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -68,12 +72,164 @@ void verbs_check(int result, const char* operation)
     TORCH_CHECK(result == 0, operation, ": ", std::strerror(result > 0 ? result : errno));
 }
 
+int64_t checked_mul(int64_t left, int64_t right, const char* value)
+{
+    TORCH_CHECK(left > 0 && right > 0, value, " requires positive factors");
+    TORCH_CHECK(left <= std::numeric_limits<int64_t>::max() / right,
+                value, " exceeds int64 range");
+    return left * right;
+}
+
+uint64_t checked_address_add(uint64_t address, uint64_t offset, const char* value)
+{
+    TORCH_CHECK(address <= std::numeric_limits<uint64_t>::max() - offset,
+                value, " address overflows uint64");
+    return address + offset;
+}
+
+uint64_t checked_offset_mul(uint64_t left, uint64_t right, const char* value)
+{
+    TORCH_CHECK(right == 0 || left <= std::numeric_limits<uint64_t>::max() / right,
+                value, " offset exceeds uint64 range");
+    return left * right;
+}
+
+size_t checked_registration_bytes(int64_t bytes)
+{
+    TORCH_CHECK(bytes > 0, "RDMA buffer size must be positive");
+    TORCH_CHECK(static_cast<uint64_t>(bytes) <= std::numeric_limits<size_t>::max(),
+                "RDMA buffer size exceeds size_t range");
+    return static_cast<size_t>(bytes);
+}
+
+int64_t checked_tensor_bytes(int mode,
+                             int64_t bytes,
+                             int64_t batch,
+                             int64_t seq,
+                             int64_t heads,
+                             int64_t dim,
+                             int64_t element_size)
+{
+    TORCH_CHECK(mode == 0 || mode == 1, "RDMA mode must be 0 or 1");
+    TORCH_CHECK(batch > 0 && seq > 0 && heads > 0 && dim > 0 && element_size > 0,
+                "RDMA dimensions and element size must be positive");
+    if (mode == 0) {
+        TORCH_CHECK(heads % kWorld == 0,
+                    "mode=0 head dimension must divide world_size");
+    } else {
+        TORCH_CHECK(seq % kWorld == 0,
+                    "mode=1 sequence dimension must divide world_size");
+    }
+
+    const int64_t rows = checked_mul(batch, seq, "RDMA element count");
+    const int64_t columns = checked_mul(heads, dim, "RDMA element count");
+    const int64_t elements = checked_mul(rows, columns, "RDMA element count");
+    const int64_t expected = checked_mul(elements, element_size, "RDMA tensor size");
+    TORCH_CHECK(bytes == expected, "RDMA buffer size does not match its shape: expected ",
+                expected, " bytes but received ", bytes);
+    checked_registration_bytes(bytes);
+    return expected;
+}
+
+struct MkeyGeometry {
+    uint32_t rows = 0;
+    uint32_t width = 0;
+    uint32_t skip = 0;
+    uint64_t pitch = 0;
+};
+
+MkeyGeometry mkey_geometry(int mode,
+                           int64_t batch,
+                           int64_t seq,
+                           int64_t heads,
+                           int64_t dim,
+                           int64_t element_size)
+{
+    int64_t rows = 0;
+    int64_t width = 0;
+    int64_t pitch = 0;
+    if (mode == 0) {
+        rows = checked_mul(batch, seq, "mode=0 MKey rows");
+        const int64_t head_width = checked_mul(heads / kWorld, dim,
+                                               "mode=0 MKey width");
+        width = checked_mul(head_width, element_size, "mode=0 MKey width");
+        pitch = checked_mul(checked_mul(heads, dim, "mode=0 MKey pitch"),
+                            element_size, "mode=0 MKey pitch");
+    } else {
+        rows = checked_mul(batch, seq / kWorld, "mode=1 MKey rows");
+        width = checked_mul(checked_mul(heads, dim, "mode=1 MKey width"),
+                            element_size, "mode=1 MKey width");
+        pitch = checked_mul(checked_mul(heads, kWorld, "mode=1 MKey pitch"),
+                            checked_mul(dim, element_size, "mode=1 MKey pitch"),
+                            "mode=1 MKey pitch");
+    }
+    TORCH_CHECK(rows <= UINT32_MAX, "mode=", mode,
+                " MKey row count exceeds UINT32_MAX");
+    TORCH_CHECK(width <= UINT32_MAX, "mode=", mode,
+                " MKey width exceeds UINT32_MAX");
+    TORCH_CHECK(width <= pitch, "mode=", mode, " MKey width exceeds pitch");
+    TORCH_CHECK(pitch <= kMaxInterleavedStride, "mode=", mode,
+                " MKey pitch exceeds the device interleaved-stride limit of ",
+                kMaxInterleavedStride, " bytes");
+    const int64_t skip = pitch - width;
+    TORCH_CHECK(skip <= UINT32_MAX, "mode=", mode,
+                " MKey skip exceeds UINT32_MAX");
+    return {static_cast<uint32_t>(rows), static_cast<uint32_t>(width),
+            static_cast<uint32_t>(skip), static_cast<uint64_t>(pitch)};
+}
+
+uint64_t mkey_peer_address(const void* pointer,
+                           int peer,
+                           int64_t bytes,
+                           const MkeyGeometry& geometry,
+                           const char* value)
+{
+    const uint64_t peer_offset = checked_offset_mul(peer, geometry.width, value);
+    const uint64_t row_offset = checked_offset_mul(geometry.rows - 1, geometry.pitch, value);
+    const uint64_t end = checked_address_add(
+        checked_address_add(peer_offset, row_offset, value), geometry.width, value);
+    TORCH_CHECK(end <= static_cast<uint64_t>(bytes), value,
+                " interleaved layout exceeds registered memory");
+    const uint64_t base = reinterpret_cast<uint64_t>(pointer);
+    checked_address_add(base, end, value);
+    return checked_address_add(base, peer_offset, value);
+}
+
+uint32_t checked_payload(int64_t input_bytes)
+{
+    checked_registration_bytes(input_bytes);
+    TORCH_CHECK(input_bytes % kWorld == 0,
+                "RDMA input bytes must divide world_size");
+    const int64_t payload = input_bytes / kWorld;
+    TORCH_CHECK(payload > 0 && payload <= UINT32_MAX,
+                "per-peer payload exceeds mlx5 WR limits");
+    return static_cast<uint32_t>(payload);
+}
+
 ibv_mr* register_gpu_mr(ibv_pd* pd, void* pointer, size_t bytes, int access)
 {
+    TORCH_CHECK(pointer, "cannot register a null GPU pointer");
     auto* mr = ibv_reg_mr(pd, pointer, bytes, access);
     TORCH_CHECK(mr, "ibv_reg_mr failed: ", std::strerror(errno));
     return mr;
 }
+
+struct MrDeleter {
+    void operator()(ibv_mr* mr) const noexcept
+    {
+        if (mr) ibv_dereg_mr(mr);
+    }
+};
+
+struct MkeyDeleter {
+    void operator()(mlx5dv_mkey* mkey) const noexcept
+    {
+        if (mkey) mlx5dv_destroy_mkey(mkey);
+    }
+};
+
+using MrHandle = std::unique_ptr<ibv_mr, MrDeleter>;
+using MkeyHandle = std::unique_ptr<mlx5dv_mkey, MkeyDeleter>;
 
 int nic_number(const std::string& name)
 {
@@ -276,31 +432,77 @@ struct RdmaTransport::Impl {
 struct RdmaBuffer::Impl {
     ibv_mr* output_mr = nullptr;
     void* output_pointer = nullptr;
+    int64_t output_bytes = 0;
     std::array<mlx5dv_mkey*, kWorld> destination_mkeys{};
     ibv_mr* input_mr = nullptr;
     std::array<mlx5dv_mkey*, kWorld> source_mkeys{};
     const void* input_pointer = nullptr;
     int64_t input_bytes = 0;
     int mode = 0;
+    int64_t batch = 0;
+    int64_t seq = 0;
+    int64_t heads = 0;
+    int64_t dim = 0;
+    int64_t element_size = 0;
     std::array<BufferWire, kWorld> peers{};
     std::array<void*, kWorld> peer_pointers{};
     void* flags = nullptr;
     std::array<void*, kWorld> peer_flags{};
     bool connected = false;
+    bool imports_closed = false;
+
+    cudaError_t close_imports() noexcept
+    {
+        // Closing is terminal even if one mapping reports an error. Successfully closed handles
+        // stay null so a coordinated retry only visits the remainder.
+        connected = false;
+        cudaError_t first_error = cudaSuccess;
+        auto close = [&first_error](void*& pointer, const void* local) {
+            if (!pointer || pointer == local) return;
+            const cudaError_t result = cudaIpcCloseMemHandle(pointer);
+            if (result == cudaSuccess)
+                pointer = nullptr;
+            else if (first_error == cudaSuccess)
+                first_error = result;
+        };
+        for (auto*& pointer : peer_pointers) close(pointer, output_pointer);
+        for (auto*& pointer : peer_flags) close(pointer, flags);
+        if (first_error == cudaSuccess) imports_closed = true;
+        return first_error;
+    }
+
+    void release_local() noexcept
+    {
+        for (auto*& mkey : source_mkeys) {
+            if (mkey) mlx5dv_destroy_mkey(mkey);
+            mkey = nullptr;
+        }
+        if (input_mr) ibv_dereg_mr(input_mr);
+        input_mr = nullptr;
+        input_pointer = nullptr;
+        input_bytes = 0;
+        for (auto*& mkey : destination_mkeys) {
+            if (mkey) mlx5dv_destroy_mkey(mkey);
+            mkey = nullptr;
+        }
+        if (output_mr) ibv_dereg_mr(output_mr);
+        output_mr = nullptr;
+        for (auto*& pointer : peer_pointers)
+            if (pointer == output_pointer) pointer = nullptr;
+        for (auto*& pointer : peer_flags)
+            if (pointer == flags) pointer = nullptr;
+        if (flags) cudaFree(flags);
+        flags = nullptr;
+        output_pointer = nullptr;
+        output_bytes = 0;
+    }
 
     ~Impl()
     {
-        for (auto* pointer : peer_pointers)
-            if (pointer && pointer != output_pointer) cudaIpcCloseMemHandle(pointer);
-        for (auto* mkey : source_mkeys)
-            if (mkey) mlx5dv_destroy_mkey(mkey);
-        if (input_mr) ibv_dereg_mr(input_mr);
-        for (auto* mkey : destination_mkeys)
-            if (mkey) mlx5dv_destroy_mkey(mkey);
-        if (output_mr) ibv_dereg_mr(output_mr);
-        for (auto* pointer : peer_flags)
-            if (pointer && pointer != flags) cudaIpcCloseMemHandle(pointer);
-        if (flags) cudaFree(flags);
+        // The coordinated path closes imports before peers release their exports. This fallback
+        // is deliberately noexcept and makes a successful explicit close safe to repeat.
+        close_imports();
+        release_local();
     }
 };
 
@@ -318,12 +520,26 @@ RdmaTransport::RdmaTransport(int rank,
     impl_->rank = rank;
     impl_->world_size = world_size;
     impl_->device = device;
+    if (world_size != kWorld || !enable) return;
+    if (devices.size() != kWorld) return;
+    for (int i = 0; i < kWorld; ++i)
+        if (devices[i] != i) return;
+    TORCH_CHECK(rank >= 0 && rank < kWorld && device == rank,
+                "mlx5 RDMA requires rank i to own CUDA device i");
+
     cuda_check(cudaDeviceGetAttribute(&impl_->write_ordering,
                                       cudaDevAttrGPUDirectRDMAWritesOrdering, device),
                "cudaDeviceGetAttribute(GPUDirectRDMAWritesOrdering)");
-    if (world_size != kWorld || !enable) return;
-    for (int i = 0; i < kWorld; ++i)
-        if (devices[i] != i) return;
+    if (impl_->write_ordering < cudaGPUDirectRDMAWritesOrderingOwner) {
+        int flush_options = 0;
+        cuda_check(cudaDeviceGetAttribute(
+                       &flush_options, cudaDevAttrGPUDirectRDMAFlushWritesOptions, device),
+                   "cudaDeviceGetAttribute(GPUDirectRDMAFlushWritesOptions)");
+        TORCH_CHECK(
+            flush_options & cudaFlushGPUDirectRDMAWritesOptionHost,
+            "mlx5 RDMA requires cudaDeviceFlushGPUDirectRDMAWrites(), but device ", device,
+            " does not advertise cudaFlushGPUDirectRDMAWritesOptionHost");
+    }
 
     impl_->nic_name = select_nic(rank, device, nics);
     int count = 0;
@@ -460,40 +676,64 @@ std::unique_ptr<RdmaBuffer> RdmaTransport::register_buffer(void* pointer,
                                                            int64_t element_size)
 {
     TORCH_CHECK(impl_->connected, "RDMA transport is not connected");
+    TORCH_CHECK(pointer, "cannot register a null RDMA output pointer");
+    checked_tensor_bytes(mode, bytes, batch, seq, heads, dim, element_size);
+    const uint32_t payload = checked_payload(bytes);
+
+    MkeyGeometry geometry{};
+    std::array<uint64_t, kWorld> destination_addresses{};
+    if (mode == 1) {
+        geometry = mkey_geometry(mode, batch, seq, heads, dim, element_size);
+        TORCH_CHECK(checked_offset_mul(geometry.rows, geometry.width,
+                                       "mode=1 MKey payload") == payload,
+                    "mode=1 MKey geometry does not match the per-peer payload");
+        for (int peer = 0; peer < kWorld; ++peer) {
+            if (!impl_->cross(peer)) continue;
+            destination_addresses[peer] = mkey_peer_address(
+                pointer, peer, bytes, geometry, "mode=1 destination MKey");
+        }
+    }
+
     auto state = std::make_unique<RdmaBuffer::Impl>();
     state->mode = mode;
     state->output_pointer = pointer;
+    state->output_bytes = bytes;
+    state->batch = batch;
+    state->seq = seq;
+    state->heads = heads;
+    state->dim = dim;
+    state->element_size = element_size;
     state->peer_pointers[impl_->rank] = pointer;
     cuda_check(cudaMalloc(&state->flags, kWorld * sizeof(uint64_t)), "cudaMalloc RDMA flags");
     cuda_check(cudaMemset(state->flags, 0, kWorld * sizeof(uint64_t)),
                "cudaMemset RDMA flags");
     state->peer_flags[impl_->rank] = state->flags;
-    state->output_mr = register_gpu_mr(
-        impl_->pd, pointer, bytes,
-        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
-    TORCH_CHECK(state->output_mr, "cannot register output GPU memory on ", impl_->nic_name,
-                ": ", std::strerror(errno));
+    MrHandle output_mr(register_gpu_mr(
+        impl_->pd, pointer, checked_registration_bytes(bytes),
+        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ));
 
     if (mode == 1) {
-        const int64_t rows64 = batch * seq / kWorld;
-        const int64_t width64 = heads * dim * element_size;
-        const int64_t pitch64 = heads * kWorld * dim * element_size;
-        TORCH_CHECK(rows64 <= UINT32_MAX && width64 <= UINT32_MAX &&
-                        pitch64 <= kMaxInterleavedStride,
-                    "mode=1 shape exceeds mlx5 UMR limits");
+        std::array<MkeyHandle, kWorld> destination_mkeys{};
         for (int peer = 0; peer < kWorld; ++peer) {
             if (!impl_->cross(peer)) continue;
-            state->destination_mkeys[peer] = impl_->create_mkey();
+            destination_mkeys[peer].reset(impl_->create_mkey());
+        }
+        int configured = 0;
+        for (int peer = 0; peer < kWorld; ++peer) {
+            if (!impl_->cross(peer)) continue;
             impl_->configure_mkey(
-                peer, state->destination_mkeys[peer],
+                peer, destination_mkeys[peer].get(),
                 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                     IBV_ACCESS_REMOTE_READ,
-                reinterpret_cast<uint64_t>(pointer) + peer * width64,
-                static_cast<uint32_t>(width64), static_cast<uint32_t>(pitch64 - width64),
-                static_cast<uint32_t>(rows64), state->output_mr->lkey);
+                destination_addresses[peer], geometry.width, geometry.skip,
+                geometry.rows, output_mr->lkey);
+            ++configured;
         }
-        impl_->poll(kWorld - kQuad);
+        impl_->poll(configured);
+        for (int peer = 0; peer < kWorld; ++peer)
+            state->destination_mkeys[peer] = destination_mkeys[peer].release();
     }
+    state->output_mr = output_mr.release();
     return std::unique_ptr<RdmaBuffer>(new RdmaBuffer(std::move(state)));
 }
 
@@ -517,21 +757,46 @@ void RdmaTransport::connect_buffer(
     const std::vector<std::vector<int64_t>>& encoded_peers) const
 {
     TORCH_CHECK(encoded_peers.size() == kWorld, "expected eight RDMA buffer peers");
+    TORCH_CHECK(!buffer.impl_->connected, "RDMA buffer is already connected");
+    TORCH_CHECK(!buffer.impl_->imports_closed,
+                "RDMA buffer imports were permanently closed");
+    std::array<BufferWire, kWorld> peers{};
     for (int peer = 0; peer < kWorld; ++peer)
-        buffer.impl_->peers[peer] = decode<BufferWire>(encoded_peers[peer]);
+        peers[peer] = decode<BufferWire>(encoded_peers[peer]);
+
+    struct PendingImports {
+        std::array<void*, kWorld> payloads{};
+        std::array<void*, kWorld> flags{};
+
+        ~PendingImports()
+        {
+            for (auto* pointer : payloads)
+                if (pointer) cudaIpcCloseMemHandle(pointer);
+            for (auto* pointer : flags)
+                if (pointer) cudaIpcCloseMemHandle(pointer);
+        }
+    } pending;
     for (int peer = 0; peer < kWorld; ++peer) {
         if (peer == impl_->rank) continue;
         if (!impl_->cross(peer))
-            cuda_check(cudaIpcOpenMemHandle(&buffer.impl_->peer_pointers[peer],
-                                            buffer.impl_->peers[peer].ipc,
+            cuda_check(cudaIpcOpenMemHandle(&pending.payloads[peer],
+                                            peers[peer].ipc,
                                             cudaIpcMemLazyEnablePeerAccess),
                        "cudaIpcOpenMemHandle");
         // Flags are mapped from every rank, not just the quad: the payload crosses the quad
         // boundary through the NIC, but the handshake is a single word and P2P reaches it.
-        cuda_check(cudaIpcOpenMemHandle(&buffer.impl_->peer_flags[peer],
-                                        buffer.impl_->peers[peer].flag_ipc,
+        cuda_check(cudaIpcOpenMemHandle(&pending.flags[peer],
+                                        peers[peer].flag_ipc,
                                         cudaIpcMemLazyEnablePeerAccess),
                    "cudaIpcOpenMemHandle flags");
+    }
+    buffer.impl_->peers = peers;
+    for (int peer = 0; peer < kWorld; ++peer) {
+        if (peer == impl_->rank) continue;
+        buffer.impl_->peer_pointers[peer] = pending.payloads[peer];
+        pending.payloads[peer] = nullptr;
+        buffer.impl_->peer_flags[peer] = pending.flags[peer];
+        pending.flags[peer] = nullptr;
     }
     buffer.impl_->connected = true;
 }
@@ -552,6 +817,15 @@ std::vector<uint64_t> RdmaTransport::peer_flags(const RdmaBuffer& buffer) const
     return result;
 }
 
+void RdmaTransport::close_buffer_imports(RdmaBuffer& buffer) const
+{
+    if (buffer.impl_->imports_closed) return;
+    TORCH_CHECK(impl_->pending_completions == 0,
+                "cannot close RDMA buffer imports while an exchange is pending");
+    const cudaError_t result = buffer.impl_->close_imports();
+    cuda_check(result, "cudaIpcCloseMemHandle RDMA buffer imports");
+}
+
 void RdmaTransport::start_exchange(const void* input,
                                    int64_t input_bytes,
                                    RdmaBuffer& output,
@@ -567,43 +841,116 @@ void RdmaTransport::start_exchange(const void* input,
     TORCH_CHECK(output.impl_->connected, "RDMA output metadata is not connected");
     TORCH_CHECK(output.impl_->mode == mode, "RDMA output mode mismatch");
     auto& state = *output.impl_;
-    if (state.input_pointer != input || state.input_bytes != input_bytes) {
-        for (auto*& mkey : state.source_mkeys) {
-            if (mkey) mlx5dv_destroy_mkey(mkey);
-            mkey = nullptr;
-        }
-        if (state.input_mr) ibv_dereg_mr(state.input_mr);
-        state.input_mr = register_gpu_mr(impl_->pd, const_cast<void*>(input), input_bytes,
-                                         IBV_ACCESS_LOCAL_WRITE);
-        TORCH_CHECK(state.input_mr, "cannot register input GPU memory on ", impl_->nic_name,
-                    ": ", std::strerror(errno));
-        state.input_pointer = input;
-        state.input_bytes = input_bytes;
+    TORCH_CHECK(input, "RDMA input pointer must not be null");
+    if (state.input_mr) {
+        TORCH_CHECK(state.input_pointer == input && state.input_bytes == input_bytes,
+                    "RDMA input storage and byte size are fixed after first use; allocate a "
+                    "separate output workspace for a different input storage");
+    }
+    TORCH_CHECK(state.batch == batch && state.seq == seq && state.heads == heads &&
+                    state.dim == dim && state.element_size == element_size,
+                "RDMA output workspace was registered for a different input shape or dtype");
+    TORCH_CHECK(state.output_bytes == input_bytes,
+                "RDMA input and output byte sizes must match");
+    checked_tensor_bytes(mode, input_bytes, batch, seq, heads, dim, element_size);
+    const MkeyGeometry geometry =
+        mkey_geometry(mode, batch, seq, heads, dim, element_size);
+    const uint32_t payload = checked_payload(input_bytes);
+    TORCH_CHECK(checked_offset_mul(geometry.rows, geometry.width,
+                                   "RDMA MKey payload") == payload,
+                "RDMA MKey geometry does not match the per-peer payload");
+    const uint64_t payload64 = payload;
 
+    std::array<uint64_t, kWorld> source_mkey_addresses{};
+    std::array<uint64_t, kWorld> local_addresses{};
+    std::array<uint64_t, kWorld> remote_addresses{};
+    std::array<uint32_t, kWorld> remote_keys{};
+    const uint64_t input_address = reinterpret_cast<uint64_t>(input);
+    for (int step = kQuad; step < kWorld; ++step) {
+        const int peer = impl_->rank ^ step;
+        TORCH_CHECK(impl_->qps[peer] && impl_->qpxs[peer] && impl_->mlx5_qpxs[peer],
+                    "missing mlx5 QP for peer ", peer);
         if (mode == 0) {
-            const int64_t rows64 = batch * seq;
-            const int64_t width64 = heads / kWorld * dim * element_size;
-            const int64_t pitch64 = heads * dim * element_size;
-            TORCH_CHECK(rows64 <= UINT32_MAX && width64 <= UINT32_MAX &&
-                            pitch64 <= kMaxInterleavedStride,
-                        "mode=0 shape exceeds mlx5 UMR limits");
-            for (int peer = 0; peer < kWorld; ++peer) {
-                if (!impl_->cross(peer)) continue;
-                state.source_mkeys[peer] = impl_->create_mkey();
-                impl_->configure_mkey(
-                    peer, state.source_mkeys[peer], 0,
-                    reinterpret_cast<uint64_t>(input) + peer * width64,
-                    static_cast<uint32_t>(width64),
-                    static_cast<uint32_t>(pitch64 - width64),
-                    static_cast<uint32_t>(rows64), state.input_mr->lkey);
-            }
-            impl_->poll(kWorld - kQuad);
+            source_mkey_addresses[peer] = mkey_peer_address(
+                input, peer, input_bytes, geometry, "mode=0 source MKey");
+            TORCH_CHECK(state.peers[peer].address && state.peers[peer].rkey,
+                        "missing mode=0 output registration for peer ", peer);
+            const uint64_t remote_offset =
+                checked_offset_mul(impl_->rank, payload64, "mode=0 remote payload");
+            TORCH_CHECK(checked_address_add(remote_offset, payload64,
+                                            "mode=0 remote payload") <=
+                            static_cast<uint64_t>(state.output_bytes),
+                        "mode=0 remote payload exceeds output buffer");
+            checked_address_add(
+                state.peers[peer].address,
+                checked_address_add(remote_offset, payload64,
+                                    "mode=0 remote payload"),
+                "mode=0 remote payload");
+            remote_addresses[peer] = checked_address_add(
+                state.peers[peer].address, remote_offset, "mode=0 remote payload");
+            remote_keys[peer] = state.peers[peer].rkey;
+        } else {
+            remote_keys[peer] = state.peers[peer].destination_rkey[impl_->rank];
+            TORCH_CHECK(remote_keys[peer],
+                        "missing mode=1 destination MKey for peer ", peer);
+            const uint64_t local_offset =
+                checked_offset_mul(peer, payload64, "mode=1 local payload");
+            TORCH_CHECK(checked_address_add(local_offset, payload64,
+                                            "mode=1 local payload") <=
+                            static_cast<uint64_t>(input_bytes),
+                        "mode=1 local payload exceeds input buffer");
+            checked_address_add(
+                input_address,
+                checked_address_add(local_offset, payload64,
+                                    "mode=1 local payload"),
+                "mode=1 local payload");
+            local_addresses[peer] = checked_address_add(
+                input_address, local_offset, "mode=1 local payload");
         }
     }
 
-    const int64_t payload64 = input_bytes / kWorld;
-    TORCH_CHECK(payload64 <= UINT32_MAX, "per-peer payload exceeds mlx5 WR limit");
-    const uint32_t payload = static_cast<uint32_t>(payload64);
+    if (!state.input_mr) {
+        MrHandle input_mr(register_gpu_mr(
+            impl_->pd, const_cast<void*>(input), checked_registration_bytes(input_bytes),
+            IBV_ACCESS_LOCAL_WRITE));
+        std::array<MkeyHandle, kWorld> source_mkeys{};
+        if (mode == 0) {
+            for (int peer = 0; peer < kWorld; ++peer) {
+                if (!impl_->cross(peer)) continue;
+                source_mkeys[peer].reset(impl_->create_mkey());
+            }
+            int configured = 0;
+            for (int peer = 0; peer < kWorld; ++peer) {
+                if (!impl_->cross(peer)) continue;
+                impl_->configure_mkey(peer, source_mkeys[peer].get(), 0,
+                                      source_mkey_addresses[peer], geometry.width,
+                                      geometry.skip, geometry.rows, input_mr->lkey);
+                ++configured;
+            }
+            impl_->poll(configured);
+            for (int peer = 0; peer < kWorld; ++peer)
+                state.source_mkeys[peer] = source_mkeys[peer].release();
+        }
+        state.input_pointer = input;
+        state.input_bytes = input_bytes;
+        state.input_mr = input_mr.release();
+    }
+
+    std::array<uint32_t, kWorld> local_keys{};
+    for (int step = kQuad; step < kWorld; ++step) {
+        const int peer = impl_->rank ^ step;
+        if (mode == 0) {
+            TORCH_CHECK(state.source_mkeys[peer],
+                        "missing mode=0 source MKey for peer ", peer);
+            local_keys[peer] = state.source_mkeys[peer]->lkey;
+        } else {
+            TORCH_CHECK(state.input_mr, "missing RDMA input registration");
+            local_keys[peer] = state.input_mr->lkey;
+        }
+    }
+
+    // Every shape conversion, address calculation, and key lookup above is complete before the
+    // first receive is posted. A validation failure therefore cannot strand half an exchange.
     for (int step = kQuad; step < kWorld; ++step) {
         impl_->post_receive(impl_->rank ^ step);
         ++impl_->pending_completions;
@@ -611,16 +958,11 @@ void RdmaTransport::start_exchange(const void* input,
     for (int step = kQuad; step < kWorld; ++step) {
         const int peer = impl_->rank ^ step;
         if (mode == 0) {
-            impl_->post_write(peer, state.source_mkeys[peer]->lkey, 0, payload,
-                              state.peers[peer].rkey,
-                              state.peers[peer].address + impl_->rank * payload64);
+            impl_->post_write(peer, local_keys[peer], 0, payload,
+                              remote_keys[peer], remote_addresses[peer]);
         } else {
-            const uint32_t remote_key =
-                state.peers[peer].destination_rkey[impl_->rank];
-            TORCH_CHECK(remote_key, "missing mode=1 destination MKey for peer ", peer);
-            impl_->post_write(peer, state.input_mr->lkey,
-                              reinterpret_cast<uint64_t>(input) + peer * payload64,
-                              payload, remote_key, 0);
+            impl_->post_write(peer, local_keys[peer], local_addresses[peer], payload,
+                              remote_keys[peer], 0);
         }
         ++impl_->pending_completions;
     }

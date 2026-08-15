@@ -3,6 +3,7 @@
 #include "rdma.h"
 
 #include <ATen/ATen.h>
+#include <c10/core/Storage.h>
 #include <c10/core/TensorImpl.h>
 #include <c10/util/Exception.h>
 #include <cuda_runtime.h>
@@ -28,8 +29,23 @@ static_assert(TORCH_VERSION_MAJOR > 2 ||
 namespace ulysses {
 
 struct Buffer {
+    // Keep the allocation itself alive independently of tensor: set_() mutates the shared
+    // TensorImpl behind every at::Tensor handle, but cannot replace this Storage owner.
     at::Tensor tensor;
-    at::Tensor input_owner;
+    c10::Storage output_storage;
+    const c10::StorageImpl* output_storage_impl = nullptr;
+    void* output_data_ptr = nullptr;
+    int64_t output_storage_offset = 0;
+    int64_t output_nbytes = 0;
+
+    // A workspace is permanently paired with the first input allocation used with it. Holding
+    // Storage rather than Tensor also makes a later input.set_() observable instead of silently
+    // following the rebound TensorImpl.
+    c10::Storage input_storage;
+    const c10::StorageImpl* input_storage_impl = nullptr;
+    const void* input_data_ptr = nullptr;
+    int64_t input_storage_offset = 0;
+    int64_t input_nbytes = 0;
     std::vector<uint64_t> peers;
     std::vector<uint64_t> flags;
     std::vector<int64_t> shape;
@@ -47,7 +63,7 @@ public:
                  std::vector<int64_t> devices,
                  bool enable_rdma,
                  std::vector<std::string> nics);
-    ~UlyssesGroup() override;
+    ~UlyssesGroup() noexcept override;
 
     at::Tensor allocate_output(const at::Tensor& input, int64_t mode);
     void all_to_all_4d(const at::Tensor& input,
@@ -61,16 +77,22 @@ public:
     void connect_buffer(at::Tensor output,
                         const std::vector<std::vector<int64_t>>& peers);
     void flush() const;
+    void close_imports();
     void destroy();
 
 private:
     void validate(const at::Tensor& input, int64_t mode) const;
     std::vector<int64_t> output_shape(const at::Tensor& input, int64_t mode) const;
+    Buffer& lookup_output(const at::Tensor& output) const;
+    void bind_or_validate_input(Buffer& buffer, const at::Tensor& input) const;
+    bool has_rdma_buffers() const noexcept;
+    void leak_unsafe_resources() noexcept;
 
     std::string name_;
     int rank_;
     int world_size_;
     int device_;
+    bool imports_closed_ = false;
     bool destroyed_ = false;
     std::unique_ptr<RdmaTransport> rdma_;
     std::vector<std::unique_ptr<Buffer>> buffers_;

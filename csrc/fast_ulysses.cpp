@@ -4,6 +4,7 @@
 #include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
 #include <torch/extension.h>
 
+#include <limits>
 #include <set>
 
 namespace ulysses {
@@ -22,6 +23,16 @@ bool supports_p2p(const std::vector<int64_t>& devices)
         }
     }
     return true;
+}
+
+int64_t tensor_nbytes(const at::Tensor& tensor)
+{
+    const int64_t elements = tensor.numel();
+    const int64_t element_size = tensor.element_size();
+    TORCH_CHECK(element_size > 0 &&
+                    elements <= std::numeric_limits<int64_t>::max() / element_size,
+                "tensor byte size overflows int64_t");
+    return elements * element_size;
 }
 
 }  // namespace
@@ -53,14 +64,19 @@ UlyssesGroup::UlyssesGroup(std::string name,
                                             enable_rdma, nics);
 }
 
-UlyssesGroup::~UlyssesGroup()
+UlyssesGroup::~UlyssesGroup() noexcept
 {
-    destroy();
+    // Destruction can be triggered by Python under an arbitrary CUDA context and cannot perform
+    // the rank-coordinated IPC shutdown protocol. If explicit shutdown was skipped, retain all
+    // CUDA and RDMA resources until process exit rather than freeing them under an unsafe context
+    // or closing peer mappings out of order.
+    if (!destroyed_) leak_unsafe_resources();
 }
 
 void UlyssesGroup::validate(const at::Tensor& input, int64_t mode) const
 {
     TORCH_CHECK(!destroyed_, "group is destroyed");
+    TORCH_CHECK(!imports_closed_, "group imports are closed");
     TORCH_CHECK(mode == 0 || mode == 1, "mode must be 0 or 1");
     TORCH_CHECK(input.is_cuda() && input.get_device() == device_, "wrong CUDA device");
     TORCH_CHECK(input.dim() == 4 && input.is_contiguous(),
@@ -135,9 +151,14 @@ at::Tensor UlyssesGroup::allocate_output(const at::Tensor& input, int64_t mode)
     auto output = tensor.view(shape);
     // Keep this exact TensorImpl alive so registry identity cannot be reused.
     buffer->tensor = output;
+    buffer->output_storage = output.storage();
+    buffer->output_storage_impl = buffer->output_storage.unsafeGetStorageImpl();
+    buffer->output_data_ptr = output.data_ptr();
+    buffer->output_storage_offset = output.storage_offset();
+    buffer->output_nbytes = tensor_nbytes(output);
     if (rdma_ && rdma_->enabled()) {
         buffer->rdma = rdma_->register_buffer(
-            output.data_ptr(), output.numel() * output.element_size(), mode,
+            buffer->output_data_ptr, buffer->output_nbytes, mode,
             input.size(0), input.size(1), input.size(2), input.size(3),
             input.element_size());
     }
@@ -147,15 +168,57 @@ at::Tensor UlyssesGroup::allocate_output(const at::Tensor& input, int64_t mode)
     return output;
 }
 
+Buffer& UlyssesGroup::lookup_output(const at::Tensor& output) const
+{
+    TORCH_CHECK(!destroyed_, "group is destroyed");
+    TORCH_CHECK(!imports_closed_, "group imports are closed");
+    const auto it = outputs_.find(output.unsafeGetTensorImpl());
+    TORCH_CHECK(it != outputs_.end(), "output must come from allocate_output()");
+    Buffer& buffer = *it->second;
+
+    // Check StorageImpl before dereferencing the current data pointer. In particular, set_() keeps
+    // TensorImpl identity unchanged, so the registry lookup alone is not an ownership check.
+    TORCH_CHECK(output.has_storage() &&
+                    output.storage().unsafeGetStorageImpl() == buffer.output_storage_impl &&
+                    buffer.output_storage.unsafeGetStorageImpl() == buffer.output_storage_impl,
+                "output storage was rebound after allocate_output()");
+    TORCH_CHECK(output.data_ptr() == buffer.output_data_ptr,
+                "output data pointer changed after allocate_output()");
+    TORCH_CHECK(output.storage_offset() == buffer.output_storage_offset &&
+                    tensor_nbytes(output) == buffer.output_nbytes,
+                "output storage offset or byte size changed after allocate_output()");
+    return buffer;
+}
+
+void UlyssesGroup::bind_or_validate_input(Buffer& buffer, const at::Tensor& input) const
+{
+    TORCH_CHECK(input.has_storage(), "input must have storage");
+    const int64_t bytes = tensor_nbytes(input);
+    const auto* storage_impl = input.storage().unsafeGetStorageImpl();
+    if (!buffer.input_storage) {
+        buffer.input_storage = input.storage();
+        buffer.input_storage_impl = storage_impl;
+        buffer.input_data_ptr = input.data_ptr();
+        buffer.input_storage_offset = input.storage_offset();
+        buffer.input_nbytes = bytes;
+        return;
+    }
+    TORCH_CHECK(storage_impl == buffer.input_storage_impl &&
+                    buffer.input_storage.unsafeGetStorageImpl() == buffer.input_storage_impl &&
+                    input.data_ptr() == buffer.input_data_ptr &&
+                    input.storage_offset() == buffer.input_storage_offset &&
+                    bytes == buffer.input_nbytes,
+                "each output workspace requires one fixed input storage, pointer, offset, and "
+                "byte size");
+}
+
 void UlyssesGroup::all_to_all_4d(const at::Tensor& input,
                                  at::Tensor output,
                                  int64_t mode,
                                  int64_t stream_ptr)
 {
     const auto shape = output_shape(input, mode);
-    const auto it = outputs_.find(output.unsafeGetTensorImpl());
-    TORCH_CHECK(it != outputs_.end(), "output must come from allocate_output()");
-    Buffer& buffer = *it->second;
+    Buffer& buffer = lookup_output(output);
     TORCH_CHECK(output.is_cuda() && output.get_device() == device_ && output.is_contiguous(),
                 "invalid output");
     TORCH_CHECK(output.scalar_type() == input.scalar_type() && output.sizes().vec() == shape,
@@ -168,18 +231,16 @@ void UlyssesGroup::all_to_all_4d(const at::Tensor& input,
 
     const at::cuda::CUDAGuard guard(device_);
     auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    int stream_device = -1;
+    FU_CUDA_CHECK(cudaStreamGetDevice(stream, &stream_device));
+    TORCH_CHECK(stream_device == device_, "stream is on the wrong CUDA device");
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    FU_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    TORCH_CHECK(capture_status == cudaStreamCaptureStatusNone,
+                "CUDA Graph capture is unsupported");
+    bind_or_validate_input(buffer, input);
     if (rdma_ && rdma_->enabled()) {
         TORCH_CHECK(buffer.rdma, "RDMA output is not registered");
-        // The input MR is cached on the bare pointer, so the tensor behind it has to stay alive:
-        // once it is freed the caching allocator can hand the same address to something else and
-        // the registration would silently point at other data. Dropping the previous owner only
-        // after the new one is held keeps the address from being recycled in between.
-        at::Tensor previous_input;
-        if (!buffer.input_owner.defined() ||
-            buffer.input_owner.data_ptr() != input.data_ptr()) {
-            previous_input = std::move(buffer.input_owner);
-            buffer.input_owner = input;
-        }
         // A cross-quad RDMA write lands in the peer's output the moment it is posted -- a receive
         // queue entry holds back the completion, not the data -- so the next call would overwrite
         // a result its peers have not read yet. The opening barrier is what stops that. It covers
@@ -215,48 +276,83 @@ std::string UlyssesGroup::backend() const
 
 std::vector<int64_t> UlyssesGroup::connection_info() const
 {
+    TORCH_CHECK(!destroyed_, "group is destroyed");
+    TORCH_CHECK(!imports_closed_, "group imports are closed");
     TORCH_CHECK(rdma_ && rdma_->enabled(), "mlx5 backend is disabled");
     return rdma_->connection_info();
 }
 
 void UlyssesGroup::connect(const std::vector<std::vector<int64_t>>& peers)
 {
+    TORCH_CHECK(!destroyed_, "group is destroyed");
+    TORCH_CHECK(!imports_closed_, "group imports are closed");
     TORCH_CHECK(rdma_ && rdma_->enabled(), "mlx5 backend is disabled");
     rdma_->connect(peers);
 }
 
 std::vector<int64_t> UlyssesGroup::buffer_info(at::Tensor output) const
 {
-    const auto it = outputs_.find(output.unsafeGetTensorImpl());
-    TORCH_CHECK(it != outputs_.end() && it->second->rdma,
+    Buffer& buffer = lookup_output(output);
+    TORCH_CHECK(buffer.rdma,
                 "output must be an RDMA allocate_output() result");
-    return rdma_->buffer_info(*it->second->rdma);
+    return rdma_->buffer_info(*buffer.rdma);
 }
 
 void UlyssesGroup::connect_buffer(
     at::Tensor output,
     const std::vector<std::vector<int64_t>>& peers)
 {
-    const auto it = outputs_.find(output.unsafeGetTensorImpl());
-    TORCH_CHECK(it != outputs_.end() && it->second->rdma,
+    Buffer& buffer = lookup_output(output);
+    TORCH_CHECK(buffer.rdma,
                 "output must be an RDMA allocate_output() result");
-    rdma_->connect_buffer(*it->second->rdma, peers);
-    it->second->peers = rdma_->peer_pointers(*it->second->rdma);
-    it->second->flags = rdma_->peer_flags(*it->second->rdma);
+    rdma_->connect_buffer(*buffer.rdma, peers);
+    buffer.peers = rdma_->peer_pointers(*buffer.rdma);
+    buffer.flags = rdma_->peer_flags(*buffer.rdma);
 }
 
 void UlyssesGroup::flush() const
 {
+    TORCH_CHECK(!destroyed_, "group is destroyed");
+    TORCH_CHECK(!imports_closed_, "group imports are closed");
     if (rdma_) rdma_->flush();
+}
+
+void UlyssesGroup::close_imports()
+{
+    TORCH_CHECK(!destroyed_, "group is destroyed");
+    if (imports_closed_) return;
+    const at::cuda::CUDAGuard guard(device_);
+    if (rdma_ && rdma_->enabled()) {
+        for (auto& buffer : buffers_) {
+            if (buffer->rdma) rdma_->close_buffer_imports(*buffer->rdma);
+        }
+    }
+    imports_closed_ = true;
+}
+
+bool UlyssesGroup::has_rdma_buffers() const noexcept
+{
+    for (const auto& buffer : buffers_) {
+        if (buffer && buffer->rdma) return true;
+    }
+    return false;
+}
+
+void UlyssesGroup::leak_unsafe_resources() noexcept
+{
+    for (auto& buffer : buffers_) static_cast<void>(buffer.release());
+    static_cast<void>(rdma_.release());
 }
 
 void UlyssesGroup::destroy()
 {
     if (destroyed_) return;
-    destroyed_ = true;
-    // cudaIpcCloseMemHandle acts on the current device's context, and this runs from a destructor
-    // that Python can trigger under any device.
+    TORCH_CHECK(!has_rdma_buffers() || imports_closed_,
+                "close_imports() must complete on every rank before destroy()");
+    // cudaIpcCloseMemHandle acts on the current device's context, while explicit shutdown may be
+    // initiated under any device.
     const at::cuda::CUDAGuard guard(device_);
+    destroyed_ = true;
     outputs_.clear();
     buffers_.clear();
     rdma_.reset();
@@ -277,6 +373,7 @@ TORCH_LIBRARY(fast_ulysses, m)
         .def("buffer_info", &ulysses::UlyssesGroup::buffer_info)
         .def("connect_buffer", &ulysses::UlyssesGroup::connect_buffer)
         .def("flush", &ulysses::UlyssesGroup::flush)
+        .def("close_imports", &ulysses::UlyssesGroup::close_imports)
         .def("destroy", &ulysses::UlyssesGroup::destroy);
 }
 
