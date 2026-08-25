@@ -4,8 +4,8 @@ Run under tools/exclusive.sh -- a number from a shared GPU is not a number:
 
     ./tools/exclusive.sh 0,1,2,3 -- torchrun --nproc_per_node=4 benchmark/bench_a2a.py --mode stages
 
-Modes: stages (default), overlap, padding, zerocopy, sweep, link, zerosm. benchmark/collect.sh runs
-all of them in order and records the environment they ran in.
+Modes: stages (default), overlap, padding, zerocopy, sweep, link, pcie-pretest, zerosm.
+benchmark/collect.sh runs the established modes in order and records the environment they ran in.
 
 stages (default)
     Both paths broken into their parts on one stream, so they sum to the whole call rather than
@@ -43,6 +43,15 @@ link
     Flat peer copies, one pair and all pairs at once, to establish what the fabric can actually
     do. It is what makes `transfer` interpretable: at 80% of this ceiling there is nothing left to
     schedule, and at 30% there is.
+
+pcie-pretest
+    Feasibility gate for a future PCIe backend. Mode 0 is locally packed by destination, then each
+    destination receives one flat copy directly into its final sequence slice. On an NVLink B300
+    this validates the layout, scheduling, and pack cost but not PCIe peer bandwidth; pinned D2H
+    and H2D rows separately exercise the machine's real host PCIe path. On a PCIe-only machine,
+    pass --allow-non-nvlink and the flat-peer row exercises real GPU P2P. This is a benchmark-only
+    prototype: its peer-copy timing deliberately has no cross-rank GPU barrier, and the report adds
+    the current operator's measured barrier cost as an estimate.
 
 zerosm
     Does a copy take SMs? The same bytes and the same `dst.copy_(src)` twice -- once into a peer's
@@ -443,6 +452,285 @@ def run_link(group, pg, rank, ws, args) -> None:
         print("# per-flow number above, is how much of the fabric the collective is using.")
 
 
+def run_pcie_pretest(group, pg, rank, ws, args) -> None:
+    """Test the packed-flat design before it becomes a production transport.
+
+    Batch one makes each destination's sequence slice contiguous, so mode 0 needs a local pack
+    but no receive-side unpack. The peer-copy region intentionally measures outgoing work only;
+    repeated writes are stream ordered and every source owns disjoint destination slices. A real
+    backend still needs a completion barrier, whose measured current cost is reported separately.
+    """
+    import torch.distributed._symmetric_memory as symm_mem
+
+    if args.batch != 1:
+        raise ValueError("pcie-pretest currently requires --batch 1")
+    if ws < 2:
+        raise ValueError("pcie-pretest requires at least two ranks")
+
+    dev = torch.device("cuda", torch.cuda.current_device())
+    label, img, heads, d, txt = next(shape for shape in SHAPES if shape[0] == args.shape)
+    if heads % ws:
+        raise ValueError(f"{heads} heads do not divide world_size {ws}")
+    s_total = img + txt
+    s_total -= s_total % ws
+    s_local, h_local = s_total // ws, heads // ws
+
+    # Small exact integers make a full layout check cheap to construct and bit-exact in bf16.
+    seq_index = torch.arange(s_local, device=dev, dtype=torch.int64)[:, None]
+    head_index = torch.arange(heads, device=dev, dtype=torch.int64)[None, :]
+    pattern = ((rank * 97 + seq_index * 7 + head_index) % 251).to(torch.bfloat16)
+    x = torch.empty((1, s_local, heads, d), dtype=torch.bfloat16, device=dev)
+    x.copy_(pattern[None, :, :, None].expand_as(x))
+
+    packed = torch.empty((ws, 1, s_local, h_local, d), dtype=x.dtype, device=dev)
+    recv = torch.empty_like(x).flatten()
+
+    out_numel = s_total * h_local * d
+    out_storage = symm_mem.empty(out_numel, dtype=x.dtype, device=dev)
+    out_storage.zero_()
+    handle = symm_mem.rendezvous(out_storage, pg)
+    out_shape = (1, s_total, h_local, d)
+    out = out_storage.view(out_shape)
+    peer_outputs = [
+        handle.get_buffer(peer, (out_numel,), x.dtype).view(out_shape) for peer in range(ws)
+    ]
+
+    current = torch.cuda.current_stream()
+    transfer = torch.cuda.Stream()
+    ready = torch.cuda.Event()
+    done = torch.cuda.Event()
+
+    def pack_input() -> None:
+        source = x.view(1, s_local, ws, h_local, d).permute(2, 0, 1, 3, 4)
+        packed.copy_(source)
+
+    # Match the production path's XOR order when possible: it spreads the first destination of
+    # every rank instead of making all ranks target the same peer first.
+    if ws & (ws - 1) == 0:
+        remote_order = [rank ^ step for step in range(1, ws)]
+    else:
+        remote_order = [(rank + step) % ws for step in range(1, ws)]
+
+    def flat_peer_copy() -> None:
+        ready.record(current)
+        transfer.wait_event(ready)
+        with torch.cuda.stream(transfer):
+            for peer in remote_order:
+                dst = peer_outputs[peer].narrow(1, rank * s_local, s_local)
+                dst.copy_(packed[peer], non_blocking=True)
+            done.record(transfer)
+        own = peer_outputs[rank].narrow(1, rank * s_local, s_local)
+        own.copy_(packed[rank], non_blocking=True)
+        current.wait_event(done)
+
+    def pack_and_copy() -> None:
+        pack_input()
+        flat_peer_copy()
+
+    pack_input()
+    torch.cuda.synchronize()
+    raw_send = packed.flatten()
+
+    def raw_a2a() -> None:
+        dist.all_to_all_single(recv, raw_send, group=pg)
+
+    base_ms = median_ms(lambda: baseline_padded(x, pg, ws, recv), args.iters, args.warmup)
+    raw_ms = median_ms(raw_a2a, args.iters, args.warmup)
+    pack_ms = median_ms(pack_input, args.iters, args.warmup)
+    peer_ms = median_ms(flat_peer_copy, args.iters, args.warmup)
+    packed_ms = median_ms(pack_and_copy, args.iters, args.warmup)
+
+    # Reuse the implemented synchronization protocol to avoid inventing an optimistic constant.
+    current_stages = median_of(
+        lambda: list(group._timed(x, mode=0)[1].values()), args.iters, args.warmup
+    )
+    barrier_ms = current_stages[0] + current_stages[2]
+    copy_out_ms = current_stages[3]
+
+    def slowest(value: float) -> float:
+        result = torch.tensor(value, dtype=torch.float64, device=dev)
+        dist.all_reduce(result, op=dist.ReduceOp.MAX, group=pg)
+        return float(result.item())
+
+    base_ms, raw_ms, pack_ms, peer_ms, packed_ms, barrier_ms, copy_out_ms = (
+        slowest(value)
+        for value in (
+            base_ms,
+            raw_ms,
+            pack_ms,
+            peer_ms,
+            packed_ms,
+            barrier_ms,
+            copy_out_ms,
+        )
+    )
+
+    # All outgoing streams are complete before this host barrier, so every local output is now
+    # safe to inspect. Check every element without allocating a second full-size output tensor.
+    torch.cuda.synchronize()
+    dist.barrier(group=pg)
+    for source_rank in range(ws):
+        source_seq = torch.arange(s_local, device=dev, dtype=torch.int64)[:, None]
+        source_heads = torch.arange(
+            rank * h_local, (rank + 1) * h_local, device=dev, dtype=torch.int64
+        )[None, :]
+        expected = ((source_rank * 97 + source_seq * 7 + source_heads) % 251).to(x.dtype)
+        actual = out[:, source_rank * s_local : (source_rank + 1) * s_local]
+        if not torch.equal(actual, expected[None, :, :, None].expand_as(actual)):
+            raise AssertionError(
+                f"packed mode-0 layout mismatch on rank {rank}, source {source_rank}"
+            )
+
+    # The integrated backend is measured separately from the prototype above. Keeping both in the
+    # report shows exactly what production validation/copy-out costs beyond the flat-copy kernel.
+    production = UlyssesGroup(process_group=pg, require_nvlink=False, backend="packed")
+    production_out = production.empty_output(x, mode=0)
+    production_owned_ms = median_ms(
+        lambda: production.all_to_all_4d(x, mode=0), args.iters, args.warmup
+    )
+    production_zero_ms = median_ms(
+        lambda: production.all_to_all_4d(x, mode=0, out=production_out),
+        args.iters,
+        args.warmup,
+    )
+    mode1_input = production.all_to_all_4d(x, mode=0)
+    production_mode1_ms = median_ms(
+        lambda: production.all_to_all_4d(mode1_input, mode=1), args.iters, args.warmup
+    )
+    round_trip = production.all_to_all_4d(mode1_input, mode=1)
+    if not torch.equal(round_trip, x):
+        raise AssertionError(f"production packed round trip mismatch on rank {rank}")
+    production_owned_ms = slowest(production_owned_ms)
+    production_zero_ms = slowest(production_zero_ms)
+    production_mode1_ms = slowest(production_mode1_ms)
+    production.destroy()
+
+    # These are local host-path probes, not a multi-rank host-staged collective. They remain useful
+    # on B300 because D2H/H2D uses PCIe even when GPU peer traffic is routed over NVLink/NVSwitch.
+    host_bytes = min(x.numel() * x.element_size(), args.host_mib << 20)
+    gpu_src = torch.empty(host_bytes, dtype=torch.uint8, device=dev)
+    gpu_dst = torch.empty_like(gpu_src)
+    host = torch.empty(host_bytes, dtype=torch.uint8, pin_memory=True)
+
+    def d2h() -> None:
+        host.copy_(gpu_src, non_blocking=True)
+
+    def h2d() -> None:
+        gpu_dst.copy_(host, non_blocking=True)
+
+    def host_roundtrip() -> None:
+        host.copy_(gpu_src, non_blocking=True)
+        gpu_dst.copy_(host, non_blocking=True)
+
+    d2h_ms = slowest(median_ms(d2h, args.iters, args.warmup))
+    h2d_ms = slowest(median_ms(h2d, args.iters, args.warmup))
+    host_serial_ms = slowest(median_ms(host_roundtrip, args.iters, args.warmup))
+
+    tensor_bytes = x.numel() * x.element_size()
+    crossed_bytes = tensor_bytes * (ws - 1) / ws
+    estimated_zero_copy_ms = packed_ms + barrier_ms
+    estimated_owned_ms = estimated_zero_copy_ms + copy_out_ms
+
+    # Exercise an actual GPU -> pinned host -> different GPU route. Each rank owns the peer-side
+    # scratch allocation in its process; this measures the data path and all-rank contention, not
+    # a usable collective buffer. Two host slots pipeline D2H(i+1) with H2D(i).
+    staged_bytes = int(crossed_bytes)
+    chunk_bytes = min(staged_bytes, args.host_mib << 20)
+    staged_src = torch.empty(staged_bytes, dtype=torch.uint8, device=dev)
+    staged_src.fill_(rank % 251)
+    peer_device = torch.device("cuda", (torch.cuda.current_device() + 1) % ws)
+    with torch.cuda.device(peer_device):
+        staged_dst = torch.empty(staged_bytes, dtype=torch.uint8, device=peer_device)
+        peer_stream = torch.cuda.Stream(device=peer_device)
+    host_slots = [
+        torch.empty(chunk_bytes, dtype=torch.uint8, pin_memory=True),
+        torch.empty(chunk_bytes, dtype=torch.uint8, pin_memory=True),
+    ]
+    d2h_done = [torch.cuda.Event() for _ in range(2)]
+    with torch.cuda.device(peer_device):
+        h2d_done = [torch.cuda.Event() for _ in range(2)]
+
+    def host_staged_peer() -> None:
+        for chunk_index, offset in enumerate(range(0, staged_bytes, chunk_bytes)):
+            slot = chunk_index % 2
+            size = min(chunk_bytes, staged_bytes - offset)
+            if chunk_index >= 2:
+                current.wait_event(h2d_done[slot])
+            host_chunk = host_slots[slot].narrow(0, 0, size)
+            host_chunk.copy_(staged_src.narrow(0, offset, size), non_blocking=True)
+            d2h_done[slot].record(current)
+            with torch.cuda.stream(peer_stream):
+                peer_stream.wait_event(d2h_done[slot])
+                staged_dst.narrow(0, offset, size).copy_(host_chunk, non_blocking=True)
+                h2d_done[slot].record(peer_stream)
+        for event in h2d_done:
+            current.wait_event(event)
+
+    staged_peer_ms = slowest(median_ms(host_staged_peer, args.iters, args.warmup))
+    torch.cuda.synchronize()
+    with torch.cuda.device(peer_device):
+        if not bool(torch.all(staged_dst == rank % 251)):
+            raise AssertionError(f"host-staged peer copy mismatch on source rank {rank}")
+
+    def gbps(nbytes: float, elapsed_ms: float) -> float:
+        return nbytes / (elapsed_ms * 1e6)
+
+    if rank == 0:
+        print(f"# {label} mode=0 world_size={ws} b=1 bf16; slowest-rank medians")
+        print("# packed-flat is benchmark-only and has no production cross-rank GPU barrier")
+        print("# estimates add the current operator's measured barriers and optional copy-out")
+        print(
+            "# On NVLink hardware, peer rows validate layout/scheduling only; host rows use PCIe."
+        )
+        print("# On PCIe-only hardware, rerun with --allow-non-nvlink for the real P2P result.\n")
+        print(f"{'path':<30} {'ms':>9} {'effective GB/s':>15} {'vs BASE':>10}")
+        print("-" * 68)
+        rows = (
+            ("BASE permute+NCCL+permute", base_ms, crossed_bytes),
+            ("raw NCCL (prepared layout)", raw_ms, crossed_bytes),
+            ("local pack", pack_ms, 2 * tensor_bytes),
+            ("flat peer copies (no barrier)", peer_ms, crossed_bytes),
+            ("pack+flat peer (no barrier)", packed_ms, crossed_bytes),
+            ("estimated packed (zero-copy)", estimated_zero_copy_ms, crossed_bytes),
+            ("estimated packed (owned out)", estimated_owned_ms, crossed_bytes),
+            ("PRODUCTION packed mode0 zero", production_zero_ms, crossed_bytes),
+            ("PRODUCTION packed mode0 owned", production_owned_ms, crossed_bytes),
+            ("PRODUCTION packed mode1 owned", production_mode1_ms, crossed_bytes),
+        )
+        for name, elapsed, moved in rows:
+            print(
+                f"{name:<30} {elapsed:9.3f} {gbps(moved, elapsed):15.1f} {base_ms / elapsed:9.2f}x"
+            )
+        print(
+            f"\n# current overhead estimates: barriers={barrier_ms:.3f} ms, "
+            f"owned-output copy={copy_out_ms:.3f} ms"
+        )
+        print(f"# local pinned-host probe: {host_bytes / (1 << 20):.0f} MiB")
+        print(f"{'D2H':<30} {d2h_ms:9.3f} {gbps(host_bytes, d2h_ms):15.1f}")
+        print(f"{'H2D':<30} {h2d_ms:9.3f} {gbps(host_bytes, h2d_ms):15.1f}")
+        print(
+            f"{'D2H then H2D (serial)':<30} {host_serial_ms:9.3f} "
+            f"{gbps(2 * host_bytes, host_serial_ms):15.1f}"
+        )
+        print(
+            f"{'host-staged all pairs':<30} {staged_peer_ms:9.3f} "
+            f"{gbps(crossed_bytes, staged_peer_ms):15.1f} {base_ms / staged_peer_ms:9.2f}x BASE"
+        )
+        print(
+            f"# ideal double-buffer host pipeline floor for this chunk: "
+            f"{max(d2h_ms, h2d_ms):.3f} ms (before synchronization and routing)"
+        )
+        host_floor_ms = (
+            crossed_bytes / min(gbps(host_bytes, d2h_ms), gbps(host_bytes, h2d_ms)) / 1e6
+        )
+        host_serial_projected_ms = crossed_bytes / gbps(host_bytes, d2h_ms) / 1e6
+        host_serial_projected_ms += crossed_bytes / gbps(host_bytes, h2d_ms) / 1e6
+        print(
+            f"# projected full-message host floors per rank: ideal duplex={host_floor_ms:.3f} ms, "
+            f"serial={host_serial_projected_ms:.3f} ms; excludes contention/sync/NUMA"
+        )
+
+
 def run_zerosm(group, pg, rank, ws, args) -> None:
     """Whether a copy takes SMs, as an A/B with a control: peer destination against same-device.
 
@@ -642,12 +930,33 @@ def main() -> None:
     parser.add_argument(
         "--mode",
         default="stages",
-        choices=["stages", "overlap", "padding", "zerocopy", "sweep", "link", "zerosm"],
+        choices=[
+            "stages",
+            "overlap",
+            "padding",
+            "zerocopy",
+            "sweep",
+            "link",
+            "pcie-pretest",
+            "zerosm",
+        ],
         help="which measurement to run; see the module docstring",
     )
     parser.add_argument("--iters", type=int, default=25)
     parser.add_argument("--warmup", type=int, default=8)
     parser.add_argument("--batch", type=int, default=1)
+    parser.add_argument(
+        "--shape",
+        choices=[shape[0] for shape in SHAPES],
+        default=SHAPES[0][0],
+        help="shape for --mode pcie-pretest (default: wan-720p)",
+    )
+    parser.add_argument(
+        "--host-mib",
+        type=int,
+        default=64,
+        help="pinned-host probe size for --mode pcie-pretest (default: 64 MiB)",
+    )
     parser.add_argument(
         "--allow-non-nvlink",
         action="store_true",
@@ -669,6 +978,7 @@ def main() -> None:
         "zerocopy": run_zerocopy,
         "sweep": run_sweep,
         "link": run_link,
+        "pcie-pretest": run_pcie_pretest,
         "zerosm": run_zerosm,
     }[args.mode](group, pg, rank, ws, args)
 
