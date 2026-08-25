@@ -2,7 +2,7 @@
 # Run one MiniMax H3 E2E backend. Called under tools/exclusive.sh.
 set -Eeuo pipefail
 
-BACKEND="${BACKEND:?set BACKEND to nccl, pitched-owned, pitched-zero, packed-owned, or auto-zero}"
+BACKEND="${BACKEND:?set BACKEND to nccl, pitched-owned, packed-owned, auto-owned, or an explicit zero-copy diagnostic}"
 WORK_ROOT="${WORK_ROOT:?set WORK_ROOT}"
 MODEL_ROOT="${MODEL_ROOT:?set MODEL_ROOT}"
 VLLM_OMNI_DIR="${VLLM_OMNI_DIR:?set VLLM_OMNI_DIR}"
@@ -15,6 +15,13 @@ WARMUPS="${WARMUPS:-2}"
 MEASURED_RUNS="${MEASURED_RUNS:-3}"
 PORT="${PORT:-8091}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-1800}"
+if [[ -z "${REQUEST_TIMEOUT:-}" ]]; then
+  if (( NUM_INFERENCE_STEPS <= 5 )); then
+    REQUEST_TIMEOUT=180
+  else
+    REQUEST_TIMEOUT=1800
+  fi
+fi
 
 case "${BACKEND}" in
   nccl)
@@ -31,6 +38,10 @@ case "${BACKEND}" in
     ;;
   packed-owned)
     transport="packed"
+    zero_copy=0
+    ;;
+  auto-owned)
+    transport="auto"
     zero_copy=0
     ;;
   auto-zero)
@@ -65,6 +76,7 @@ printf '%s\n' "${BACKEND}" >"${OUTPUT_DIR}/backend.txt"
   printf 'NUM_INFERENCE_STEPS=%s\n' "${NUM_INFERENCE_STEPS}"
   printf 'WARMUPS=%s\n' "${WARMUPS}"
   printf 'MEASURED_RUNS=%s\n' "${MEASURED_RUNS}"
+  printf 'REQUEST_TIMEOUT=%s\n' "${REQUEST_TIMEOUT}"
 } >"${OUTPUT_DIR}/environment.txt"
 
 server_pid=""
@@ -140,7 +152,7 @@ API_URL="http://127.0.0.1:${PORT}/v1/videos/sync"
 request() {
   local label="$1"
   /usr/bin/time -f '%e' -o "${OUTPUT_DIR}/${label}.seconds" \
-    curl --fail-with-body -sS --max-time 1800 -D "${OUTPUT_DIR}/${label}.headers" \
+    curl --fail-with-body -sS --max-time "${REQUEST_TIMEOUT}" -D "${OUTPUT_DIR}/${label}.headers" \
     -X POST "${API_URL}" \
     -F 'prompt=At night, three cats march into a bedroom playing tiny brass instruments, then abruptly file out, with synchronized room ambience.' \
     -F 'width=1344' \

@@ -44,6 +44,7 @@ Defaults match the validated socket-0 RTX PRO 5000 layout:
   TP_SIZE=2, ULYSSES_DEGREE=2, NUMA_NODE=0
 
 RUN_LEVEL=screen uses 5 denoise steps. RUN_LEVEL=full uses 50 steps.
+H3_E2E_BACKENDS is a comma-separated override. Zero-copy variants are diagnostics only.
 Override RESULT_ROOT to append later phases to an existing result directory.
 EOF
 }
@@ -201,7 +202,10 @@ run_e2e() {
     die "RUN_LEVEL must be 'screen' or 'full'"
   fi
 
-  local backends=(nccl pitched-owned pitched-zero packed-owned auto-zero)
+  local backend_csv="${H3_E2E_BACKENDS:-nccl,pitched-owned,packed-owned,auto-owned}"
+  local backends
+  IFS=',' read -r -a backends <<<"${backend_csv}"
+  [[ "${#backends[@]}" -gt 0 ]] || die "H3_E2E_BACKENDS selected no backends"
   for backend in "${backends[@]}"; do
     "${FAST_ULYSSES_ROOT}/tools/exclusive.sh" "${GPU_IDS}" -- env \
       BACKEND="${backend}" WORK_ROOT="${WORK_ROOT}" MODEL_ROOT="${MODEL_ROOT}" \

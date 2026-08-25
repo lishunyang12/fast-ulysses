@@ -23,9 +23,14 @@ reference IDs to a different host.
 | --- | --- | --- |
 | `nccl` | permute + `all_to_all_single` + permute | production baseline |
 | `pitched-owned` | pitched peer copies plus flat copy-out | PCIe control |
-| `pitched-zero` | pitched peer copies into persistent outputs | remove copy-out |
 | `packed-owned` | local pack + flat peer copies + local mode-1 unpack | PCIe fallback |
-| `auto-zero` | first-shape autotune plus persistent outputs | topology-aware candidate |
+| `auto-owned` | first-shape autotune plus owned outputs | topology-aware candidate |
+
+`pitched-zero` and `auto-zero` remain explicit diagnostics, not default E2E candidates. On the
+reference PCIe H3 run, `pitched-zero` entered all four persistent Q/K/V/O buffers but then made no
+forward progress; the following TP all-reduce timed out after 602 seconds. The operator-only loop
+did not expose this interaction, so no zero-copy production speedup may be claimed until an E2E
+screen completes and matches the NCCL output.
 
 The H3 block benchmark uses TP-local heads. H3 has 56 model heads; TP2 leaves 28 heads in each
 Ulysses2 group. It issues three independent `[B,S/U,28,128]` mode-0 calls for Q/K/V and one
@@ -61,10 +66,11 @@ backend, parallelism, and compile mode identical. Exclude two warmups. Record th
 requests, stage headers, GPU memory/utilization samples, server logs, and decoded video/audio
 FrameMD5.
 
-The zero-copy variants assign independent persistent symmetric outputs to Q, K, V, and O. The
-auto variant measures pitched and packed on the first mode-0 and mode-1 shapes, compares the
+The auto variant measures pitched and packed on the first mode-0 and mode-1 shapes, compares the
 slowest rank, and keeps pitched unless packed is at least 5% faster. Startup autotuning is absorbed
-by the warmups and must not be included in measured request latency.
+by the warmups and must not be included in measured request latency. An explicit zero-copy run
+assigns independent persistent symmetric outputs to Q, K, V, and O and is a correctness/liveness
+diagnostic until the E2E hang above is resolved.
 
 `RUN_LEVEL=screen` uses five steps to reject broken or losing paths. `RUN_LEVEL=full` uses 50
 steps for the reportable result. Do not publish the screen result as a production speedup.
@@ -83,8 +89,8 @@ Packed-flat proceeds to the full E2E run only when all of these hold:
 2. Flat peer copies recover at least 70% of the pair's flat-link ceiling.
 3. `packed_owned_block` beats `nccl_block` by at least 10% in at least four of five exclusive runs.
 4. p95 does not regress by more than 10% relative to packed p50.
-5. The server log confirms the requested backend, every zero-copy allocation, and the auto
-   selection; silent NCCL fallback is a hard failure.
+5. The server log confirms the requested backend and auto selection; an explicit zero-copy
+   diagnostic must also confirm every allocation. Silent NCCL fallback is a hard failure.
 6. Decoded video and audio FrameMD5 match the NCCL baseline.
 7. Full-run denoise and E2E latency both improve; a VAE-only or startup-only change is not a
    communication result.
