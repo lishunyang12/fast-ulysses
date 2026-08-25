@@ -99,6 +99,7 @@ setup_env() {
   if [[ ! -x "${VLLM_OMNI_DIR}/.venv/bin/python" ]]; then
     "${UV}" venv --python 3.12 --seed "${VLLM_OMNI_DIR}/.venv"
   fi
+  export PATH="${VLLM_OMNI_DIR}/.venv/bin:${PATH}"
 
   "${UV}" pip install --python "${VLLM_OMNI_DIR}/.venv/bin/python" \
     "vllm==0.26.0" --torch-backend=auto
