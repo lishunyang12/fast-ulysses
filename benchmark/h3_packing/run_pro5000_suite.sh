@@ -53,6 +53,16 @@ die() {
   exit 2
 }
 
+acquire_e2e_lock() {
+  require_command flock
+  local gpu_lock_key="${GPU_IDS//,/-}"
+  local lock_file="/tmp/fast-ulysses-h3-e2e-${USER:-unknown}-${gpu_lock_key}.lock"
+  exec {E2E_LOCK_FD}<>"${lock_file}"
+  flock -n "${E2E_LOCK_FD}" || \
+    die "another H3 E2E suite is already using GPU_IDS=${GPU_IDS} (lock ${lock_file})"
+  printf 'pid=%s\nresult_root=%s\n' "$$" "${RESULT_ROOT}" >"${lock_file}"
+}
+
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
@@ -234,10 +244,12 @@ case "${ACTION}" in
     run_microbench
     ;;
   e2e)
+    acquire_e2e_lock
     setup_env
     run_e2e
     ;;
   all)
+    acquire_e2e_lock
     setup_env
     run_microbench
     run_e2e

@@ -86,6 +86,18 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP
 
+show_server_failure() {
+  echo "# server process group ${server_pid}" >&2
+  ps -eo user,pid,ppid,pgid,etime,cmd | \
+    awk -v pgid="${server_pid}" 'NR == 1 || $4 == pgid || $2 == pgid' >&2 || true
+  echo "# first relevant server errors" >&2
+  grep -nEi \
+    'out of memory|cuda error|nvshmem|segmentation|signal|killed|traceback|exception|error' \
+    "${OUTPUT_DIR}/server.log" | head -n 120 >&2 || true
+  echo "# last 300 server log lines" >&2
+  tail -n 300 "${OUTPUT_DIR}/server.log" >&2 || true
+}
+
 setsid numactl --cpunodebind="${NUMA_NODE}" --membind="${NUMA_NODE}" \
   vllm serve "${MODEL_ROOT}/FL2VA" \
   --omni \
@@ -111,13 +123,14 @@ nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,power.draw \
 sampler_pid=$!
 
 deadline=$((SECONDS + STARTUP_TIMEOUT))
-until curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null; do
+until curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; do
   kill -0 "${server_pid}" 2>/dev/null || {
-    tail -n 200 "${OUTPUT_DIR}/server.log" >&2
+    show_server_failure
     exit 1
   }
   (( SECONDS < deadline )) || {
     echo "server startup timed out after ${STARTUP_TIMEOUT}s" >&2
+    show_server_failure
     exit 1
   }
   sleep 10
