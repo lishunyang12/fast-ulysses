@@ -9,7 +9,7 @@ ACTION="${1:-all}"
 
 VLLM_OMNI_DIR="${VLLM_OMNI_DIR:-${WORK_ROOT}/vllm-omni-fast-ulysses}"
 VLLM_OMNI_REPO="${VLLM_OMNI_REPO:-https://github.com/lishunyang12/vllm-omni.git}"
-VLLM_OMNI_BRANCH="${VLLM_OMNI_BRANCH:-feat/fast-ulysses-transport}"
+VLLM_OMNI_BRANCH="${VLLM_OMNI_BRANCH:-feat/fast-ulysses-transport-v026}"
 MODEL_ROOT="${MODEL_ROOT:-${WORK_ROOT}/MiniMax-H3}"
 GPU_IDS="${GPU_IDS:-0,2,1,3}"
 NUMA_NODE="${NUMA_NODE:-0}"
