@@ -18,6 +18,11 @@ ULYSSES_DEGREE="${ULYSSES_DEGREE:-2}"
 MICRO_RUNS="${MICRO_RUNS:-5}"
 MICRO_ITERS="${MICRO_ITERS:-200}"
 MICRO_WARMUP="${MICRO_WARMUP:-50}"
+OVERLAP_RUNS="${OVERLAP_RUNS:-3}"
+OVERLAP_ITERS="${OVERLAP_ITERS:-12}"
+OVERLAP_WARMUP="${OVERLAP_WARMUP:-3}"
+H3_SEQUENCE_LENGTH="${H3_SEQUENCE_LENGTH:-37760}"
+H3_ATTENTION_BACKEND="${H3_ATTENTION_BACKEND:-cudnn}"
 RUN_LEVEL="${RUN_LEVEL:-screen}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RESULT_ROOT="${RESULT_ROOT:-${WORK_ROOT}/results/h3-packing-${STAMP}}"
@@ -37,7 +42,7 @@ fi
 
 usage() {
   cat <<'EOF'
-Usage: run_pro5000_suite.sh [setup|microbench|e2e|all]
+Usage: run_pro5000_suite.sh [setup|microbench|overlap|e2e|all]
 
 Defaults match the validated socket-0 RTX PRO 5000 layout:
   GPU_IDS=0,2,1,3  -> Ulysses pairs are physical (0,1) and (2,3)
@@ -182,6 +187,7 @@ run_microbench() {
       "${torchrun}" --standalone --nproc_per_node=4 \
       "${FAST_ULYSSES_ROOT}/benchmark/bench_a2a.py" \
       --mode h3-block --shape h3-t2va-5s --tensor-parallel-size "${TP_SIZE}" \
+      --sequence-length "${H3_SEQUENCE_LENGTH}" \
       --allow-non-nvlink --iters "${MICRO_ITERS}" --warmup "${MICRO_WARMUP}" \
       --blocks 50 --steps 50 --json-out "${output_dir}/h3-block-${run}.json" \
       2>&1 | tee "${output_dir}/h3-block-${run}.log"
@@ -189,6 +195,30 @@ run_microbench() {
 
   "${VLLM_OMNI_DIR}/.venv/bin/python" "${SCRIPT_DIR}/summarize_h3_block.py" \
     "${output_dir}"/h3-block-*.json --output "${output_dir}/h3-block-summary.tsv"
+}
+
+run_overlap() {
+  local torchrun="${VLLM_OMNI_DIR}/.venv/bin/torchrun"
+  [[ -x "${torchrun}" ]] || die "environment missing; run '$0 setup' first"
+  local output_dir="${RESULT_ROOT}/overlap"
+  mkdir -p "${output_dir}"
+
+  for run in $(seq 1 "${OVERLAP_RUNS}"); do
+    "${FAST_ULYSSES_ROOT}/tools/exclusive.sh" "${GPU_IDS}" -- \
+      numactl --cpunodebind="${NUMA_NODE}" --membind="${NUMA_NODE}" \
+      "${torchrun}" --standalone --nproc_per_node=4 \
+      "${SCRIPT_DIR}/bench_h3_tiled_overlap.py" \
+      --sequence-length "${H3_SEQUENCE_LENGTH}" \
+      --tensor-parallel-size "${TP_SIZE}" \
+      --attention-backend "${H3_ATTENTION_BACKEND}" \
+      --allow-non-nvlink --iters "${OVERLAP_ITERS}" --warmup "${OVERLAP_WARMUP}" \
+      --json-out "${output_dir}/h3-tiled-overlap-${run}.json" \
+      2>&1 | tee "${output_dir}/h3-tiled-overlap-${run}.log"
+  done
+
+  "${VLLM_OMNI_DIR}/.venv/bin/python" "${SCRIPT_DIR}/summarize_h3_overlap.py" \
+    "${output_dir}"/h3-tiled-overlap-*.json \
+    --output "${output_dir}/h3-tiled-overlap-summary.tsv"
 }
 
 run_e2e() {
@@ -247,6 +277,10 @@ case "${ACTION}" in
     setup_env
     run_microbench
     ;;
+  overlap)
+    setup_env
+    run_overlap
+    ;;
   e2e)
     acquire_e2e_lock
     setup_env
@@ -256,6 +290,7 @@ case "${ACTION}" in
     acquire_e2e_lock
     setup_env
     run_microbench
+    run_overlap
     run_e2e
     ;;
   -h|--help|help)

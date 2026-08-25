@@ -81,6 +81,24 @@ After the screen passes, collect one two-step Nsight or torch-profiler trace per
 time to input pack, peer copies, barriers, mode-1 unpack/copy-out, NCCL kernels, and layout kernels.
 The trace must explain the wall-clock change; latency alone is insufficient.
 
+### 5. Head-tiled overlap experiment
+
+Run the two-way head-tile prototype separately from the safe E2E matrix. It compares the current
+pitched-owned full block, a serial two-tile control, and a two-tile pipeline. Tile 1 Q/K/V transfer
+runs under tile 0 attention; tile 0 O transfer runs under tile 1 attention. All peer copies remain
+serialized on one communication stream, and all outputs are owned (the known-broken persistent
+zero-copy E2E path is not involved).
+
+The pipelined candidate packs Q/K/V in destination-major order and moves one fused tensor per
+tile, so Q/K/V share one pair of barriers. `fused_full_with_pack` measures an explicit `torch.cat`;
+the other fused rows model a later norm/RoPE kernel that writes this layout directly. Report these
+separately—the prepacked result is not an end-to-end speedup until that producer fusion exists.
+
+The exact E2E sequence length on the reference run is 37760. Correctness against untiled attention
+must pass before timing is reported. A useful result must beat both the untiled full path and the
+serial tiled control in at least two of three exclusive process runs; otherwise tiling overhead is
+larger than the communication hidden and this design should not be integrated into vLLM-Omni.
+
 ## Acceptance gates
 
 Packed-flat proceeds to the full E2E run only when all of these hold:
@@ -115,3 +133,11 @@ bash benchmark/h3_packing/run_pro5000_suite.sh e2e
 
 Results are written under `WORK_ROOT/results/h3-packing-<UTC timestamp>`. Set `RESULT_ROOT` to an
 explicit directory when setup, microbench, and E2E are launched as separate scheduler jobs.
+
+Run only the communication/attention overlap experiment with:
+
+```bash
+WORK_ROOT=/lustre/raplab/client/sylarl/minimax-h3-native \
+GPU_IDS=4,6,5,7 NUMA_NODE=1 \
+bash benchmark/h3_packing/run_pro5000_suite.sh overlap
+```
