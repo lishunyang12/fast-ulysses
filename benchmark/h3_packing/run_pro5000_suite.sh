@@ -184,7 +184,8 @@ run_e2e() {
     die "RUN_LEVEL must be 'screen' or 'full'"
   fi
 
-  for backend in nccl pitched packed; do
+  local backends=(nccl pitched-owned pitched-zero packed-owned auto-zero)
+  for backend in "${backends[@]}"; do
     "${FAST_ULYSSES_ROOT}/tools/exclusive.sh" "${GPU_IDS}" -- env \
       BACKEND="${backend}" WORK_ROOT="${WORK_ROOT}" MODEL_ROOT="${MODEL_ROOT}" \
       VLLM_OMNI_DIR="${VLLM_OMNI_DIR}" RESULT_ROOT="${RESULT_ROOT}" \
@@ -195,7 +196,7 @@ run_e2e() {
 
   {
     printf 'backend\truns\tmean_seconds\n'
-    for backend in nccl pitched packed; do
+    for backend in "${backends[@]}"; do
       awk -v backend="${backend}" '
         {sum += $1; count += 1}
         END {printf "%s\t%d\t%.3f\n", backend, count, sum / count}
@@ -203,10 +204,13 @@ run_e2e() {
     done
   } | tee "${RESULT_ROOT}/e2e/summary.tsv"
 
-  sha256sum "${RESULT_ROOT}/e2e"/*/run-1.video.framemd5 \
-    | tee "${RESULT_ROOT}/e2e/video-correctness.sha256"
-  sha256sum "${RESULT_ROOT}/e2e"/*/run-1.audio.framemd5 \
-    | tee "${RESULT_ROOT}/e2e/audio-correctness.sha256"
+  local video_checks=() audio_checks=()
+  for backend in "${backends[@]}"; do
+    video_checks+=("${RESULT_ROOT}/e2e/${backend}/run-1.video.framemd5")
+    audio_checks+=("${RESULT_ROOT}/e2e/${backend}/run-1.audio.framemd5")
+  done
+  sha256sum "${video_checks[@]}" | tee "${RESULT_ROOT}/e2e/video-correctness.sha256"
+  sha256sum "${audio_checks[@]}" | tee "${RESULT_ROOT}/e2e/audio-correctness.sha256"
 
   [[ "$(awk '{print $1}' "${RESULT_ROOT}/e2e/video-correctness.sha256" | sort -u | wc -l)" -eq 1 ]] || \
     die "decoded video FrameMD5 differs across backends"

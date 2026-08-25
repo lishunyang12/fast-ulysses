@@ -22,8 +22,10 @@ reference IDs to a different host.
 | name | implementation | purpose |
 | --- | --- | --- |
 | `nccl` | permute + `all_to_all_single` + permute | production baseline |
-| `pitched` | fast-ulysses pitched peer copies | control reproducing the PCIe failure mode |
-| `packed` | local pack + flat peer copies + local mode-1 unpack | PCIe candidate |
+| `pitched-owned` | pitched peer copies plus flat copy-out | PCIe control |
+| `pitched-zero` | pitched peer copies into persistent outputs | remove copy-out |
+| `packed-owned` | local pack + flat peer copies + local mode-1 unpack | PCIe fallback |
+| `auto-zero` | first-shape autotune plus persistent outputs | topology-aware candidate |
 
 The H3 block benchmark uses TP-local heads. H3 has 56 model heads; TP2 leaves 28 heads in each
 Ulysses2 group. It issues three independent `[B,S/U,28,128]` mode-0 calls for Q/K/V and one
@@ -59,6 +61,11 @@ backend, parallelism, and compile mode identical. Exclude two warmups. Record th
 requests, stage headers, GPU memory/utilization samples, server logs, and decoded video/audio
 FrameMD5.
 
+The zero-copy variants assign independent persistent symmetric outputs to Q, K, V, and O. The
+auto variant measures pitched and packed on the first mode-0 and mode-1 shapes, compares the
+slowest rank, and keeps pitched unless packed is at least 5% faster. Startup autotuning is absorbed
+by the warmups and must not be included in measured request latency.
+
 `RUN_LEVEL=screen` uses five steps to reject broken or losing paths. `RUN_LEVEL=full` uses 50
 steps for the reportable result. Do not publish the screen result as a production speedup.
 
@@ -76,7 +83,8 @@ Packed-flat proceeds to the full E2E run only when all of these hold:
 2. Flat peer copies recover at least 70% of the pair's flat-link ceiling.
 3. `packed_owned_block` beats `nccl_block` by at least 10% in at least four of five exclusive runs.
 4. p95 does not regress by more than 10% relative to packed p50.
-5. The server log confirms `backend=packed`; silent NCCL fallback is a hard failure.
+5. The server log confirms the requested backend, every zero-copy allocation, and the auto
+   selection; silent NCCL fallback is a hard failure.
 6. Decoded video and audio FrameMD5 match the NCCL baseline.
 7. Full-run denoise and E2E latency both improve; a VAE-only or startup-only change is not a
    communication result.

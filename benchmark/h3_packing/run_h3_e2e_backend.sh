@@ -2,7 +2,7 @@
 # Run one MiniMax H3 E2E backend. Called under tools/exclusive.sh.
 set -Eeuo pipefail
 
-BACKEND="${BACKEND:?set BACKEND to nccl, pitched, or packed}"
+BACKEND="${BACKEND:?set BACKEND to nccl, pitched-owned, pitched-zero, packed-owned, or auto-zero}"
 WORK_ROOT="${WORK_ROOT:?set WORK_ROOT}"
 MODEL_ROOT="${MODEL_ROOT:?set MODEL_ROOT}"
 VLLM_OMNI_DIR="${VLLM_OMNI_DIR:?set VLLM_OMNI_DIR}"
@@ -17,7 +17,26 @@ PORT="${PORT:-8091}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-1800}"
 
 case "${BACKEND}" in
-  nccl|pitched|packed) ;;
+  nccl)
+    transport="nccl"
+    zero_copy=0
+    ;;
+  pitched-owned)
+    transport="pitched"
+    zero_copy=0
+    ;;
+  pitched-zero)
+    transport="pitched"
+    zero_copy=1
+    ;;
+  packed-owned)
+    transport="packed"
+    zero_copy=0
+    ;;
+  auto-zero)
+    transport="auto"
+    zero_copy=1
+    ;;
   *) echo "invalid BACKEND=${BACKEND}" >&2; exit 2 ;;
 esac
 
@@ -26,8 +45,9 @@ export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${WORK_ROOT}/xdg-cache}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${WORK_ROOT}/triton-cache}"
 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-${WORK_ROOT}/torchinductor-cache}"
 export PATH="${WORK_ROOT}/bin:${WORK_ROOT}/ffmpeg-tools:${WORK_ROOT}/ffmpeg-tools/bin:${WORK_ROOT}/ffmpeg-shared/bin:${VLLM_OMNI_DIR}/.venv/bin:${PATH}"
-export VLLM_OMNI_ULYSSES_TRANSPORT="${BACKEND}"
+export VLLM_OMNI_ULYSSES_TRANSPORT="${transport}"
 export VLLM_OMNI_FAST_ULYSSES_ALLOW_NON_NVLINK=1
+export VLLM_OMNI_FAST_ULYSSES_ZERO_COPY="${zero_copy}"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800
 
@@ -36,6 +56,8 @@ mkdir -p "${OUTPUT_DIR}"
 printf '%s\n' "${BACKEND}" >"${OUTPUT_DIR}/backend.txt"
 {
   printf 'BACKEND=%s\n' "${BACKEND}"
+  printf 'TRANSPORT=%s\n' "${transport}"
+  printf 'ZERO_COPY=%s\n' "${zero_copy}"
   printf 'CUDA_VISIBLE_DEVICES=%s\n' "${CUDA_VISIBLE_DEVICES:-}"
   printf 'NUMA_NODE=%s\n' "${NUMA_NODE}"
   printf 'TP_SIZE=%s\n' "${TP_SIZE}"
@@ -123,9 +145,21 @@ for warmup in $(seq 1 "${WARMUPS}"); do
   request "warmup-${warmup}"
 done
 
-if [[ "${BACKEND}" != "nccl" ]]; then
-  grep -q "Initialized fast-ulysses transport backend=${BACKEND}" "${OUTPUT_DIR}/server.log" || {
-    echo "server did not confirm fast-ulysses backend=${BACKEND}; refusing to record fallback data" >&2
+if [[ "${transport}" == "auto" ]]; then
+  grep -q "Selected fast-ulysses auto backend=" "${OUTPUT_DIR}/server.log" || {
+    echo "server did not confirm a fast-ulysses auto selection; refusing to record fallback data" >&2
+    exit 1
+  }
+elif [[ "${transport}" != "nccl" ]]; then
+  grep -q "Initialized fast-ulysses transport backend=${transport}" "${OUTPUT_DIR}/server.log" || {
+    echo "server did not confirm fast-ulysses backend=${transport}; refusing to record fallback data" >&2
+    exit 1
+  }
+fi
+
+if [[ "${zero_copy}" == "1" ]]; then
+  grep -q "Allocated fast-ulysses zero-copy output" "${OUTPUT_DIR}/server.log" || {
+    echo "server did not confirm zero-copy output allocation" >&2
     exit 1
   }
 fi
