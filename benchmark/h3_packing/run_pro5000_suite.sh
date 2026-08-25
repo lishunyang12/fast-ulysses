@@ -104,6 +104,8 @@ setup_env() {
     "vllm==0.26.0" --torch-backend=auto
   "${UV}" pip install --python "${VLLM_OMNI_DIR}/.venv/bin/python" \
     -e "${VLLM_OMNI_DIR}"
+  "${UV}" pip install --python "${VLLM_OMNI_DIR}/.venv/bin/python" \
+    cmake ninja
   FAST_ULYSSES_CUDA_ARCH=120 "${UV}" pip install \
     --python "${VLLM_OMNI_DIR}/.venv/bin/python" --no-build-isolation \
     -e "${FAST_ULYSSES_ROOT}"
