@@ -4,7 +4,8 @@ Run under tools/exclusive.sh -- a number from a shared GPU is not a number:
 
     ./tools/exclusive.sh 0,1,2,3 -- torchrun --nproc_per_node=4 benchmark/bench_a2a.py --mode stages
 
-Modes: stages (default), overlap, padding, zerocopy, sweep, link, pcie-pretest, zerosm.
+Modes: stages (default), overlap, padding, zerocopy, sweep, link, pcie-pretest, h3-block,
+zerosm.
 benchmark/collect.sh runs the established modes in order and records the environment they ran in.
 
 stages (default)
@@ -53,6 +54,12 @@ pcie-pretest
     prototype: its peer-copy timing deliberately has no cross-rank GPU barrier, and the report adds
     the current operator's measured barrier cost as an estimate.
 
+h3-block
+    A production-path A/B/C for MiniMax H3. Unlike the historical shape rows, this sends Q, K,
+    and V as three independent head_dim=128 mode-0 calls, then one mode-1 output call, exactly as
+    vLLM-Omni's Ulysses wrapper does today. It reports slowest-rank p50/p95 for NCCL, pitched, and
+    packed backends, checks exact round trips, and projects the communication-only denoise total.
+
 zerosm
     Does a copy take SMs? The same bytes and the same `dst.copy_(src)` twice -- once into a peer's
     symmetric-memory window, once into this rank's own memory -- the same copy count for both, each
@@ -65,9 +72,11 @@ zerosm
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import statistics
 import time
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -731,6 +740,234 @@ def run_pcie_pretest(group, pg, rank, ws, args) -> None:
         )
 
 
+def _baseline_mode0(x: torch.Tensor, pg, ws: int) -> torch.Tensor:
+    """vLLM-Omni strict Ulysses: scatter heads, gather sequence."""
+    b, s_local, h_global, d = x.shape
+    h_local = h_global // ws
+    send = x.reshape(b, s_local, ws, h_local, d).transpose(0, 2).contiguous()
+    recv = torch.empty_like(send)
+    dist.all_to_all_single(recv, send, group=pg)
+    return recv.reshape(s_local * ws, b, h_local, d).transpose(0, 1).contiguous()
+
+
+def _baseline_mode1(x: torch.Tensor, pg, ws: int) -> torch.Tensor:
+    """vLLM-Omni strict Ulysses reverse: scatter sequence, gather heads."""
+    b, s_global, h_local, d = x.shape
+    s_local = s_global // ws
+    send = (
+        x.reshape(b, ws, s_local, h_local, d)
+        .transpose(0, 3)
+        .transpose(0, 1)
+        .contiguous()
+        .reshape(ws, h_local, s_local, b, d)
+    )
+    recv = torch.empty_like(send)
+    dist.all_to_all_single(recv, send, group=pg)
+    return recv.reshape(h_local * ws, s_local, b, d).transpose(0, 2).contiguous()
+
+
+def _slowest_rank_distribution(fn, iters: int, warmup: int, timing_pg) -> dict[str, float]:
+    """CUDA-event latency distribution, reduced to the slowest rank per iteration."""
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    dist.barrier(group=timing_pg)
+
+    samples = []
+    for _ in range(iters):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn()
+        end.record()
+        end.synchronize()
+        samples.append(start.elapsed_time(end))
+
+    values = torch.tensor(samples, dtype=torch.float64, device=torch.cuda.current_device())
+    dist.all_reduce(values, op=dist.ReduceOp.MAX, group=timing_pg)
+    ordered = sorted(float(value) for value in values.cpu().tolist())
+
+    def percentile(fraction: float) -> float:
+        index = min(len(ordered) - 1, max(0, int(len(ordered) * fraction + 0.999999) - 1))
+        return ordered[index]
+
+    return {
+        "min_ms": ordered[0],
+        "p50_ms": statistics.median(ordered),
+        "p95_ms": percentile(0.95),
+        "p99_ms": percentile(0.99),
+        "max_ms": ordered[-1],
+        "mean_ms": statistics.mean(ordered),
+    }
+
+
+def run_h3_block(group, pg, rank, ws, args) -> None:
+    """Measure the four collectives issued by one MiniMax H3 transformer block."""
+    if args.batch != 1:
+        raise ValueError("h3-block currently requires --batch 1")
+    if ws < 2:
+        raise ValueError("h3-block requires at least two ranks")
+
+    label, img, model_heads, _, txt = next(shape for shape in SHAPES if shape[0] == args.shape)
+    if label != "h3-t2va-5s":
+        raise ValueError("h3-block currently requires --shape h3-t2va-5s")
+    if model_heads % args.tensor_parallel_size:
+        raise ValueError(
+            f"{model_heads} model heads do not divide tensor parallel size "
+            f"{args.tensor_parallel_size}"
+        )
+    heads = model_heads // args.tensor_parallel_size
+    if heads % ws:
+        raise ValueError(f"{heads} TP-local heads do not divide Ulysses world_size {ws}")
+
+    sequence_length = args.sequence_length or img + txt
+    sequence_length += (-sequence_length) % ws
+    s_local = sequence_length // ws
+    head_dim = 128
+    h_local = heads // ws
+    dev = torch.device("cuda", torch.cuda.current_device())
+
+    qkv = [
+        torch.randn((1, s_local, heads, head_dim), dtype=torch.bfloat16, device=dev)
+        for _ in range(3)
+    ]
+    attn_output = torch.randn(
+        (1, sequence_length, h_local, head_dim), dtype=torch.bfloat16, device=dev
+    )
+
+    packed = UlyssesGroup(process_group=pg, require_nvlink=False, backend="packed")
+    try:
+        baseline_round_trip = _baseline_mode1(_baseline_mode0(qkv[0], pg, ws), pg, ws)
+        pitched_round_trip = group.all_to_all_4d(group.all_to_all_4d(qkv[0], mode=0), mode=1)
+        packed_round_trip = packed.all_to_all_4d(packed.all_to_all_4d(qkv[0], mode=0), mode=1)
+        for name, actual in (
+            ("nccl", baseline_round_trip),
+            ("pitched", pitched_round_trip),
+            ("packed", packed_round_trip),
+        ):
+            if not torch.equal(actual, qkv[0]):
+                raise AssertionError(f"{name} H3 round trip mismatch on rank {rank}")
+
+        pitched_qkv_out = [group.empty_output(x, mode=0) for x in qkv]
+        pitched_o_out = group.empty_output(attn_output, mode=1)
+        packed_qkv_out = [packed.empty_output(x, mode=0) for x in qkv]
+        packed_o_out = packed.empty_output(attn_output, mode=1)
+
+        def nccl_block() -> None:
+            for x in qkv:
+                _baseline_mode0(x, pg, ws)
+            _baseline_mode1(attn_output, pg, ws)
+
+        def pitched_owned_block() -> None:
+            for x in qkv:
+                group.all_to_all_4d(x, mode=0)
+            group.all_to_all_4d(attn_output, mode=1)
+
+        def pitched_zero_block() -> None:
+            for x, out in zip(qkv, pitched_qkv_out):
+                group.all_to_all_4d(x, mode=0, out=out)
+            group.all_to_all_4d(attn_output, mode=1, out=pitched_o_out)
+
+        def packed_owned_block() -> None:
+            for x in qkv:
+                packed.all_to_all_4d(x, mode=0)
+            packed.all_to_all_4d(attn_output, mode=1)
+
+        def packed_zero_block() -> None:
+            for x, out in zip(qkv, packed_qkv_out):
+                packed.all_to_all_4d(x, mode=0, out=out)
+            packed.all_to_all_4d(attn_output, mode=1, out=packed_o_out)
+
+        measurements = {
+            "nccl_mode0": lambda: _baseline_mode0(qkv[0], pg, ws),
+            "nccl_mode1": lambda: _baseline_mode1(attn_output, pg, ws),
+            "pitched_owned_mode0": lambda: group.all_to_all_4d(qkv[0], mode=0),
+            "pitched_owned_mode1": lambda: group.all_to_all_4d(attn_output, mode=1),
+            "packed_owned_mode0": lambda: packed.all_to_all_4d(qkv[0], mode=0),
+            "packed_owned_mode1": lambda: packed.all_to_all_4d(attn_output, mode=1),
+            "nccl_block": nccl_block,
+            "pitched_owned_block": pitched_owned_block,
+            "pitched_zero_block": pitched_zero_block,
+            "packed_owned_block": packed_owned_block,
+            "packed_zero_block": packed_zero_block,
+        }
+        results = {
+            name: _slowest_rank_distribution(fn, args.iters, args.warmup, dist.group.WORLD)
+            for name, fn in measurements.items()
+        }
+    finally:
+        packed.destroy()
+
+    baseline_block = results["nccl_block"]["p50_ms"]
+    predictions = {}
+    for name in (
+        "nccl_block",
+        "pitched_owned_block",
+        "pitched_zero_block",
+        "packed_owned_block",
+        "packed_zero_block",
+    ):
+        block_ms = results[name]["p50_ms"]
+        predictions[name] = {
+            "block_p50_ms": block_ms,
+            "versus_nccl": baseline_block / block_ms,
+            "denoise_communication_s": block_ms * args.blocks * args.steps / 1000,
+        }
+
+    report = {
+        "shape": {
+            "label": label,
+            "batch": 1,
+            "sequence_length": sequence_length,
+            "local_sequence_length": s_local,
+            "model_heads": model_heads,
+            "tensor_parallel_size": args.tensor_parallel_size,
+            "tp_local_heads": heads,
+            "local_heads": h_local,
+            "head_dim": head_dim,
+            "dtype": "bfloat16",
+            "ulysses_world_size": ws,
+            "process_world_size": dist.get_world_size(),
+        },
+        "iterations": args.iters,
+        "warmup": args.warmup,
+        "blocks": args.blocks,
+        "steps": args.steps,
+        "measurements": results,
+        "predictions": predictions,
+    }
+
+    if rank == 0:
+        print(
+            f"# MiniMax H3 separate Q/K/V block; s={sequence_length} model_heads={model_heads} "
+            f"TP={args.tensor_parallel_size} Ulysses={ws} local_heads={heads} head_dim={head_dim}"
+        )
+        print("# one block = 3 x mode0(Q/K/V) + 1 x mode1(O); slowest-rank samples")
+        print(f"{'path':<28} {'p50 ms':>10} {'p95 ms':>10} {'p99 ms':>10}")
+        print("-" * 62)
+        for name, stats in results.items():
+            print(
+                f"{name:<28} {stats['p50_ms']:10.3f} {stats['p95_ms']:10.3f} "
+                f"{stats['p99_ms']:10.3f}"
+            )
+        print(
+            f"\n# projected communication-only denoise: {args.blocks} blocks x {args.steps} steps"
+        )
+        print(f"{'path':<28} {'seconds':>10} {'vs NCCL':>10}")
+        print("-" * 50)
+        for name, prediction in predictions.items():
+            print(
+                f"{name:<28} {prediction['denoise_communication_s']:10.3f} "
+                f"{prediction['versus_nccl']:9.2f}x"
+            )
+
+        if args.json_out:
+            output_path = Path(args.json_out)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(json.dumps(report, indent=2) + "\n")
+            print(f"\n# JSON: {output_path}")
+
+
 def run_zerosm(group, pg, rank, ws, args) -> None:
     """Whether a copy takes SMs, as an A/B with a control: peer destination against same-device.
 
@@ -938,6 +1175,7 @@ def main() -> None:
             "sweep",
             "link",
             "pcie-pretest",
+            "h3-block",
             "zerosm",
         ],
         help="which measurement to run; see the module docstring",
@@ -958,6 +1196,33 @@ def main() -> None:
         help="pinned-host probe size for --mode pcie-pretest (default: 64 MiB)",
     )
     parser.add_argument(
+        "--sequence-length",
+        type=int,
+        help="override the total sequence length for --mode h3-block",
+    )
+    parser.add_argument(
+        "--blocks",
+        type=int,
+        default=50,
+        help="transformer blocks used by the h3-block denoise projection (default: 50)",
+    )
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help="TP degree surrounding each Ulysses group in --mode h3-block (default: 1)",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=50,
+        help="denoise steps used by the h3-block projection (default: 50)",
+    )
+    parser.add_argument(
+        "--json-out",
+        help="rank-0 JSON output path for --mode h3-block",
+    )
+    parser.add_argument(
         "--allow-non-nvlink",
         action="store_true",
         help="measure a group the constructor would refuse. Only for establishing what the "
@@ -969,6 +1234,24 @@ def main() -> None:
     rank, ws = dist.get_rank(), dist.get_world_size()
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", rank)))
     pg = dist.group.WORLD
+    if args.mode == "h3-block" and args.tensor_parallel_size > 1:
+        if ws % args.tensor_parallel_size:
+            raise ValueError(
+                f"world_size {ws} is not divisible by tensor parallel size "
+                f"{args.tensor_parallel_size}"
+            )
+        ulysses_degree = ws // args.tensor_parallel_size
+        local_pg = None
+        for tp_rank in range(args.tensor_parallel_size):
+            ranks = [
+                tp_rank + sp_rank * args.tensor_parallel_size for sp_rank in range(ulysses_degree)
+            ]
+            candidate = dist.new_group(ranks)
+            if rank in ranks:
+                local_pg = candidate
+        if local_pg is None:
+            raise RuntimeError(f"rank {rank} was not assigned to an H3 Ulysses group")
+        pg = local_pg
     group = UlyssesGroup(process_group=pg, require_nvlink=not args.allow_non_nvlink)
 
     {
@@ -979,8 +1262,9 @@ def main() -> None:
         "sweep": run_sweep,
         "link": run_link,
         "pcie-pretest": run_pcie_pretest,
+        "h3-block": run_h3_block,
         "zerosm": run_zerosm,
-    }[args.mode](group, pg, rank, ws, args)
+    }[args.mode](group, pg, rank, dist.get_world_size(pg), args)
 
     group.destroy()
     dist.destroy_process_group()

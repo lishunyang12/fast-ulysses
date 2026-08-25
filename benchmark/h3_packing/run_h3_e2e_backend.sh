@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# Run one MiniMax H3 E2E backend. Called under tools/exclusive.sh.
+set -Eeuo pipefail
+
+BACKEND="${BACKEND:?set BACKEND to nccl, pitched, or packed}"
+WORK_ROOT="${WORK_ROOT:?set WORK_ROOT}"
+MODEL_ROOT="${MODEL_ROOT:?set MODEL_ROOT}"
+VLLM_OMNI_DIR="${VLLM_OMNI_DIR:?set VLLM_OMNI_DIR}"
+RESULT_ROOT="${RESULT_ROOT:?set RESULT_ROOT}"
+NUMA_NODE="${NUMA_NODE:-0}"
+TP_SIZE="${TP_SIZE:-2}"
+ULYSSES_DEGREE="${ULYSSES_DEGREE:-2}"
+NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-5}"
+WARMUPS="${WARMUPS:-2}"
+MEASURED_RUNS="${MEASURED_RUNS:-3}"
+PORT="${PORT:-8091}"
+STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-1800}"
+
+case "${BACKEND}" in
+  nccl|pitched|packed) ;;
+  *) echo "invalid BACKEND=${BACKEND}" >&2; exit 2 ;;
+esac
+
+export HF_HOME="${HF_HOME:-${WORK_ROOT}/hf-cache}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${WORK_ROOT}/xdg-cache}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${WORK_ROOT}/triton-cache}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-${WORK_ROOT}/torchinductor-cache}"
+export PATH="${WORK_ROOT}/bin:${WORK_ROOT}/ffmpeg-tools:${WORK_ROOT}/ffmpeg-tools/bin:${WORK_ROOT}/ffmpeg-shared/bin:${VLLM_OMNI_DIR}/.venv/bin:${PATH}"
+export VLLM_OMNI_ULYSSES_TRANSPORT="${BACKEND}"
+export VLLM_OMNI_FAST_ULYSSES_ALLOW_NON_NVLINK=1
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800
+
+OUTPUT_DIR="${RESULT_ROOT}/e2e/${BACKEND}"
+mkdir -p "${OUTPUT_DIR}"
+printf '%s\n' "${BACKEND}" >"${OUTPUT_DIR}/backend.txt"
+{
+  printf 'BACKEND=%s\n' "${BACKEND}"
+  printf 'CUDA_VISIBLE_DEVICES=%s\n' "${CUDA_VISIBLE_DEVICES:-}"
+  printf 'NUMA_NODE=%s\n' "${NUMA_NODE}"
+  printf 'TP_SIZE=%s\n' "${TP_SIZE}"
+  printf 'ULYSSES_DEGREE=%s\n' "${ULYSSES_DEGREE}"
+  printf 'NUM_INFERENCE_STEPS=%s\n' "${NUM_INFERENCE_STEPS}"
+  printf 'WARMUPS=%s\n' "${WARMUPS}"
+  printf 'MEASURED_RUNS=%s\n' "${MEASURED_RUNS}"
+} >"${OUTPUT_DIR}/environment.txt"
+
+server_pid=""
+sampler_pid=""
+cleanup() {
+  if [[ -n "${sampler_pid}" ]]; then
+    kill "${sampler_pid}" 2>/dev/null || true
+    wait "${sampler_pid}" 2>/dev/null || true
+  fi
+  if [[ -n "${server_pid}" ]]; then
+    kill -TERM -- "-${server_pid}" 2>/dev/null || true
+    for _ in $(seq 1 60); do
+      kill -0 "${server_pid}" 2>/dev/null || break
+      sleep 1
+    done
+    kill -KILL -- "-${server_pid}" 2>/dev/null || true
+    wait "${server_pid}" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM HUP
+
+setsid numactl --cpunodebind="${NUMA_NODE}" --membind="${NUMA_NODE}" \
+  vllm serve "${MODEL_ROOT}/FL2VA" \
+  --omni \
+  --host 127.0.0.1 \
+  --port "${PORT}" \
+  --trust-remote-code \
+  --num-gpus 4 \
+  --tensor-parallel-size "${TP_SIZE}" \
+  --usp "${ULYSSES_DEGREE}" \
+  --ring 1 \
+  --text-encoder-tp-size 4 \
+  --vae-patch-parallel-size 4 \
+  --vae-parallel-mode tile \
+  --vae-use-tiling \
+  --diffusion-attention-backend CUDNN_ATTN \
+  --enable-diffusion-pipeline-profiler \
+  >"${OUTPUT_DIR}/server.log" 2>&1 &
+server_pid=$!
+printf '%s\n' "${server_pid}" >"${OUTPUT_DIR}/server.pid"
+
+nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,power.draw \
+  --format=csv -l 1 >"${OUTPUT_DIR}/gpu-samples.csv" 2>&1 &
+sampler_pid=$!
+
+deadline=$((SECONDS + STARTUP_TIMEOUT))
+until curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null; do
+  kill -0 "${server_pid}" 2>/dev/null || {
+    tail -n 200 "${OUTPUT_DIR}/server.log" >&2
+    exit 1
+  }
+  (( SECONDS < deadline )) || {
+    echo "server startup timed out after ${STARTUP_TIMEOUT}s" >&2
+    exit 1
+  }
+  sleep 10
+done
+
+API_URL="http://127.0.0.1:${PORT}/v1/videos/sync"
+request() {
+  local label="$1"
+  /usr/bin/time -f '%e' -o "${OUTPUT_DIR}/${label}.seconds" \
+    curl --fail-with-body -sS --max-time 1800 -D "${OUTPUT_DIR}/${label}.headers" \
+    -X POST "${API_URL}" \
+    -F 'prompt=At night, three cats march into a bedroom playing tiny brass instruments, then abruptly file out, with synchronized room ambience.' \
+    -F 'width=1344' \
+    -F 'height=768' \
+    -F 'aspect_ratio=16:9' \
+    -F 'fps=24' \
+    -F "num_inference_steps=${NUM_INFERENCE_STEPS}" \
+    -F 'flow_shift=12' \
+    -F 'seed=1101' \
+    -F 'extra_params={"task":"t2va","duration":5.0,"audio_flow_shift":3.0}' \
+    -o "${OUTPUT_DIR}/${label}.mp4"
+}
+
+for warmup in $(seq 1 "${WARMUPS}"); do
+  request "warmup-${warmup}"
+done
+
+if [[ "${BACKEND}" != "nccl" ]]; then
+  grep -q "Initialized fast-ulysses transport backend=${BACKEND}" "${OUTPUT_DIR}/server.log" || {
+    echo "server did not confirm fast-ulysses backend=${BACKEND}; refusing to record fallback data" >&2
+    exit 1
+  }
+fi
+
+for run in $(seq 1 "${MEASURED_RUNS}"); do
+  request "run-${run}"
+done
+
+ffprobe -v error -show_entries stream=index,codec_name,width,height,r_frame_rate,channels,sample_rate \
+  -of json "${OUTPUT_DIR}/run-1.mp4" >"${OUTPUT_DIR}/run-1.ffprobe.json"
+ffmpeg -v error -i "${OUTPUT_DIR}/run-1.mp4" -map 0:v -f framemd5 \
+  "${OUTPUT_DIR}/run-1.video.framemd5"
+ffmpeg -v error -i "${OUTPUT_DIR}/run-1.mp4" -map 0:a -f framemd5 \
+  "${OUTPUT_DIR}/run-1.audio.framemd5"
+
+awk '{sum += $1; count += 1} END {printf "mean_seconds=%.3f\n", sum / count}' \
+  "${OUTPUT_DIR}"/run-*.seconds | tee "${OUTPUT_DIR}/summary.txt"

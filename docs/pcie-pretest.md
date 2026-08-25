@@ -101,3 +101,8 @@ Use these gates before enabling the production path in a model:
 Selection is currently explicit: retain `backend="pitched"` on NVLink, use `backend="packed"` on
 favorable PCIe P2P, and keep NCCL as the fallback until host staging proves faster on the target
 topology.
+
+For MiniMax H3, use the TP-aware separate-QKV block benchmark and the one-command RTX PRO 5000
+runner in [h3-packing-test-plan.md](h3-packing-test-plan.md). The older `h3-t2va-5s` decomposition
+row fuses QKV into a `d=384` tensor; `--mode h3-block` instead matches vLLM-Omni's three mode-0
+calls plus one mode-1 call and can model TP2 x Ulysses2 contention.
