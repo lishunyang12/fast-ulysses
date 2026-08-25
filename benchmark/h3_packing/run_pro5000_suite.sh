@@ -91,8 +91,15 @@ setup_env() {
   else
     [[ -z "$(git -C "${VLLM_OMNI_DIR}" status --short)" ]] || \
       die "${VLLM_OMNI_DIR} has local changes; refusing to update it"
-    git -C "${VLLM_OMNI_DIR}" fetch origin "${VLLM_OMNI_BRANCH}"
-    git -C "${VLLM_OMNI_DIR}" checkout "${VLLM_OMNI_BRANCH}"
+    git -C "${VLLM_OMNI_DIR}" fetch origin \
+      "refs/heads/${VLLM_OMNI_BRANCH}:refs/remotes/origin/${VLLM_OMNI_BRANCH}"
+    if git -C "${VLLM_OMNI_DIR}" show-ref --verify --quiet \
+      "refs/heads/${VLLM_OMNI_BRANCH}"; then
+      git -C "${VLLM_OMNI_DIR}" checkout "${VLLM_OMNI_BRANCH}"
+    else
+      git -C "${VLLM_OMNI_DIR}" checkout -b "${VLLM_OMNI_BRANCH}" \
+        "refs/remotes/origin/${VLLM_OMNI_BRANCH}"
+    fi
     git -C "${VLLM_OMNI_DIR}" merge --ff-only "origin/${VLLM_OMNI_BRANCH}"
   fi
 
