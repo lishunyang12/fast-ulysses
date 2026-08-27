@@ -75,11 +75,17 @@ diagnostic until the E2E hang above is resolved.
 `RUN_LEVEL=screen` uses five steps to reject broken or losing paths. `RUN_LEVEL=full` uses 50
 steps for the reportable result. Do not publish the screen result as a production speedup.
 
-### 4. Profile
+### 4. Profile without Nsight Systems
 
-After the screen passes, collect one two-step Nsight or torch-profiler trace per backend. Attribute
-time to input pack, peer copies, barriers, mode-1 unpack/copy-out, NCCL kernels, and layout kernels.
-The trace must explain the wall-clock change; latency alone is insufficient.
+The short DLO profile sets `VLLM_OMNI_DIFFUSION_TIMING=1`. vLLM-Omni records CUDA event pairs
+without synchronizing each layer, resolves them once after denoise, and emits one JSON record per
+worker. It reports mmap-to-pinned packing, mmap copy submission, H2D, DLO AllGather, exposed
+prefetch waits, total DiT forward time, streaming-block compute, and Ulysses mode-0/mode-1
+pack/A2A/unpack. The runner aggregates the slowest rank for each measured request.
+
+`dlo_overlap_pct` is an exposure estimate: `(H2D + DLO AllGather - compute-stream wait) /
+(H2D + DLO AllGather)`. CUDA-stream component durations can overlap and therefore must not be
+summed to reconstruct wall time. Keep this instrumentation off for the reportable A/B run.
 
 ### 5. Head-tiled overlap experiment
 
@@ -170,3 +176,16 @@ The summary is `e2e/dlo-ab-summary.tsv`. It reports warm E2E latency, denoise-st
 GPU memory, process-group CPU RSS, startup time, and speedup relative to no-AllGather. Server logs
 must confirm SP8 sharding or the no-AllGather path and `unified shared_buffers=2`. Decoded video
 FrameMD5 must match between modes.
+
+Collect the detailed two-step breakdown separately (one warmup and one measured request):
+
+```bash
+WORK_ROOT=/lustre/raplab/client/sylarl/minimax-h3-native \
+DLO_GPU_IDS=0,1,2,3,4,5,6,7 WAIT_SECS=1800 \
+bash benchmark/h3_packing/run_pro5000_suite.sh dlo-profile
+```
+
+The wide summary is `e2e/dlo-runtime-summary.tsv`; per-request/per-metric rank maxima and means
+are in `e2e/dlo-runtime-detail.tsv`. Set `DLO_PROFILE_RESIDENT_LAYERS=N` to profile the resident
+layer implementation separately. The default remains zero so `dit.streaming_block_compute`
+covers every DiT block.

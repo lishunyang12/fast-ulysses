@@ -7,13 +7,19 @@ FAST_ULYSSES_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 WORK_ROOT="${WORK_ROOT:-$(cd -- "${FAST_ULYSSES_ROOT}/.." && pwd)}"
 ACTION="${1:-all}"
 
-if [[ "${ACTION}" == "dlo-ab" ]]; then
-  # Keep the official NCCL DLO experiment isolated from the older custom
-  # fast-ulysses integration.  vLLM-Omni main currently targets vLLM v0.27.0
-  # in its CI image.
-  VLLM_OMNI_DIR="${VLLM_OMNI_DIR:-${WORK_ROOT}/vllm-omni-h3-dlo-latest}"
-  VLLM_OMNI_REPO="${VLLM_OMNI_REPO:-https://github.com/vllm-project/vllm-omni.git}"
-  VLLM_OMNI_BRANCH="${VLLM_OMNI_BRANCH:-main}"
+if [[ "${ACTION}" == "dlo-ab" || "${ACTION}" == "dlo-profile" ]]; then
+  # Keep NCCL DLO experiments isolated from the older custom fast-ulysses
+  # integration. The A/B uses official main; the profiler uses its dedicated
+  # instrumentation branch. Both resolve vLLM from the checkout's CI image.
+  if [[ "${ACTION}" == "dlo-profile" ]]; then
+    VLLM_OMNI_DIR="${VLLM_OMNI_DIR:-${WORK_ROOT}/vllm-omni-h3-dlo-profile}"
+    VLLM_OMNI_REPO="${VLLM_OMNI_REPO:-https://github.com/lishunyang12/vllm-omni.git}"
+    VLLM_OMNI_BRANCH="${VLLM_OMNI_BRANCH:-bench/dlo-runtime-timing}"
+  else
+    VLLM_OMNI_DIR="${VLLM_OMNI_DIR:-${WORK_ROOT}/vllm-omni-h3-dlo-latest}"
+    VLLM_OMNI_REPO="${VLLM_OMNI_REPO:-https://github.com/vllm-project/vllm-omni.git}"
+    VLLM_OMNI_BRANCH="${VLLM_OMNI_BRANCH:-main}"
+  fi
   VLLM_VERSION="${VLLM_VERSION:-auto}"
   INSTALL_FAST_ULYSSES="${INSTALL_FAST_ULYSSES:-0}"
 else
@@ -39,6 +45,8 @@ H3_ATTENTION_BACKEND="${H3_ATTENTION_BACKEND:-cudnn}"
 DLO_GPU_IDS="${DLO_GPU_IDS:-0,1,2,3,4,5,6,7}"
 DLO_SP_BACKEND="${DLO_SP_BACKEND:-nccl}"
 DLO_NUMA_POLICY="${DLO_NUMA_POLICY:-interleave}"
+DLO_PROFILE_STEPS="${DLO_PROFILE_STEPS:-2}"
+DLO_PROFILE_RESIDENT_LAYERS="${DLO_PROFILE_RESIDENT_LAYERS:-0}"
 RUN_LEVEL="${RUN_LEVEL:-screen}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RESULT_ROOT="${RESULT_ROOT:-${WORK_ROOT}/results/h3-packing-${STAMP}}"
@@ -58,7 +66,7 @@ fi
 
 usage() {
   cat <<'EOF'
-Usage: run_pro5000_suite.sh [setup|microbench|overlap|e2e|dlo-ab|all]
+Usage: run_pro5000_suite.sh [setup|microbench|overlap|e2e|dlo-ab|dlo-profile|all]
 
 Defaults match the validated socket-0 RTX PRO 5000 layout:
   GPU_IDS=0,2,1,3  -> Ulysses pairs are physical (0,1) and (2,3)
@@ -73,6 +81,9 @@ dlo-ab runs one isolated 8-GPU experiment:
   --dlo-use-allgather versus --dlo-no-use-allgather
   official vLLM-Omni main in a fresh worktree, with its CI-targeted vLLM release
 Override DLO_GPU_IDS, DLO_SP_BACKEND, or DLO_NUMA_POLICY if needed.
+
+dlo-profile is a short, env-gated run that records deferred CUDA-event and CPU
+timings without Nsight Systems. It uses one warmup and one measured request.
 EOF
 }
 
@@ -100,7 +111,7 @@ capture_machine() {
   local metadata_dir="${RESULT_ROOT}/metadata"
   local recorded_gpu_ids="${GPU_IDS}"
   local recorded_parallelism
-  if [[ "${ACTION}" == "dlo-ab" ]]; then
+  if [[ "${ACTION}" == "dlo-ab" || "${ACTION}" == "dlo-profile" ]]; then
     recorded_gpu_ids="${DLO_GPU_IDS}"
     recorded_parallelism=$'TP_SIZE=1\nULYSSES_DEGREE=8\nNUMA_POLICY='"${DLO_NUMA_POLICY}"
   else
@@ -360,7 +371,7 @@ run_dlo_ab() {
       DLO_RESIDENT_LAYERS=0 \
       TEXT_ENCODER_TP_SIZE=8 VAE_PATCH_PARALLEL_SIZE=8 \
       NUM_INFERENCE_STEPS="${steps}" WARMUPS="${warmups}" MEASURED_RUNS="${runs}" \
-      STARTUP_TIMEOUT=3600 bash "${backend_script}"; then
+      STARTUP_TIMEOUT=3600 REQUEST_TIMEOUT=1800 bash "${backend_script}"; then
       printf 'PASS\n' >"${RESULT_ROOT}/e2e/${label}/status.txt"
     else
       local rc=$?
@@ -386,6 +397,44 @@ run_dlo_ab() {
   (( failed == 0 )) || die "one or more DLO modes failed; inspect the summary and server logs"
 }
 
+run_dlo_profile() {
+  [[ -f "${MODEL_ROOT}/FL2VA/model_index.json" ]] || \
+    die "MiniMax H3 FL2VA checkpoint not found under ${MODEL_ROOT}/FL2VA"
+  IFS=',' read -r -a dlo_gpus <<<"${DLO_GPU_IDS}"
+  [[ "${#dlo_gpus[@]}" -eq 8 ]] || die "DLO_GPU_IDS must contain eight physical GPU IDs"
+  [[ "${DLO_PROFILE_STEPS}" -ge 2 ]] || die "DLO_PROFILE_STEPS must be at least 2"
+
+  local backend_script="${SCRIPT_DIR}/run_h3_e2e_backend.sh"
+  local warmups=1 runs=1 failed=0
+  mkdir -p "${RESULT_ROOT}/e2e"
+  for mode in use-allgather no-allgather; do
+    local label="dlo-${mode}"
+    mkdir -p "${RESULT_ROOT}/e2e/${label}"
+    if "${FAST_ULYSSES_ROOT}/tools/exclusive.sh" "${DLO_GPU_IDS}" -- env \
+      BACKEND="${DLO_SP_BACKEND}" OUTPUT_LABEL="${label}" DLO_MODE="${mode}" \
+      WORK_ROOT="${WORK_ROOT}" MODEL_ROOT="${MODEL_ROOT}" \
+      VLLM_OMNI_DIR="${VLLM_OMNI_DIR}" RESULT_ROOT="${RESULT_ROOT}" \
+      NUMA_POLICY="${DLO_NUMA_POLICY}" NUM_GPUS=8 TP_SIZE=1 ULYSSES_DEGREE=8 \
+      DLO_RESIDENT_LAYERS="${DLO_PROFILE_RESIDENT_LAYERS}" \
+      TEXT_ENCODER_TP_SIZE=8 VAE_PATCH_PARALLEL_SIZE=8 \
+      NUM_INFERENCE_STEPS="${DLO_PROFILE_STEPS}" WARMUPS="${warmups}" \
+      MEASURED_RUNS="${runs}" RUNTIME_TIMING=1 REQUEST_TIMEOUT=1800 \
+      STARTUP_TIMEOUT=3600 bash "${backend_script}"; then
+      printf 'PASS\n' >"${RESULT_ROOT}/e2e/${label}/status.txt"
+    else
+      local rc=$?
+      printf 'FAIL exit=%s\n' "${rc}" >"${RESULT_ROOT}/e2e/${label}/status.txt"
+      failed=1
+    fi
+  done
+
+  "${VLLM_OMNI_DIR}/.venv/bin/python" "${SCRIPT_DIR}/summarize_h3_runtime_timing.py" \
+    "${RESULT_ROOT}" --warmups "${warmups}" --expected-ranks 8 \
+    --output "${RESULT_ROOT}/e2e/dlo-runtime-summary.tsv" \
+    --detail-output "${RESULT_ROOT}/e2e/dlo-runtime-detail.tsv"
+  (( failed == 0 )) || die "one or more DLO profile modes failed; inspect server logs"
+}
+
 case "${ACTION}" in
   setup)
     setup_env
@@ -407,6 +456,11 @@ case "${ACTION}" in
     acquire_e2e_lock "${DLO_GPU_IDS}"
     setup_env
     run_dlo_ab
+    ;;
+  dlo-profile)
+    acquire_e2e_lock "${DLO_GPU_IDS}"
+    setup_env
+    run_dlo_profile
     ;;
   all)
     acquire_e2e_lock
