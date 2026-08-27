@@ -8,8 +8,14 @@ MODEL_ROOT="${MODEL_ROOT:?set MODEL_ROOT}"
 VLLM_OMNI_DIR="${VLLM_OMNI_DIR:?set VLLM_OMNI_DIR}"
 RESULT_ROOT="${RESULT_ROOT:?set RESULT_ROOT}"
 NUMA_NODE="${NUMA_NODE:-0}"
+NUMA_POLICY="${NUMA_POLICY:-bind}"
+NUM_GPUS="${NUM_GPUS:-4}"
 TP_SIZE="${TP_SIZE:-2}"
 ULYSSES_DEGREE="${ULYSSES_DEGREE:-2}"
+TEXT_ENCODER_TP_SIZE="${TEXT_ENCODER_TP_SIZE:-${NUM_GPUS}}"
+VAE_PATCH_PARALLEL_SIZE="${VAE_PATCH_PARALLEL_SIZE:-${NUM_GPUS}}"
+DLO_MODE="${DLO_MODE:-off}"
+OUTPUT_LABEL="${OUTPUT_LABEL:-${BACKEND}}"
 NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-5}"
 WARMUPS="${WARMUPS:-2}"
 MEASURED_RUNS="${MEASURED_RUNS:-3}"
@@ -62,7 +68,33 @@ export VLLM_OMNI_FAST_ULYSSES_ZERO_COPY="${zero_copy}"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800
 
-OUTPUT_DIR="${RESULT_ROOT}/e2e/${BACKEND}"
+case "${DLO_MODE}" in
+  off)
+    dlo_args=()
+    ;;
+  use-allgather)
+    dlo_args=(--enable-distributed-layerwise-offload --dlo-use-allgather)
+    ;;
+  no-allgather)
+    dlo_args=(--enable-distributed-layerwise-offload --dlo-no-use-allgather)
+    ;;
+  *) echo "invalid DLO_MODE=${DLO_MODE}" >&2; exit 2 ;;
+esac
+
+case "${NUMA_POLICY}" in
+  bind)
+    numa_args=(--cpunodebind="${NUMA_NODE}" --membind="${NUMA_NODE}")
+    ;;
+  interleave)
+    numa_args=(--interleave=all)
+    ;;
+  none)
+    numa_args=()
+    ;;
+  *) echo "invalid NUMA_POLICY=${NUMA_POLICY}" >&2; exit 2 ;;
+esac
+
+OUTPUT_DIR="${RESULT_ROOT}/e2e/${OUTPUT_LABEL}"
 mkdir -p "${OUTPUT_DIR}"
 printf '%s\n' "${BACKEND}" >"${OUTPUT_DIR}/backend.txt"
 {
@@ -71,8 +103,13 @@ printf '%s\n' "${BACKEND}" >"${OUTPUT_DIR}/backend.txt"
   printf 'ZERO_COPY=%s\n' "${zero_copy}"
   printf 'CUDA_VISIBLE_DEVICES=%s\n' "${CUDA_VISIBLE_DEVICES:-}"
   printf 'NUMA_NODE=%s\n' "${NUMA_NODE}"
+  printf 'NUMA_POLICY=%s\n' "${NUMA_POLICY}"
+  printf 'NUM_GPUS=%s\n' "${NUM_GPUS}"
   printf 'TP_SIZE=%s\n' "${TP_SIZE}"
   printf 'ULYSSES_DEGREE=%s\n' "${ULYSSES_DEGREE}"
+  printf 'TEXT_ENCODER_TP_SIZE=%s\n' "${TEXT_ENCODER_TP_SIZE}"
+  printf 'VAE_PATCH_PARALLEL_SIZE=%s\n' "${VAE_PATCH_PARALLEL_SIZE}"
+  printf 'DLO_MODE=%s\n' "${DLO_MODE}"
   printf 'NUM_INFERENCE_STEPS=%s\n' "${NUM_INFERENCE_STEPS}"
   printf 'WARMUPS=%s\n' "${WARMUPS}"
   printf 'MEASURED_RUNS=%s\n' "${MEASURED_RUNS}"
@@ -81,7 +118,12 @@ printf '%s\n' "${BACKEND}" >"${OUTPUT_DIR}/backend.txt"
 
 server_pid=""
 sampler_pid=""
+rss_sampler_pid=""
 cleanup() {
+  if [[ -n "${rss_sampler_pid}" ]]; then
+    kill "${rss_sampler_pid}" 2>/dev/null || true
+    wait "${rss_sampler_pid}" 2>/dev/null || true
+  fi
   if [[ -n "${sampler_pid}" ]]; then
     kill "${sampler_pid}" 2>/dev/null || true
     wait "${sampler_pid}" 2>/dev/null || true
@@ -110,22 +152,24 @@ show_server_failure() {
   tail -n 300 "${OUTPUT_DIR}/server.log" >&2 || true
 }
 
-setsid numactl --cpunodebind="${NUMA_NODE}" --membind="${NUMA_NODE}" \
+startup_start="$(date +%s)"
+setsid numactl "${numa_args[@]}" \
   vllm serve "${MODEL_ROOT}/FL2VA" \
   --omni \
   --host 127.0.0.1 \
   --port "${PORT}" \
   --trust-remote-code \
-  --num-gpus 4 \
+  --num-gpus "${NUM_GPUS}" \
   --tensor-parallel-size "${TP_SIZE}" \
   --usp "${ULYSSES_DEGREE}" \
   --ring 1 \
-  --text-encoder-tp-size 4 \
-  --vae-patch-parallel-size 4 \
+  --text-encoder-tp-size "${TEXT_ENCODER_TP_SIZE}" \
+  --vae-patch-parallel-size "${VAE_PATCH_PARALLEL_SIZE}" \
   --vae-parallel-mode tile \
   --vae-use-tiling \
   --diffusion-attention-backend CUDNN_ATTN \
   --enable-diffusion-pipeline-profiler \
+  "${dlo_args[@]}" \
   >"${OUTPUT_DIR}/server.log" 2>&1 &
 server_pid=$!
 printf '%s\n' "${server_pid}" >"${OUTPUT_DIR}/server.pid"
@@ -133,6 +177,16 @@ printf '%s\n' "${server_pid}" >"${OUTPUT_DIR}/server.pid"
 nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,power.draw \
   --format=csv -l 1 >"${OUTPUT_DIR}/gpu-samples.csv" 2>&1 &
 sampler_pid=$!
+
+(
+  printf 'timestamp,total_process_group_rss_kib\n'
+  while kill -0 "${server_pid}" 2>/dev/null; do
+    printf '%s,' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    ps -eo pgid=,rss= | awk -v pgid="${server_pid}" '$1 == pgid {sum += $2} END {print sum + 0}'
+    sleep 1
+  done
+) >"${OUTPUT_DIR}/process-rss-samples.csv" &
+rss_sampler_pid=$!
 
 deadline=$((SECONDS + STARTUP_TIMEOUT))
 until curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; do
@@ -147,6 +201,7 @@ until curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; do
   }
   sleep 10
 done
+printf '%s\n' "$(( $(date +%s) - startup_start ))" >"${OUTPUT_DIR}/startup.seconds"
 
 API_URL="http://127.0.0.1:${PORT}/v1/videos/sync"
 request() {
@@ -185,6 +240,25 @@ fi
 if [[ "${zero_copy}" == "1" ]]; then
   grep -q "Allocated fast-ulysses zero-copy output" "${OUTPUT_DIR}/server.log" || {
     echo "server did not confirm zero-copy output allocation" >&2
+    exit 1
+  }
+fi
+
+if [[ "${DLO_MODE}" == "use-allgather" ]]; then
+  grep -q "using SP group (world_size=${ULYSSES_DEGREE})" "${OUTPUT_DIR}/server.log" || {
+    echo "server did not confirm DLO AllGather over SP${ULYSSES_DEGREE}" >&2
+    exit 1
+  }
+elif [[ "${DLO_MODE}" == "no-allgather" ]]; then
+  grep -q "dlo_use_allgather=False" "${OUTPUT_DIR}/server.log" || {
+    echo "server did not confirm DLO no-AllGather mode" >&2
+    exit 1
+  }
+fi
+
+if [[ "${DLO_MODE}" != "off" ]]; then
+  grep -q "unified shared_buffers=2" "${OUTPUT_DIR}/server.log" || {
+    echo "server did not confirm the fixed two-buffer DLO residency" >&2
     exit 1
   }
 fi

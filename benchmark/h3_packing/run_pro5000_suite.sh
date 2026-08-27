@@ -23,6 +23,9 @@ OVERLAP_ITERS="${OVERLAP_ITERS:-12}"
 OVERLAP_WARMUP="${OVERLAP_WARMUP:-3}"
 H3_SEQUENCE_LENGTH="${H3_SEQUENCE_LENGTH:-37760}"
 H3_ATTENTION_BACKEND="${H3_ATTENTION_BACKEND:-cudnn}"
+DLO_GPU_IDS="${DLO_GPU_IDS:-0,1,2,3,4,5,6,7}"
+DLO_SP_BACKEND="${DLO_SP_BACKEND:-pitched-owned}"
+DLO_NUMA_POLICY="${DLO_NUMA_POLICY:-interleave}"
 RUN_LEVEL="${RUN_LEVEL:-screen}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RESULT_ROOT="${RESULT_ROOT:-${WORK_ROOT}/results/h3-packing-${STAMP}}"
@@ -42,7 +45,7 @@ fi
 
 usage() {
   cat <<'EOF'
-Usage: run_pro5000_suite.sh [setup|microbench|overlap|e2e|all]
+Usage: run_pro5000_suite.sh [setup|microbench|overlap|e2e|dlo-ab|all]
 
 Defaults match the validated socket-0 RTX PRO 5000 layout:
   GPU_IDS=0,2,1,3  -> Ulysses pairs are physical (0,1) and (2,3)
@@ -51,6 +54,11 @@ Defaults match the validated socket-0 RTX PRO 5000 layout:
 RUN_LEVEL=screen uses 5 denoise steps. RUN_LEVEL=full uses 50 steps.
 H3_E2E_BACKENDS is a comma-separated override. Zero-copy variants are diagnostics only.
 Override RESULT_ROOT to append later phases to an existing result directory.
+
+dlo-ab runs one isolated 8-GPU experiment:
+  TP1 x Ulysses8, DLO fixed two-buffer residency, pitched-owned SP transport
+  --dlo-use-allgather versus --dlo-no-use-allgather
+Override DLO_GPU_IDS, DLO_SP_BACKEND, or DLO_NUMA_POLICY if needed.
 EOF
 }
 
@@ -61,11 +69,12 @@ die() {
 
 acquire_e2e_lock() {
   require_command flock
-  local gpu_lock_key="${GPU_IDS//,/-}"
+  local devices="${1:-${GPU_IDS}}"
+  local gpu_lock_key="${devices//,/-}"
   local lock_file="/tmp/fast-ulysses-h3-e2e-${USER:-unknown}-${gpu_lock_key}.lock"
   exec {E2E_LOCK_FD}<>"${lock_file}"
   flock -n "${E2E_LOCK_FD}" || \
-    die "another H3 E2E suite is already using GPU_IDS=${GPU_IDS} (lock ${lock_file})"
+    die "another H3 E2E suite is already using GPUs=${devices} (lock ${lock_file})"
   printf 'pid=%s\nresult_root=%s\n' "$$" "${RESULT_ROOT}" >"${lock_file}"
 }
 
@@ -269,6 +278,66 @@ run_e2e() {
     die "decoded audio FrameMD5 differs across backends"
 }
 
+run_dlo_ab() {
+  [[ -f "${MODEL_ROOT}/FL2VA/model_index.json" ]] || \
+    die "MiniMax H3 FL2VA checkpoint not found under ${MODEL_ROOT}/FL2VA"
+  IFS=',' read -r -a dlo_gpus <<<"${DLO_GPU_IDS}"
+  [[ "${#dlo_gpus[@]}" -eq 8 ]] || die "DLO_GPU_IDS must contain eight physical GPU IDs"
+
+  local backend_script="${SCRIPT_DIR}/run_h3_e2e_backend.sh"
+  local steps=5 warmups=2 runs=3
+  if [[ "${RUN_LEVEL}" == "full" ]]; then
+    steps=50
+  elif [[ "${RUN_LEVEL}" != "screen" ]]; then
+    die "RUN_LEVEL must be 'screen' or 'full'"
+  fi
+
+  mkdir -p "${RESULT_ROOT}/e2e"
+  {
+    printf 'DLO_GPU_IDS=%s\n' "${DLO_GPU_IDS}"
+    printf 'DLO_SP_BACKEND=%s\n' "${DLO_SP_BACKEND}"
+    printf 'DLO_NUMA_POLICY=%s\n' "${DLO_NUMA_POLICY}"
+    printf 'RESIDENT_BLOCK_BUFFERS=2\n'
+    printf 'TP_SIZE=1\nULYSSES_DEGREE=8\n'
+  } >"${RESULT_ROOT}/e2e/dlo-ab.env"
+
+  local failed=0
+  for mode in use-allgather no-allgather; do
+    local label="dlo-${mode}"
+    mkdir -p "${RESULT_ROOT}/e2e/${label}"
+    if "${FAST_ULYSSES_ROOT}/tools/exclusive.sh" "${DLO_GPU_IDS}" -- env \
+      BACKEND="${DLO_SP_BACKEND}" OUTPUT_LABEL="${label}" DLO_MODE="${mode}" \
+      WORK_ROOT="${WORK_ROOT}" MODEL_ROOT="${MODEL_ROOT}" \
+      VLLM_OMNI_DIR="${VLLM_OMNI_DIR}" RESULT_ROOT="${RESULT_ROOT}" \
+      NUMA_POLICY="${DLO_NUMA_POLICY}" NUM_GPUS=8 TP_SIZE=1 ULYSSES_DEGREE=8 \
+      TEXT_ENCODER_TP_SIZE=8 VAE_PATCH_PARALLEL_SIZE=8 \
+      NUM_INFERENCE_STEPS="${steps}" WARMUPS="${warmups}" MEASURED_RUNS="${runs}" \
+      STARTUP_TIMEOUT=3600 bash "${backend_script}"; then
+      printf 'PASS\n' >"${RESULT_ROOT}/e2e/${label}/status.txt"
+    else
+      local rc=$?
+      printf 'FAIL exit=%s\n' "${rc}" >"${RESULT_ROOT}/e2e/${label}/status.txt"
+      failed=1
+    fi
+  done
+
+  "${VLLM_OMNI_DIR}/.venv/bin/python" "${SCRIPT_DIR}/summarize_h3_dlo.py" \
+    "${RESULT_ROOT}" --measured-runs "${runs}" \
+    --output "${RESULT_ROOT}/e2e/dlo-ab-summary.tsv"
+
+  if [[ -f "${RESULT_ROOT}/e2e/dlo-use-allgather/run-1.video.framemd5" && \
+        -f "${RESULT_ROOT}/e2e/dlo-no-allgather/run-1.video.framemd5" ]]; then
+    sha256sum \
+      "${RESULT_ROOT}/e2e/dlo-use-allgather/run-1.video.framemd5" \
+      "${RESULT_ROOT}/e2e/dlo-no-allgather/run-1.video.framemd5" \
+      | tee "${RESULT_ROOT}/e2e/dlo-video-correctness.sha256"
+    [[ "$(awk '{print $1}' "${RESULT_ROOT}/e2e/dlo-video-correctness.sha256" | sort -u | wc -l)" -eq 1 ]] || \
+      die "decoded video FrameMD5 differs between DLO modes"
+  fi
+
+  (( failed == 0 )) || die "one or more DLO modes failed; inspect the summary and server logs"
+}
+
 case "${ACTION}" in
   setup)
     setup_env
@@ -285,6 +354,11 @@ case "${ACTION}" in
     acquire_e2e_lock
     setup_env
     run_e2e
+    ;;
+  dlo-ab)
+    acquire_e2e_lock "${DLO_GPU_IDS}"
+    setup_env
+    run_dlo_ab
     ;;
   all)
     acquire_e2e_lock

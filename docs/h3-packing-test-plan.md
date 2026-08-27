@@ -141,3 +141,27 @@ WORK_ROOT=/lustre/raplab/client/sylarl/minimax-h3-native \
 GPU_IDS=4,6,5,7 NUMA_NODE=1 \
 bash benchmark/h3_packing/run_pro5000_suite.sh overlap
 ```
+
+### Ulysses8 DLO AllGather A/B
+
+The focused DLO experiment uses all eight RTX PRO 5000 GPUs with TP1 x Ulysses8. Both modes use
+the current fixed two-buffer residency (the current block plus one prefetched block), the same
+pitched-owned SP transport, two warmups, and three measured requests. The only changed flag is
+`--dlo-use-allgather` versus `--dlo-no-use-allgather`.
+
+```bash
+WORK_ROOT=/lustre/raplab/client/sylarl/minimax-h3-native \
+DLO_GPU_IDS=0,1,2,3,4,5,6,7 \
+WAIT_SECS=1800 RUN_LEVEL=screen \
+bash benchmark/h3_packing/run_pro5000_suite.sh dlo-ab
+```
+
+Eight GPUs span both CPU sockets on the reference host, so the default DLO NUMA policy is
+`--interleave=all` for a reproducible comparison. Set `DLO_NUMA_POLICY=none` only for a separate
+NUMA experiment; do not mix policies within this A/B. After the five-step screen passes, rerun
+with `RUN_LEVEL=full` for the 50-step result.
+
+The summary is `e2e/dlo-ab-summary.tsv`. It reports warm E2E latency, denoise-step latency, peak
+GPU memory, process-group CPU RSS, startup time, and speedup relative to no-AllGather. Server logs
+must confirm SP8 sharding or the no-AllGather path and `unified shared_buffers=2`. Decoded video
+FrameMD5 must match between modes.
