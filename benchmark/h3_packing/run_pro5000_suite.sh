@@ -47,6 +47,7 @@ DLO_SP_BACKEND="${DLO_SP_BACKEND:-nccl}"
 DLO_NUMA_POLICY="${DLO_NUMA_POLICY:-interleave}"
 DLO_PROFILE_STEPS="${DLO_PROFILE_STEPS:-2}"
 DLO_PROFILE_RESIDENT_LAYERS="${DLO_PROFILE_RESIDENT_LAYERS:-0}"
+DLO_PROFILE_MODES="${DLO_PROFILE_MODES:-use-allgather,no-allgather}"
 RUN_LEVEL="${RUN_LEVEL:-screen}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RESULT_ROOT="${RESULT_ROOT:-${WORK_ROOT}/results/h3-packing-${STAMP}}"
@@ -406,11 +407,19 @@ run_dlo_profile() {
 
   local backend_script="${SCRIPT_DIR}/run_h3_e2e_backend.sh"
   local warmups=1 runs=1 failed=0
+  local profile_modes
+  local profile_labels=()
+  IFS=',' read -r -a profile_modes <<<"${DLO_PROFILE_MODES}"
+  [[ "${#profile_modes[@]}" -gt 0 ]] || die "DLO_PROFILE_MODES selected no modes"
   mkdir -p "${RESULT_ROOT}/e2e"
-  for mode in use-allgather no-allgather; do
+  for mode in "${profile_modes[@]}"; do
+    [[ "${mode}" == "use-allgather" || "${mode}" == "no-allgather" ]] || \
+      die "invalid DLO profile mode: ${mode}"
     local label="dlo-${mode}"
+    profile_labels+=("${label}")
     mkdir -p "${RESULT_ROOT}/e2e/${label}"
-    if "${FAST_ULYSSES_ROOT}/tools/exclusive.sh" "${DLO_GPU_IDS}" -- env \
+    if EXCLUSIVE_DIAGNOSTICS="${RESULT_ROOT}/e2e/${label}/exclusive-processes.log" \
+      "${FAST_ULYSSES_ROOT}/tools/exclusive.sh" "${DLO_GPU_IDS}" -- env \
       BACKEND="${DLO_SP_BACKEND}" OUTPUT_LABEL="${label}" DLO_MODE="${mode}" \
       WORK_ROOT="${WORK_ROOT}" MODEL_ROOT="${MODEL_ROOT}" \
       VLLM_OMNI_DIR="${VLLM_OMNI_DIR}" RESULT_ROOT="${RESULT_ROOT}" \
@@ -428,8 +437,11 @@ run_dlo_profile() {
     fi
   done
 
+  local parser_modes
+  parser_modes="$(IFS=,; echo "${profile_labels[*]}")"
   "${VLLM_OMNI_DIR}/.venv/bin/python" "${SCRIPT_DIR}/summarize_h3_runtime_timing.py" \
-    "${RESULT_ROOT}" --warmups "${warmups}" --expected-ranks 8 \
+    "${RESULT_ROOT}" --modes "${parser_modes}" \
+    --warmups "${warmups}" --expected-ranks 8 \
     --output "${RESULT_ROOT}/e2e/dlo-runtime-summary.tsv" \
     --detail-output "${RESULT_ROOT}/e2e/dlo-runtime-detail.tsv"
   (( failed == 0 )) || die "one or more DLO profile modes failed; inspect server logs"

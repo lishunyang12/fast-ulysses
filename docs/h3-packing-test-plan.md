@@ -189,3 +189,8 @@ The wide summary is `e2e/dlo-runtime-summary.tsv`; per-request/per-metric rank m
 are in `e2e/dlo-runtime-detail.tsv`. Set `DLO_PROFILE_RESIDENT_LAYERS=N` to profile the resident
 layer implementation separately. The default remains zero so `dit.streaming_block_compute`
 covers every DiT block.
+
+To repeat only a failed or contended no-AllGather profile, use
+`DLO_PROFILE_MODES=no-allgather`. If the exclusivity guard observes more than eight GPU processes,
+their PID, process name, GPU UUID, and memory are preserved in
+`e2e/dlo-no-allgather/exclusive-processes.log`.
