@@ -63,8 +63,13 @@ export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${WORK_ROOT}/triton-cache}"
 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-${WORK_ROOT}/torchinductor-cache}"
 export PATH="${WORK_ROOT}/bin:${WORK_ROOT}/ffmpeg-tools:${WORK_ROOT}/ffmpeg-tools/bin:${WORK_ROOT}/ffmpeg-shared/bin:${VLLM_OMNI_DIR}/.venv/bin:${PATH}"
 export VLLM_OMNI_ULYSSES_TRANSPORT="${transport}"
-export VLLM_OMNI_FAST_ULYSSES_ALLOW_NON_NVLINK=1
-export VLLM_OMNI_FAST_ULYSSES_ZERO_COPY="${zero_copy}"
+if [[ "${transport}" == "nccl" ]]; then
+  unset VLLM_OMNI_FAST_ULYSSES_ALLOW_NON_NVLINK
+  unset VLLM_OMNI_FAST_ULYSSES_ZERO_COPY
+else
+  export VLLM_OMNI_FAST_ULYSSES_ALLOW_NON_NVLINK=1
+  export VLLM_OMNI_FAST_ULYSSES_ZERO_COPY="${zero_copy}"
+fi
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800
 

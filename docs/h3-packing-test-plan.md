@@ -145,8 +145,8 @@ bash benchmark/h3_packing/run_pro5000_suite.sh overlap
 ### Ulysses8 DLO AllGather A/B
 
 The focused DLO experiment uses all eight RTX PRO 5000 GPUs with TP1 x Ulysses8. Both modes use
-the current fixed two-buffer residency (the current block plus one prefetched block), the same
-pitched-owned SP transport, two warmups, and three measured requests. The only changed flag is
+the current fixed two-buffer residency (the current block plus one prefetched block), the standard
+NCCL SP transport, two warmups, and three measured requests. The only changed flag is
 `--dlo-use-allgather` versus `--dlo-no-use-allgather`.
 
 ```bash

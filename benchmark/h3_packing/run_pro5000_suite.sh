@@ -24,7 +24,7 @@ OVERLAP_WARMUP="${OVERLAP_WARMUP:-3}"
 H3_SEQUENCE_LENGTH="${H3_SEQUENCE_LENGTH:-37760}"
 H3_ATTENTION_BACKEND="${H3_ATTENTION_BACKEND:-cudnn}"
 DLO_GPU_IDS="${DLO_GPU_IDS:-0,1,2,3,4,5,6,7}"
-DLO_SP_BACKEND="${DLO_SP_BACKEND:-pitched-owned}"
+DLO_SP_BACKEND="${DLO_SP_BACKEND:-nccl}"
 DLO_NUMA_POLICY="${DLO_NUMA_POLICY:-interleave}"
 RUN_LEVEL="${RUN_LEVEL:-screen}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -56,7 +56,7 @@ H3_E2E_BACKENDS is a comma-separated override. Zero-copy variants are diagnostic
 Override RESULT_ROOT to append later phases to an existing result directory.
 
 dlo-ab runs one isolated 8-GPU experiment:
-  TP1 x Ulysses8, DLO fixed two-buffer residency, pitched-owned SP transport
+  TP1 x Ulysses8, DLO fixed two-buffer residency, standard NCCL SP transport
   --dlo-use-allgather versus --dlo-no-use-allgather
 Override DLO_GPU_IDS, DLO_SP_BACKEND, or DLO_NUMA_POLICY if needed.
 EOF
