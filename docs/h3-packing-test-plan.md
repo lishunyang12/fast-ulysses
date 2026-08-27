@@ -144,10 +144,15 @@ bash benchmark/h3_packing/run_pro5000_suite.sh overlap
 
 ### Ulysses8 DLO AllGather A/B
 
-The focused DLO experiment uses all eight RTX PRO 5000 GPUs with TP1 x Ulysses8. Both modes use
-the current fixed two-buffer residency (the current block plus one prefetched block), the standard
-NCCL SP transport, two warmups, and three measured requests. The only changed flag is
-`--dlo-use-allgather` versus `--dlo-no-use-allgather`.
+The focused DLO experiment uses all eight RTX PRO 5000 GPUs with TP1 x Ulysses8. Both modes keep
+zero DiT layers permanently resident and reuse two streaming GPU buffers (the current block plus
+one prefetched block). They use the standard NCCL SP transport, two warmups, and three measured
+requests. The only changed flag is `--dlo-use-allgather` versus `--dlo-no-use-allgather`.
+
+This action intentionally creates a separate `vllm-omni-h3-dlo-latest` checkout from the official
+vLLM-Omni `main` branch. It reads that checkout's `docker/Dockerfile.ci` and installs the vLLM
+release targeted by current CI (0.27.0 at the time this plan was written). It does not modify or
+import the older `vllm-omni-fast-ulysses` environment.
 
 ```bash
 WORK_ROOT=/lustre/raplab/client/sylarl/minimax-h3-native \

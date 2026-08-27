@@ -7,9 +7,22 @@ FAST_ULYSSES_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 WORK_ROOT="${WORK_ROOT:-$(cd -- "${FAST_ULYSSES_ROOT}/.." && pwd)}"
 ACTION="${1:-all}"
 
-VLLM_OMNI_DIR="${VLLM_OMNI_DIR:-${WORK_ROOT}/vllm-omni-fast-ulysses}"
-VLLM_OMNI_REPO="${VLLM_OMNI_REPO:-https://github.com/lishunyang12/vllm-omni.git}"
-VLLM_OMNI_BRANCH="${VLLM_OMNI_BRANCH:-feat/fast-ulysses-transport-v026}"
+if [[ "${ACTION}" == "dlo-ab" ]]; then
+  # Keep the official NCCL DLO experiment isolated from the older custom
+  # fast-ulysses integration.  vLLM-Omni main currently targets vLLM v0.27.0
+  # in its CI image.
+  VLLM_OMNI_DIR="${VLLM_OMNI_DIR:-${WORK_ROOT}/vllm-omni-h3-dlo-latest}"
+  VLLM_OMNI_REPO="${VLLM_OMNI_REPO:-https://github.com/vllm-project/vllm-omni.git}"
+  VLLM_OMNI_BRANCH="${VLLM_OMNI_BRANCH:-main}"
+  VLLM_VERSION="${VLLM_VERSION:-auto}"
+  INSTALL_FAST_ULYSSES="${INSTALL_FAST_ULYSSES:-0}"
+else
+  VLLM_OMNI_DIR="${VLLM_OMNI_DIR:-${WORK_ROOT}/vllm-omni-fast-ulysses}"
+  VLLM_OMNI_REPO="${VLLM_OMNI_REPO:-https://github.com/lishunyang12/vllm-omni.git}"
+  VLLM_OMNI_BRANCH="${VLLM_OMNI_BRANCH:-feat/fast-ulysses-transport-v026}"
+  VLLM_VERSION="${VLLM_VERSION:-0.26.0}"
+  INSTALL_FAST_ULYSSES="${INSTALL_FAST_ULYSSES:-1}"
+fi
 MODEL_ROOT="${MODEL_ROOT:-${WORK_ROOT}/MiniMax-H3}"
 GPU_IDS="${GPU_IDS:-0,2,1,3}"
 NUMA_NODE="${NUMA_NODE:-0}"
@@ -56,8 +69,9 @@ H3_E2E_BACKENDS is a comma-separated override. Zero-copy variants are diagnostic
 Override RESULT_ROOT to append later phases to an existing result directory.
 
 dlo-ab runs one isolated 8-GPU experiment:
-  TP1 x Ulysses8, DLO fixed two-buffer residency, standard NCCL SP transport
+  TP1 x Ulysses8, DLO with zero resident layers and two shared streaming buffers
   --dlo-use-allgather versus --dlo-no-use-allgather
+  official vLLM-Omni main in a fresh worktree, with its CI-targeted vLLM release
 Override DLO_GPU_IDS, DLO_SP_BACKEND, or DLO_NUMA_POLICY if needed.
 EOF
 }
@@ -84,6 +98,14 @@ require_command() {
 
 capture_machine() {
   local metadata_dir="${RESULT_ROOT}/metadata"
+  local recorded_gpu_ids="${GPU_IDS}"
+  local recorded_parallelism
+  if [[ "${ACTION}" == "dlo-ab" ]]; then
+    recorded_gpu_ids="${DLO_GPU_IDS}"
+    recorded_parallelism=$'TP_SIZE=1\nULYSSES_DEGREE=8\nNUMA_POLICY='"${DLO_NUMA_POLICY}"
+  else
+    recorded_parallelism=$'TP_SIZE='"${TP_SIZE}"$'\nULYSSES_DEGREE='"${ULYSSES_DEGREE}"$'\nNUMA_NODE='"${NUMA_NODE}"
+  fi
   mkdir -p "${metadata_dir}"
   nvidia-smi >"${metadata_dir}/nvidia-smi.txt"
   nvidia-smi topo -m >"${metadata_dir}/topology.txt"
@@ -92,12 +114,12 @@ capture_machine() {
   lscpu >"${metadata_dir}/lscpu.txt"
   numactl --hardware >"${metadata_dir}/numa.txt"
   git -C "${FAST_ULYSSES_ROOT}" rev-parse HEAD >"${metadata_dir}/fast-ulysses.commit"
-  printf '%s\n' "${GPU_IDS}" >"${metadata_dir}/gpu-order.txt"
-  printf 'TP_SIZE=%s\nULYSSES_DEGREE=%s\nNUMA_NODE=%s\n' \
-    "${TP_SIZE}" "${ULYSSES_DEGREE}" "${NUMA_NODE}" >"${metadata_dir}/parallelism.env"
+  printf '%s\n' "${recorded_gpu_ids}" >"${metadata_dir}/gpu-order.txt"
+  printf '%s\n' "${recorded_parallelism}" >"${metadata_dir}/parallelism.env"
 }
 
 setup_env() {
+  local resolved_vllm_version="${VLLM_VERSION}"
   [[ -n "${UV}" ]] || die "uv was not found; expected ${WORK_ROOT}/bin/uv or uv on PATH"
   require_command git
   require_command nvidia-smi
@@ -128,34 +150,58 @@ setup_env() {
     git -C "${VLLM_OMNI_DIR}" merge --ff-only "origin/${VLLM_OMNI_BRANCH}"
   fi
 
+  if [[ "${resolved_vllm_version}" == "auto" ]]; then
+    local ci_dockerfile="${VLLM_OMNI_DIR}/docker/Dockerfile.ci"
+    [[ -f "${ci_dockerfile}" ]] || \
+      die "cannot resolve vLLM compatibility: ${ci_dockerfile} is missing"
+    resolved_vllm_version="$(sed -n 's/^ARG VLLM_BASE_TAG=v\{0,1\}\([^[:space:]]\+\)$/\1/p' \
+      "${ci_dockerfile}" | head -n 1)"
+    [[ -n "${resolved_vllm_version}" ]] || \
+      die "cannot resolve vLLM version from ${ci_dockerfile}"
+  fi
+
   if [[ ! -x "${VLLM_OMNI_DIR}/.venv/bin/python" ]]; then
     "${UV}" venv --python 3.12 --seed "${VLLM_OMNI_DIR}/.venv"
   fi
   export PATH="${VLLM_OMNI_DIR}/.venv/bin:${PATH}"
 
   "${UV}" pip install --python "${VLLM_OMNI_DIR}/.venv/bin/python" \
-    "vllm==0.26.0" --torch-backend=auto
+    "vllm==${resolved_vllm_version}" --torch-backend=auto
   "${UV}" pip install --python "${VLLM_OMNI_DIR}/.venv/bin/python" \
     -e "${VLLM_OMNI_DIR}"
-  "${UV}" pip install --python "${VLLM_OMNI_DIR}/.venv/bin/python" \
-    cmake ninja
-  FAST_ULYSSES_CUDA_ARCH=120 "${UV}" pip install \
-    --python "${VLLM_OMNI_DIR}/.venv/bin/python" --no-build-isolation \
-    -e "${FAST_ULYSSES_ROOT}"
+  if [[ "${INSTALL_FAST_ULYSSES}" == "1" ]]; then
+    "${UV}" pip install --python "${VLLM_OMNI_DIR}/.venv/bin/python" \
+      cmake ninja
+    FAST_ULYSSES_CUDA_ARCH=120 "${UV}" pip install \
+      --python "${VLLM_OMNI_DIR}/.venv/bin/python" --no-build-isolation \
+      -e "${FAST_ULYSSES_ROOT}"
+  elif [[ "${INSTALL_FAST_ULYSSES}" != "0" ]]; then
+    die "INSTALL_FAST_ULYSSES must be 0 or 1"
+  fi
 
   git -C "${VLLM_OMNI_DIR}" rev-parse HEAD >"${RESULT_ROOT}/metadata/vllm-omni.commit"
+  {
+    printf 'VLLM_OMNI_REPO=%s\n' "${VLLM_OMNI_REPO}"
+    printf 'VLLM_OMNI_BRANCH=%s\n' "${VLLM_OMNI_BRANCH}"
+    printf 'VLLM_VERSION=%s\n' "${resolved_vllm_version}"
+  } >"${RESULT_ROOT}/metadata/software-refs.env"
   "${VLLM_OMNI_DIR}/.venv/bin/python" - \
     >"${RESULT_ROOT}/metadata/python-environment.txt" <<'PY'
 import torch
 import vllm
 import vllm_omni
-import fast_ulysses
 
 print("torch", torch.__version__)
 print("torch_cuda", torch.version.cuda)
 print("vllm", vllm.__version__)
+print("vllm_omni_version", vllm_omni.__version__)
 print("vllm_omni", vllm_omni.__file__)
-print("fast_ulysses", fast_ulysses.__version__, fast_ulysses.__file__)
+try:
+    import fast_ulysses
+except ModuleNotFoundError:
+    print("fast_ulysses", "not installed (NCCL-only experiment)")
+else:
+    print("fast_ulysses", fast_ulysses.__version__, fast_ulysses.__file__)
 print("capability", torch.cuda.get_device_capability())
 PY
   cat "${RESULT_ROOT}/metadata/python-environment.txt"
@@ -297,7 +343,8 @@ run_dlo_ab() {
     printf 'DLO_GPU_IDS=%s\n' "${DLO_GPU_IDS}"
     printf 'DLO_SP_BACKEND=%s\n' "${DLO_SP_BACKEND}"
     printf 'DLO_NUMA_POLICY=%s\n' "${DLO_NUMA_POLICY}"
-    printf 'RESIDENT_BLOCK_BUFFERS=2\n'
+    printf 'DLO_RESIDENT_LAYERS=0\n'
+    printf 'DLO_SHARED_STREAMING_BUFFERS=2\n'
     printf 'TP_SIZE=1\nULYSSES_DEGREE=8\n'
   } >"${RESULT_ROOT}/e2e/dlo-ab.env"
 
@@ -310,6 +357,7 @@ run_dlo_ab() {
       WORK_ROOT="${WORK_ROOT}" MODEL_ROOT="${MODEL_ROOT}" \
       VLLM_OMNI_DIR="${VLLM_OMNI_DIR}" RESULT_ROOT="${RESULT_ROOT}" \
       NUMA_POLICY="${DLO_NUMA_POLICY}" NUM_GPUS=8 TP_SIZE=1 ULYSSES_DEGREE=8 \
+      DLO_RESIDENT_LAYERS=0 \
       TEXT_ENCODER_TP_SIZE=8 VAE_PATCH_PARALLEL_SIZE=8 \
       NUM_INFERENCE_STEPS="${steps}" WARMUPS="${warmups}" MEASURED_RUNS="${runs}" \
       STARTUP_TIMEOUT=3600 bash "${backend_script}"; then

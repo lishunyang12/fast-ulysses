@@ -15,6 +15,7 @@ ULYSSES_DEGREE="${ULYSSES_DEGREE:-2}"
 TEXT_ENCODER_TP_SIZE="${TEXT_ENCODER_TP_SIZE:-${NUM_GPUS}}"
 VAE_PATCH_PARALLEL_SIZE="${VAE_PATCH_PARALLEL_SIZE:-${NUM_GPUS}}"
 DLO_MODE="${DLO_MODE:-off}"
+DLO_RESIDENT_LAYERS="${DLO_RESIDENT_LAYERS:-0}"
 OUTPUT_LABEL="${OUTPUT_LABEL:-${BACKEND}}"
 NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-5}"
 WARMUPS="${WARMUPS:-2}"
@@ -62,11 +63,12 @@ export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${WORK_ROOT}/xdg-cache}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${WORK_ROOT}/triton-cache}"
 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-${WORK_ROOT}/torchinductor-cache}"
 export PATH="${WORK_ROOT}/bin:${WORK_ROOT}/ffmpeg-tools:${WORK_ROOT}/ffmpeg-tools/bin:${WORK_ROOT}/ffmpeg-shared/bin:${VLLM_OMNI_DIR}/.venv/bin:${PATH}"
-export VLLM_OMNI_ULYSSES_TRANSPORT="${transport}"
 if [[ "${transport}" == "nccl" ]]; then
+  unset VLLM_OMNI_ULYSSES_TRANSPORT
   unset VLLM_OMNI_FAST_ULYSSES_ALLOW_NON_NVLINK
   unset VLLM_OMNI_FAST_ULYSSES_ZERO_COPY
 else
+  export VLLM_OMNI_ULYSSES_TRANSPORT="${transport}"
   export VLLM_OMNI_FAST_ULYSSES_ALLOW_NON_NVLINK=1
   export VLLM_OMNI_FAST_ULYSSES_ZERO_COPY="${zero_copy}"
 fi
@@ -78,10 +80,20 @@ case "${DLO_MODE}" in
     dlo_args=()
     ;;
   use-allgather)
-    dlo_args=(--enable-distributed-layerwise-offload --dlo-use-allgather)
+    dlo_args=(
+      --enable-distributed-layerwise-offload
+      --dlo-use-allgather
+      --dlo-resident-layers "${DLO_RESIDENT_LAYERS}"
+      --enforce-eager
+    )
     ;;
   no-allgather)
-    dlo_args=(--enable-distributed-layerwise-offload --dlo-no-use-allgather)
+    dlo_args=(
+      --enable-distributed-layerwise-offload
+      --dlo-no-use-allgather
+      --dlo-resident-layers "${DLO_RESIDENT_LAYERS}"
+      --enforce-eager
+    )
     ;;
   *) echo "invalid DLO_MODE=${DLO_MODE}" >&2; exit 2 ;;
 esac
@@ -115,6 +127,7 @@ printf '%s\n' "${BACKEND}" >"${OUTPUT_DIR}/backend.txt"
   printf 'TEXT_ENCODER_TP_SIZE=%s\n' "${TEXT_ENCODER_TP_SIZE}"
   printf 'VAE_PATCH_PARALLEL_SIZE=%s\n' "${VAE_PATCH_PARALLEL_SIZE}"
   printf 'DLO_MODE=%s\n' "${DLO_MODE}"
+  printf 'DLO_RESIDENT_LAYERS=%s\n' "${DLO_RESIDENT_LAYERS}"
   printf 'NUM_INFERENCE_STEPS=%s\n' "${NUM_INFERENCE_STEPS}"
   printf 'WARMUPS=%s\n' "${WARMUPS}"
   printf 'MEASURED_RUNS=%s\n' "${MEASURED_RUNS}"
@@ -164,6 +177,7 @@ setsid numactl "${numa_args[@]}" \
   --host 127.0.0.1 \
   --port "${PORT}" \
   --trust-remote-code \
+  --task-type fl2va \
   --num-gpus "${NUM_GPUS}" \
   --tensor-parallel-size "${TP_SIZE}" \
   --usp "${ULYSSES_DEGREE}" \
@@ -174,6 +188,8 @@ setsid numactl "${numa_args[@]}" \
   --vae-use-tiling \
   --diffusion-attention-backend CUDNN_ATTN \
   --enable-diffusion-pipeline-profiler \
+  --stage-init-timeout "${STARTUP_TIMEOUT}" \
+  --init-timeout "${STARTUP_TIMEOUT}" \
   "${dlo_args[@]}" \
   >"${OUTPUT_DIR}/server.log" 2>&1 &
 server_pid=$!
